@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+.media_llm_config.json
+.media_renamer_config.json
+custom_strip_patterns.json
+*.xlsx
+*.csv
+.DS_Store
