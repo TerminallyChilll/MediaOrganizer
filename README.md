@@ -22,14 +22,17 @@ cd MediaOganizer
 
 ---
 ### 🪟 Windows
-1. Double-click `install_and_run.bat`.
-2. The script will automatically check for Python, ensure dependencies are installed, and launch the interactive wizard.
+1. Make sure you have **Python 3.9+** installed. If you don't, download it from [python.org/downloads](https://www.python.org/downloads/).
+   * ⚠️ **CRITICAL:** During the Python setup, you **must** check the box that says **"Add python.exe to PATH"** at the bottom of the very first screen.
+2. Double-click `install_and_run.bat`.
+3. The script will automatically ensure dependencies are installed, and launch the interactive wizard.
 
 ### 🍎 Mac / 🐧 Linux
-1. Open a terminal and navigate to this folder.
-2. Run: `chmod +x install_and_run.sh`
-3. Run: `./install_and_run.sh`
-4. The script will install dependencies via pip and launch the wizard.
+1. Make sure you have **Python 3.9+** installed (via `brew`, `apt`, or your system's package manager).
+2. Open a terminal and navigate to this folder.
+3. Run: `chmod +x install_and_run.sh`
+4. Run: `./install_and_run.sh`
+5. The script will install dependencies via pip and launch the wizard.
 
 ### 🐳 Docker (Advanced)
 If you prefer running inside a container to avoid installing Python or pip packages on your host system:
