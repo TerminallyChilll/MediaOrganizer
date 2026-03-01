@@ -41,6 +41,28 @@ If you prefer running inside a container to avoid installing Python or pip packa
    ```
    *(Note: You must use `run` instead of `up` so you can interact with the terminal prompts!)*
 
+## How to Use the App
+After launching the script via one of the methods above, you will be greeted by the **Interactive Wizard**. The wizard will hold your hand through the entire process:
+
+1. **Choose an Action:**
+   * **Clean file names:** Renames files to be clean and readable.
+   * **Organize file structure:** Groups loose TV episodes into `Season X` folders.
+   * **Do both:** Runs both of the above actions back-to-back.
+   * **Scan Library:** Just scans your folders and updates the `.xlsx` journal without changing any files.
+
+2. **Select your Media Folders:**
+   * You'll be prompted to pick your `Movies` folder and your `TV Shows` folder (you can press Enter to skip one).
+   * You can use the built-in folder picker popups, browse directories directly inside the terminal, or paste the folder paths manually.
+
+3. **Choose a Renaming Engine:**
+   * **Regex (Fastest):** Strips out year tags, resolution (`1080p`), and scene groups instantly using built-in rules.
+   * **Ollama (Free LLM):** If you run Ollama locally, the AI will perfectly extract clean names without breaking a sweat, even on badly obfuscated files.
+   * **Cloud LLM (Paid/API):** Connect to OpenAI or Google Gemini if you want cloud-powered AI intelligence.
+
+4. **Review & Execute:**
+   * The app will scan your library, generate a preview of all the changes it's about to make, and ask for confirmation before it touches any files.
+   * **Safe Undo:** After files are renamed, the app generates an `undo_all.bat` script right next to it. If you ever realize you made a mistake, just double-click it, and all of your files will be instantly reverted back to their original names and locations!
+
 ## Requirements
 * Python 3.9 or higher
 * `pandas`, `openpyxl`, `tqdm` (automatically installed by `run.py`)
