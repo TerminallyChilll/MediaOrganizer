@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  media-organizer:
+    build: .
+    image: media-organizer:latest
+    container_name: media-organizer
+    # We need tty and stdin_open to make the interactive CLI wizard work
+    tty: true
+    stdin_open: true
+    volumes:
+      # Mount the current directory so configs and the excel sheet persist
+      - .:/app
+      # ⚠️ IMPORTANT: Mount your actual media folders here!
+      # Format is "- /host/path/to/media:/container/path"
+      # Examples:
+      # - /volume1/Media/Movies:/media/Movies
+      # - /volume1/Media/TV Shows:/media/TV_Shows
+      # - C:\Users\Shared\Videos:/media/Videos

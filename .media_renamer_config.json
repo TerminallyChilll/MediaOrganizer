@@ -1,0 +1,11 @@
+{
+  "movie_include_year": true,
+  "movie_include_quality": false,
+  "movie_include_size": false,
+  "tv_parent_include_year": false,
+  "tv_parent_include_quality": false,
+  "tv_season_include_year": true,
+  "tv_episode_include_year": false,
+  "tv_episode_include_quality": false,
+  "tv_episode_include_size": false
+}
