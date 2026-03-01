@@ -61,7 +61,7 @@ After launching the script via one of the methods above, you will be greeted by 
 
 4. **Review & Execute:**
    * The app will scan your library, generate a preview of all the changes it's about to make, and ask for confirmation before it touches any files.
-   * **Safe Undo:** After files are renamed, the app generates an `undo_all.bat` script right next to it. If you ever realize you made a mistake, just double-click it, and all of your files will be instantly reverted back to their original names and locations!
+   * **Safe Undo:** After files are renamed, the app automatically generates an `undo_all.bat` (Windows) or `undo_all.sh` (Mac/Linux) script right next to it. If you ever realize you made a mistake, just run it, and all of your files will be instantly reverted back to their original names and locations!
 
 ## Requirements
 * Python 3.9 or higher
