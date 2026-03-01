@@ -17,6 +17,8 @@ cd "$SCRIPT_DIR"
 
 # Ensure run.py is executable
 chmod +x run.py
-
+# Clean up unused Windows and Docker files to save space
+rm -f install_and_run.bat Dockerfile docker-compose.yml
+    
 # Run the universal Python launcher
 python3 run.py

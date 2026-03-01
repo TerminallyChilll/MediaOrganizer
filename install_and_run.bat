@@ -16,6 +16,10 @@ if %ERRORLEVEL% NEQ 0 (
     pause
     exit /b 1
 )
+:: Clean up unused Mac/Linux and Docker files to save space
+if exist install_and_run.sh del install_and_run.sh
+if exist Dockerfile del Dockerfile
+if exist docker-compose.yml del docker-compose.yml
 
 :: Run the universal Python launcher
 python run.py
