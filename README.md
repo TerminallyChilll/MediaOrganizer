@@ -37,9 +37,9 @@ If you prefer running inside a container to avoid installing Python or pip packa
 1. Edit `docker-compose.yml` to map your real media folders to `/media` volume mounts.
 2. Run the application interactively:
    ```bash
-   docker-compose run --rm media-organizer
+   docker compose run --rm media-organizer
    ```
-   *(Note: You must use `run` instead of `up` so you can interact with the terminal prompts!)*
+   *(Note: This uses Docker Compose V2. You must use `run` instead of `up` so you can interact with the terminal prompts!)*
 
 ## How to Use the App
 After launching the script via one of the methods above, you will be greeted by the **Interactive Wizard**. The wizard will hold your hand through the entire process:
