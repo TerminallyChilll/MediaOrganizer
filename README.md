@@ -12,6 +12,15 @@ A cross-platform tool to scan media libraries, organize TV show structures, and 
 
 ## Installation & Usage
 
+### 📥 1. Download the App
+You can download the code using Git in your terminal:
+```bash
+git clone https://github.com/TerminallyChilll/MediaOganizer.git
+cd MediaOganizer
+```
+*(Alternatively, you can just click the green "Code" button on GitHub and select "Download ZIP")*
+
+---
 ### 🪟 Windows
 1. Double-click `install_and_run.bat`.
 2. The script will automatically check for Python, ensure dependencies are installed, and launch the interactive wizard.
