@@ -222,7 +222,9 @@ def browse_for_folder(prompt="Select a folder", allow_skip=True):
     print("  [2] 📂 Browse folders in terminal")
     print("  [3] ✏️  Paste a path manually")
     if allow_skip:
-        print("  [4] ⏭️  Skip")
+        print("  [4] ⏭️  Skip (leave empty)")
+    else:
+        print("  [4] 🔙  Cancel / Go Back")
     
     choice = input("\nSelect (1-4): ").strip()
     
@@ -260,7 +262,7 @@ def browse_for_folder(prompt="Select a folder", allow_skip=True):
             print("   ❌ Invalid path. Try again.")
             return browse_for_folder(prompt, allow_skip)
     
-    elif choice == '4' and allow_skip:
+    elif choice == '4':
         return None
     
     else:
@@ -296,10 +298,12 @@ def _cli_folder_browser(prompt, allow_skip=True):
         
         if allow_skip:
             print("  [q] Cancel / Skip")
+        else:
+            print("  [q] Cancel / Go Back")
         
-        nav = input("\nNavigate to: ").strip()
+        nav = input("\nNavigate to: ").strip().lower()
         
-        if nav == 'q' and allow_skip:
+        if nav == 'q':
             return None
         elif nav in ['v', 'V', 'ok', 'OK', '']:
             print(f"   ✅ Selected: {current}")
