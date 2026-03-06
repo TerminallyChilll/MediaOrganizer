@@ -19,6 +19,39 @@ import sys
 import shutil
 from pathlib import Path
 from datetime import datetime
+from collections import defaultdict
+import builtins
+
+# Global Emoji State and Wrappers
+USE_EMOJIS = True
+
+def _strip_emojis(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    # Strip emojis and pictographs using a regex covering the main unicode ranges:
+    import re
+    text = re.sub(
+        r'[\U0001f300-\U0001faff\U0001f600-\U0001f64f\U0001f680-\U0001f6ff\u2600-\u27bf\u2300-\u23ff\u25a0-\u25ff\u2b50\u203c-\u3299\xae\xa9\u2122\u2139\U0001f004-\U0001f251\ufe0f]+', 
+        '', text
+    )
+    # Also clean up double spaces that might be left behind but preserve leading/trailing whitespace
+    return re.sub(r'(?<=\S)  +(?=\S)', ' ', text)
+
+_builtin_print = builtins.print
+_builtin_input = builtins.input
+
+def print(*args, **kwargs):
+    if USE_EMOJIS:
+        _builtin_print(*args, **kwargs)
+    else:
+        new_args = [_strip_emojis(a) if isinstance(a, str) else a for a in args]
+        _builtin_print(*new_args, **kwargs)
+
+def input(prompt=''):
+    if USE_EMOJIS:
+        return _builtin_input(prompt)
+    else:
+        return _builtin_input(_strip_emojis(prompt))
 
 try:
     import pandas as pd # type: ignore
@@ -101,6 +134,67 @@ def ask_yes_no(prompt, default=True):
     if not response:
         return default
     return response.upper() in ['Y', 'YES']
+
+def paginated_preview(lines, page_size=20):
+    """
+    Show a list of lines with page-by-page navigation.
+    Returns True if the user wants to proceed, False to abort.
+    """
+    total = len(lines)
+    if total == 0:
+        return True
+
+    page = 0
+    total_pages = max(1, (total + page_size - 1) // page_size)
+
+    while True:
+        start = page * page_size
+        end = min(start + page_size, total)
+        print(f"\n--- Page {page + 1}/{total_pages}  (items {start + 1}-{end} of {total}) ---")
+        for line in lines[start:end]:
+            print(line)
+
+        # Navigation options
+        at_start = page == 0
+        last_page: int = int(total_pages) - 1
+        at_end   = page == last_page
+
+        nav_parts = []
+        if not at_end:  nav_parts.append("[N]ext")
+        if not at_start: nav_parts.append("[P]rev")
+        if total_pages > 2: nav_parts.append("[G]o to page")
+        if not at_end:  nav_parts.append("[A]ll at once")
+        nav_parts.append("[Y]es proceed")
+        nav_parts.append("[Q]uit / abort")
+        print("  " + "  ".join(nav_parts))
+
+        choice = input("Choice: ").strip().upper()
+
+        if choice in ('N', '') and not at_end:
+            page += 1
+        elif choice == 'P' and not at_start:
+            page -= 1
+        elif choice == 'G' and total_pages > 2:
+            try:
+                pg = int(input(f"Go to page (1-{total_pages}): ").strip()) - 1
+                if 0 <= pg < total_pages:
+                    page = pg
+            except ValueError:
+                pass
+        elif choice == 'A':
+            print(f"\n--- ALL {total} items ---")
+            for line in lines:
+                print(line)
+            choice = input("\n[Y]es proceed  [Q]uit / abort: ").strip().upper()
+            if choice == 'Y': return True
+            if choice == 'Q': return False
+        elif choice == 'Y':
+            return True
+        elif choice == 'Q':
+            return False
+        elif at_end and choice not in ('P', 'G', 'A', 'Q'):
+            # At last page, any unrecognised input = prompt clearly
+            pass
 
 def clean_path_input(path):
     if not path: return path
@@ -339,10 +433,16 @@ def clean_title(folder_name, custom_patterns, case_sensitive=False):
     title = re.sub(r'\(\s*\)', '', title)
     title = re.sub(r'\s+', ' ', title).strip().title()
     
+    # Always ensure the final name starts with a letter — strip any leading
+    # punctuation/symbols/spaces left behind after pattern removal (e.g. "- My Show" -> "My Show")
+    title = re.sub(r'^[^A-Za-z]+', '', title).strip()
+    
     if year:
         title = re.sub(r'\b' + year + r'\b', '', title).strip()
         title = re.sub(r'\(\s*\)', '', title)
         title = re.sub(r'\s+', ' ', title).strip()
+        # Strip again after year removal in case year was at the start
+        title = re.sub(r'^[^A-Za-z]+', '', title).strip()
         title = f"{title} ({year})"
     return title
 
@@ -449,12 +549,25 @@ def organize_season_structure(show_path):
     
     folders = [f for f in items if os.path.isdir(os.path.join(show_path, f))]
     
-    # Step 1: Identify loose episode folders (have SxxExx but aren't season folders)
-    episode_folder_pattern = re.compile(r'S(\d{1,2})E\d{1,2}', re.IGNORECASE)
+    # Step 1: Identify loose episode folders — match both SxxExx AND bare NxN (e.g. 1x2, 9x9)
+    # SxxExx: standard format — group 1 = season
+    # NxN:    bare number format (like in 'WATCH - Show 1x2 - FREE') — group 2 = season, group 3 = episode
+    episode_folder_pattern = re.compile(
+        r'(?:[Ss](\d{1,2})[Ee]\d{1,2}|(?<!\d)(\d{1,2})[xX](\d{1,2})(?!\d))'
+    )
     season_folder_pattern = re.compile(r'^(?:season\s*|s)(\d{1,2})$', re.IGNORECASE)
     
-    # Broader season folder detection (includes show name + S01 etc.)
-    season_like_pattern = re.compile(r'(?:season\s*|\bs)(\d{1,2})\b', re.IGNORECASE)
+    # Match "ShowTitle S##" abbreviated form ONLY — e.g. "Snowfall S02"
+    # Do NOT match spelled-out "Season N" suffix (that's covered by season_folder_pattern above,
+    # and show-root folders like "Bloopers Season 8" also end in "Season 8").
+    # Require: no dashes/pipes/dots in name, ends with " S<1-2 digits>"
+    season_like_pattern = re.compile(
+        r'^([^\-\|.]+?)\s+[Ss](\d{1,2})(?:\s*\(?\d{4}\)?)?\s*$'
+    )
+    
+    def _get_episode_season(match):
+        """Extract season number from either SxxExx (group 1) or NxN (group 2) match."""
+        return int(match.group(1) or match.group(2))
     
     # Categorize folders
     existing_seasons = {}  # season_num -> folder_name
@@ -464,24 +577,23 @@ def organize_season_structure(show_path):
         # Check if it's a pure season folder (Season 1, S01, etc.)
         season_match = season_folder_pattern.match(folder.strip())
         if season_match:
-            snum = int(season_match.group(1))
-            existing_seasons[snum] = folder
+            existing_seasons[int(season_match.group(1))] = folder
             continue
         
-        # Check if folder name contains SxxExx (episode folder sitting loose)
+        # Check if folder name contains SxxExx or NxN (episode folder sitting loose)
         ep_match = episode_folder_pattern.search(folder)
         if ep_match:
-            snum = int(ep_match.group(1))
+            snum = _get_episode_season(ep_match)
             if snum not in loose_episodes:
                 loose_episodes[snum] = []
             loose_episodes[snum].append(folder)
             continue
         
-        # Check if it's a show-name-style season folder (e.g. "Snowfall S02")
-        s_match = season_like_pattern.search(folder)
+        # Check if it's a show-name-style season folder e.g. "Snowfall S02"
+        # Only the abbreviated S## form — spelled-out 'Season N' suffixes belong to show-root folders
+        s_match = season_like_pattern.match(folder)
         if s_match and not episode_folder_pattern.search(folder):
-            snum = int(s_match.group(1))
-            existing_seasons[snum] = folder
+            existing_seasons[int(s_match.group(2))] = folder
     
     # Step 2: Plan moves — loose episode folders into season folders
     for snum, ep_folders in sorted(loose_episodes.items()):
@@ -515,14 +627,20 @@ def organize_season_structure(show_path):
 
 
 def _folder_has_episodes_or_seasons(path):
-    """Check if a folder directly contains episode folders (SxxExx) or season folders."""
+    """Check if a folder directly contains episode folders (SxxExx / NxN) or season folders."""
     try:
         folders = [f for f in os.listdir(path) if os.path.isdir(os.path.join(path, f))]
     except Exception:
         return False
-    ep_pat = re.compile(r'S\d{1,2}E\d{1,2}', re.IGNORECASE)
-    season_pat = re.compile(r'(?:season\s*|(?:^|\s)s)\d{1,2}\b', re.IGNORECASE)
-    return any(ep_pat.search(f) or season_pat.search(f) for f in folders)
+    # Matches SxxExx or bare NxN (e.g. 1x2, 9x9) — both are clear episode indicators
+    ep_pat = re.compile(r'(?:[Ss]\d{1,2}[Ee]\d{1,2}|(?<!\d)\d{1,2}[xX]\d{1,2}(?!\d))')
+    # Pure season folders: "Season 1", "S01"
+    season_pat = re.compile(r'^(?:season\s*|s)\d{1,2}(?:\s*\(?\d{4}\)?)?\s*$', re.IGNORECASE)
+    # Show-name abbreviated-season: "Snowfall S02" — abbreviated S## form only, no dashes/pipes
+    season_like_pat = re.compile(r'^([^\-\|.]+?)\s+[Ss](\d{1,2})(?:\s*\(?\d{4}\)?)?\s*$')
+    def _is_season_like(f):
+        return bool(season_like_pat.match(f))
+    return any(ep_pat.search(f) or season_pat.search(f) or _is_season_like(f) for f in folders)
 
 
 def run_organizer(folder=None):
@@ -537,8 +655,8 @@ def run_organizer(folder=None):
         
         if not folder:
             folder = browse_for_folder("Select a TV show folder or your TV Shows root folder", allow_skip=False)
-        if not folder:
-            return
+            if not folder:
+                return
         
         # Auto-detect: did the user point at a show folder or a TV root?
         if _folder_has_episodes_or_seasons(folder):
@@ -589,42 +707,32 @@ def run_organizer(folder=None):
                 print("\n✅ Everything is already organized! No changes needed.")
                 return
         
-        # Preview ALL changes
+        # Paginated preview of ALL changes
         total = sum(len(c) for _, c in all_changes)
-        print(f"\n📋 PREVIEW ({total} changes)")
-        print("=" * 60)
+        print(f"\n--- ORGANIZER PREVIEW: {total} change(s) ---")
+        preview_lines = []
         for show, show_changes in all_changes:
-            print(f"\n📺 {show}:")
+            preview_lines.append(f"  Show: {show}")
             for c in show_changes:
-                print(c['description'])
+                preview_lines.append(c['description'])
         
-        if not ask_yes_no(f"\nProceed with ALL {total} changes?"):
+        if not paginated_preview(preview_lines):
             print("User aborted.")
             return
         
-        # Generate undo script
-        ext = "bat" if os.name == 'nt' else "sh"
-        undo_file = f"undo_organize.{ext}"
-        try:
-            with open(undo_file, 'w', encoding='utf-8') as f:
-                if os.name == 'nt':
-                    f.write("@echo off\nchcp 65001\n")
-                else:
-                    f.write("#!/bin/bash\n")
-                for _, show_changes in reversed(all_changes):
-                    for c in reversed(show_changes):
-                        if os.name == 'nt': f.write(f'move "{c["new_path"]}" "{c["old_path"]}"\n')
-                        else: f.write(f'mv "{c["new_path"]}" "{c["old_path"]}"\n')
-            print(f"✅ Created {undo_file}")
-        except Exception: pass
-        
-        # Execute ALL changes — moves first, then renames
+        # Execute ALL changes — moves first, then renames.
+        # The undo script is written AFTER each successful move so it reflects actual disk state.
         print("\n🔄 Organizing...")
         success: int = 0
         errors: int = 0
         
         flat_changes = [(show, c) for show, changes in all_changes for c in changes]
         flat_changes.sort(key=lambda x: 0 if x[1]['type'] == 'move_to_season' else 1)
+        
+        # Collect successful moves in order so the undo script can reverse them correctly.
+        # Renames must be undone BEFORE the moves they depend on — we track them separately.
+        undo_renames: list[tuple[str, str]] = []  # (actual_dst, actual_src)
+        undo_moves:   list[tuple[str, str]] = []  # (actual_dst, actual_src)
         
         for show, c in flat_changes:
             old_p = Path(c['old_path'])
@@ -637,6 +745,13 @@ def run_organizer(folder=None):
                     shutil.move(temp, str(new_p))
                 else:
                     shutil.move(str(old_p), str(new_p))
+                # Record what actually happened on disk using resolve()-style absolute strings
+                actual_src = str(old_p.resolve()) if old_p.exists() else str(old_p)
+                actual_dst = str(new_p.resolve()) if new_p.exists() else str(new_p)
+                if c['type'] == 'rename_season':
+                    undo_renames.append((actual_dst, str(old_p)))
+                else:
+                    undo_moves.append((actual_dst, str(old_p)))
                 success += 1  # type: ignore
                 print(f"  ✅ {c['description'].strip()}")
             except Exception as e:
@@ -644,8 +759,36 @@ def run_organizer(folder=None):
                 print(f"  ❌ {c['description'].strip()}: {e}")
         
         print(f"\n✅ Done! {success} changes applied, {errors} errors.")
-        if errors:
-            print(f"   Undo script: {os.path.abspath(undo_file)}")
+        
+        # Write undo script using actual resolved paths, in correct reverse order:
+        # undo renames first (they were applied last), then undo moves.
+        ext = "bat" if os.name == 'nt' else "sh"
+        undo_file = f"undo_organize.{ext}"
+        try:
+            with open(undo_file, 'w', encoding='utf-8') as f:
+                if os.name == 'nt':
+                    f.write('@echo off\nchcp 65001\necho Undoing organize changes...\n')
+                else:
+                    f.write('#!/bin/bash\necho "Undoing organize changes..."\n')
+                # Undo renames first (reverse order)
+                for dst, src in reversed(undo_renames):
+                    if os.name == 'nt':
+                        f.write(f'move "{dst}" "{src}"\n')
+                    else:
+                        f.write(f'mv "{dst}" "{src}"\n')
+                # Then undo moves (reverse order)
+                for dst, src in reversed(undo_moves):
+                    if os.name == 'nt':
+                        f.write(f'move "{dst}" "{src}"\n')
+                    else:
+                        f.write(f'mv "{dst}" "{src}"\n')
+                if os.name == 'nt':
+                    f.write('echo Done!\npause\n')
+                else:
+                    f.write('echo Done!\n')
+            print(f"✅ Undo script: {os.path.abspath(undo_file)}")
+        except Exception as e:
+            print(f"⚠️  Could not write undo script: {e}")
     
     except BackNavigationException:
         print("\n🔙 Going back...")
@@ -655,7 +798,7 @@ def scan_media_folder(media_path, media_type="Movies"):
     custom_patterns = [] # No custom patterns in step 1 anymore
     print(f"\n📁 Scanning {media_type} folder: {media_path}")
     if not os.path.exists(media_path):
-        print("   ⚠️ Path does not exist!")
+        print("   ⚠️ Path does not exist.")
         return []
     
     # Auto-organize any loose files into folders first
@@ -1243,16 +1386,13 @@ def run_renamer(movies_path=None, tv_path=None, excel_path=None):
         print("✅ No changes needed!")
         return
         
-    print(f"\n📋 PREVIEW (Found {len(changes)} changes)")
-    # Show first 10
-    for i, c in enumerate(changes):
-        if i >= 10: break
-        status = "✅" if c['exists'] else "❌ NOT FOUND"
-        print(f"[{status}] {c['old_name']}  ->  {c['new_name']}")
+    print(f"\n--- RENAME PREVIEW: {len(changes)} change(s) ---")
+    preview_lines = []
+    for c in changes:
+        status = "[OK]" if c['exists'] else "[NOT FOUND]"
+        preview_lines.append(f"{status}  {c['old_name']}  ->  {c['new_name']}")
     
-    if len(changes) > 10: print(f"... and {len(changes)-10} more.")
-    
-    if not ask_yes_no(f"\nProceed with renaming {len(changes)} items?"):
+    if not paginated_preview(preview_lines):
         print("User aborted.")
         return
         
@@ -1493,11 +1633,130 @@ def run_text_export():
         return
 
 
+
+def run_extension_converter():
+    """Menu option 4: Batch-rename file extensions within a folder."""
+    print("\n" + "=" * 60)
+    print("  FILE EXTENSION CONVERTER")
+    print("=" * 60)
+    print("Rename file extensions in bulk — e.g. .ts -> .mp4")
+    print()
+
+    try:
+        folder = browse_for_folder("Select the folder to convert files in", allow_skip=False)
+        if not folder:
+            return
+
+        # List unique extensions found
+        found_exts = {}  # type: ignore
+        for root, _, files in os.walk(folder):
+            for f in files:
+                ext = os.path.splitext(f)[1].lower()
+                if ext:
+                    if ext not in found_exts:
+                        found_exts[ext] = []
+                    found_exts[ext].append(str(os.path.join(root, f)))  # type: ignore
+
+        if not found_exts:
+            print("No files with extensions found in that folder.")
+            return
+
+        print("\nExtensions found:")
+        for ext, files in sorted(found_exts.items()):
+            print(f"  {ext:12}  ({len(files)} file{'s' if len(files) != 1 else ''})")
+
+        from_ext = prompt_input("\nConvert FROM extension (e.g. ts): ").strip().lower()
+        if not from_ext:
+            return
+        if not from_ext.startswith('.'):
+            from_ext = '.' + from_ext
+
+        if from_ext not in found_exts:
+            print(f"No files with extension '{from_ext}' found.")
+            return
+
+        to_ext = prompt_input(f"Convert TO extension (e.g. mp4): ").strip().lower()
+        if not to_ext:
+            return
+        if not to_ext.startswith('.'):
+            to_ext = '.' + to_ext
+
+        if from_ext == to_ext:
+            print("Source and target extensions are the same. Nothing to do.")
+            return
+
+        targets = found_exts[from_ext]
+        preview_lines = []
+        changes = []
+        for old_path in sorted(targets):
+            name_no_ext = os.path.splitext(old_path)[0]
+            new_path = name_no_ext + to_ext
+            preview_lines.append(f"  {os.path.relpath(old_path, folder)}  ->  {os.path.relpath(new_path, folder)}")
+            changes.append((old_path, new_path))
+
+        print(f"\n--- EXTENSION CONVERT PREVIEW: {len(changes)} file(s) ---")
+        if not paginated_preview(preview_lines):
+            print("User aborted.")
+            return
+
+        success = 0
+        errors = 0
+        for old_path, new_path in changes:
+            try:
+                if os.path.exists(new_path):
+                    print(f"  [SKIP] Already exists: {os.path.basename(new_path)}")
+                    continue
+                os.rename(str(old_path), str(new_path))
+                success += 1
+            except Exception as e:
+                print(f"  [ERROR] {os.path.basename(old_path)}: {e}")
+                errors += 1
+
+        print(f"\nDone! {success} converted, {errors} errors.")
+
+    except BackNavigationException:
+        print("\nGoing back...")
+        return
+
+
 # =========================
 # MAIN ENTRY
 # =========================
 
 def run_wizard():
+    global USE_EMOJIS
+    config_path = os.path.join(os.getcwd(), CONFIG_FILE_NAME)
+    
+    # Pre-Step 1: Check and ask for emoji preference if not saved
+    config_data = {}
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    config_data = loaded
+        except Exception:
+            pass
+            
+    if 'use_emojis' in config_data:
+        USE_EMOJIS = config_data['use_emojis']
+    else:
+        print("\n" + "="*80)
+        print("PRE-STEP 1: UI PREFERENCES")
+        print("="*80)
+        ans = _builtin_input("Would you like to use Emojis in the interface? (y/n) [default: y]: ").strip().lower()
+        if ans == 'n':
+            USE_EMOJIS = False
+        else:
+            USE_EMOJIS = True
+            
+        config_data['use_emojis'] = USE_EMOJIS
+        try:
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(config_data, f, indent=4)
+        except Exception:
+            pass
+
     while True:
         try:
             print("\n" + "="*80)
@@ -1506,32 +1765,52 @@ def run_wizard():
             print()
             print("STEP 1: What would you like to do?")
             print()
+            print('  [0] ⚙️ Toggle UI Emojis (Currently: ' + ('ON' if USE_EMOJIS else 'OFF') + ')')
+            print()
             print('  [1] 🧹 Clean file names')
-            print('      Example: "The.Matrix.2025.1080p.BluRay.x264-GROUP" → "The Matrix (2025)"')
+            print('      Example: "The.Matrix.2025.1080p.BluRay.x264-GROUP" -> "The Matrix (2025)"')
             print()
-            print('  [2] 📂 Organize file structure (TV Shows only)')
-            print('      Example: Loose "S05E07" folders → grouped into "Season 5/"')
+            print('  [2] Organize file structure (TV Shows only)')
+            print('      Example: Loose "S05E07" folders -> grouped into "Season 5/"')
             print()
-            print('  [3] ✨ Do both (organize structure, then clean names)')
+            print('  [3] Do both (organize structure, then clean names)')
             print()
-            print('  [4] 📊 Scan Library only (create/update Excel spreadsheet)')
+            print('  [4] Convert file extensions  (e.g. .ts -> .mp4)')
             print()
-            print('  [5] 📝 Export library to text file')
+            print('  [5] Scan Library only (create/update Excel spreadsheet)')
             print()
-            print('  [6] 🚪 Exit')
+            print('  [6] Export library to text file')
+            print()
+            print('  [7] Exit')
             print()
             print("Tip: Type 'back' or 'b' at any prompt to return to the previous step.")
             
-            choice = prompt_input("\nSelect an option (1-6): ")
+            choice = prompt_input("\nSelect an option (0-7): ")
             
-            if choice == '6':
+            if choice == '0':
+                USE_EMOJIS = not USE_EMOJIS
+                config_data['use_emojis'] = USE_EMOJIS
+                try:
+                    with open(config_path, 'w', encoding='utf-8') as f:
+                        json.dump(config_data, f, indent=4)
+                except Exception:
+                    pass
+                print(f"\nEmojis are now {'ON' if USE_EMOJIS else 'OFF'}.")
+                continue
+
+            if choice == '7':
                 break
+
                 
-            if choice == '5':
+            if choice == '6':
                 run_text_export()
                 continue
+
+            if choice == '4':
+                run_extension_converter()
+                continue
                 
-            # For 1, 2, 3, 4: Ask for folders ONCE
+            # For 1, 2, 3, 5: Ask for folders ONCE
             print("\n" + "-"*40)
             print("STEP 2: Where are your files?")
             print("Press Enter to skip a folder if you don't have it.")
@@ -1547,12 +1826,12 @@ def run_wizard():
                 movies_path = browse_for_folder("Select Movies folder", allow_skip=True)
                 tv_path = browse_for_folder("Select TV Shows folder", allow_skip=True)
                 if not movies_path and not tv_path:
-                    print("❌ No folders selected.")
+                    print("No folders selected.")
                     continue
             
-            # For 1, 3, 4: Ask for Excel file name ONCE
+            # For 1, 3, 5: Ask for Excel file name ONCE
             excel_path = None
-            if choice in ['1', '3', '4']:
+            if choice in ['1', '3', '5']:
                 print("\n" + "-"*40)
                 print("STEP 3: Spreadsheet Name")
                 print("-" * 40)
@@ -1565,7 +1844,7 @@ def run_wizard():
             # Execute selected flow
             if choice == '1':
                 print("\n" + "="*60)
-                print("▶️  RUNNING PIPELINE: Scan → Clean Names")
+                print("RUNNING PIPELINE: Scan -> Clean Names")
                 print("="*60)
                 
                 print("\n[1/2] Scanning library...")
@@ -1576,13 +1855,13 @@ def run_wizard():
                 
             elif choice == '2':
                 print("\n" + "="*60)
-                print("▶️  RUNNING PIPELINE: Organize TV Structure")
+                print("RUNNING PIPELINE: Organize TV Structure")
                 print("="*60)
                 run_organizer(folder=tv_path)
                 
             elif choice == '3':
                 print("\n" + "="*60)
-                print("▶️  RUNNING FULL PIPELINE: Organize → Scan → Clean")
+                print("RUNNING FULL PIPELINE: Organize -> Scan -> Clean")
                 print("="*60)
                 
                 if tv_path:
@@ -1597,14 +1876,14 @@ def run_wizard():
                 print("\n[3/3] Cleaning names...")
                 run_renamer(movies_path=movies_path, tv_path=tv_path, excel_path=excel_path)
                 
-            elif choice == '4':
+            elif choice == '5':
                 print("\n" + "="*60)
-                print("▶️  RUNNING PIPELINE: Scan Library")
+                print("RUNNING PIPELINE: Scan Library")
                 print("="*60)
                 run_scanner(movies_path=movies_path, tv_path=tv_path, output_file=excel_path)
             
             else:
-                print("❌ Invalid choice. Please enter 1-6.")
+                print("Invalid choice. Please enter 1-7.")
                 
         except BackNavigationException:
             pass # Already at top menu
