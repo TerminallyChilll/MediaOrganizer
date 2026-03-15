@@ -1,3 +1,4 @@
 pandas==3.0.1
 openpyxl==3.1.5
 tqdm==4.67.3
+send2trash==1.8.3

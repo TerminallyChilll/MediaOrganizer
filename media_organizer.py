@@ -18,6 +18,19 @@ import json
 import sys
 import shutil
 from pathlib import Path
+
+try:
+    from send2trash import send2trash as _send2trash
+    def safe_delete(path: str) -> None:
+        """Send a file or folder to the system trash (Windows Recycle Bin / macOS Trash / Linux Trash)."""
+        _send2trash(path)
+except ImportError:
+    # Fallback: permanent delete if send2trash is somehow not installed
+    def safe_delete(path: str) -> None:  # type: ignore[misc]
+        if os.path.isdir(path):
+            os.rmdir(path)
+        else:
+            os.remove(path)
 from datetime import datetime
 from collections import defaultdict
 import builtins
@@ -867,11 +880,11 @@ def run_organizer(folder=None):
                 errors += 1  # type: ignore
                 print(f"  ❌ {c['description'].strip()}: {e}")
 
-        # Remove now-empty episode subfolders that were flattened (best-effort)
+        # Send now-empty episode subfolders to trash (best-effort)
         for ep_dir in ep_dirs_to_clean:
             try:
                 if os.path.isdir(ep_dir) and not os.listdir(ep_dir):
-                    os.rmdir(ep_dir)
+                    safe_delete(ep_dir)
             except Exception:
                 pass
         
