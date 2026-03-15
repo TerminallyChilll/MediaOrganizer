@@ -90,7 +90,9 @@ DEFAULT_STRIP_PATTERNS = [
     r'\b(FLUX|NTb|EDITH|MeGusta|mSD|DEFLATE|NTG|Pahe|TOMMY|MIXED|EZTVx?|RAWR|JFF|RiPSaL|CMRG|SiGMA)\b',
     # Website/URL prefixes (e.g. "www.UIndex.org    -    filename")
     r'(?:www\.\S+|https?://\S+)\s*[-–—]\s*',
-    r'\.mp4$|\.mkv$|\.avi$', r'&#?\w+;', r'\b(Phoenix\s*RG|MVGroup\.org|UIndex\.org)\b',
+    r'\.mp4$|\.mkv$|\.avi$|\.ts$|\.m4v$|\.wmv$|\.mov$', r'&#?\w+;', r'\b(Phoenix\s*RG|MVGroup\.org|UIndex\.org)\b',
+    # Streaming site file-type artifacts embedded in filename (e.g. "Show Ep Ts.ts" → "Ts" leftover)
+    r'\bTs\b',
 ]
 
 class NamingScheme:
