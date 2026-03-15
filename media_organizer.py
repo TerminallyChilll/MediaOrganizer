@@ -78,12 +78,19 @@ DEFAULT_STRIP_PATTERNS = [
     r'\d+\.?\d*\s?(MB|GB|mb|gb)', r'\d{3,4}MB',
     r'\b(x264|x265|h\.?264|h\.?265|hevc|xvid|divx|avc)\b',
     r'\b(AAC|AC3|DTS|DD5\.1|DD5|DD2\.0|DD2|FLAC|MP3|Atmos)\b',
+    r'\bDDP?\s*\d+[\s\.]\d+\b',  # DDP5.1, DD5.1, DDP5 1, DD5 1, etc. (dot or space separated)
     r'\b(WEBRip|Web-Rip|WebRip|WEB-DL|WebDL|WEBDL|WEB|BluRay|Blu-Ray|BRRip|BDRip|DVDRip|HDTV|PDTV)\b',
     r'\b(PROPER|REPACK|INTERNAL|LIMITED|UNRATED|EXTENDED|DC|DIRECTORS\.CUT)\b',
     r'\[(?![12]\d{3}\])[^\]]*\]',
     r'\b(Subs|Subtitle|Subtitles|iP|RARBG|YIFY|YTS)\b',
     r'\b(GalaxyRG|RARBG|YTS|YIFY|ETRG|Pahe|PSA|STUTTERSHIT|CMRG|TGx|EVO|ION10|ION265)\b',
-    r'\.mp4$|\.mkv$|\.avi$', r'&#?\w+;', r'\b(Phoenix\s*RG|MVGroup\.org)\b',
+    # Streaming service source tags
+    r'\b(PCOK|AMZN|DSNP|HMAX|ATVP|PMTP|NFLX|CRKL|STAN|BCORE|iP)\b',
+    # Common release group names
+    r'\b(FLUX|NTb|EDITH|MeGusta|mSD|DEFLATE|NTG|Pahe|TOMMY|MIXED|EZTVx?|RAWR|JFF|RiPSaL|CMRG|SiGMA)\b',
+    # Website/URL prefixes (e.g. "www.UIndex.org    -    filename")
+    r'(?:www\.\S+|https?://\S+)\s*[-–—]\s*',
+    r'\.mp4$|\.mkv$|\.avi$', r'&#?\w+;', r'\b(Phoenix\s*RG|MVGroup\.org|UIndex\.org)\b',
 ]
 
 class NamingScheme:
@@ -423,7 +430,7 @@ def clean_title(folder_name, custom_patterns, case_sensitive=False):
     for pattern in quality_patterns: title = re.sub(pattern, '', title, flags=re.IGNORECASE)
     for pattern in DEFAULT_STRIP_PATTERNS: title = re.sub(pattern, '', title, flags=re.IGNORECASE)
     
-    spaced_patterns = [r'\bH\s*264\b', r'\bH\s*265\b', r'\bAAC2?\s*0\b', r'\bDD5?\s*1\b', r'\bDD2?\s*0\b']
+    spaced_patterns = [r'\bH\s*264\b', r'\bH\s*265\b', r'\bAAC2?\s*0\b', r'\bDD5?\s*1\b', r'\bDD2?\s*0\b', r'\bDDP?\s*\d+[\s\.]\s*\d+\b']
     for pattern in spaced_patterns: title = re.sub(pattern, '', title, flags=re.IGNORECASE)
     flags = 0 if case_sensitive else re.IGNORECASE
     for pattern in custom_patterns: title = re.sub(re.escape(pattern), '', title, flags=flags)
@@ -478,6 +485,21 @@ def scan_tv_show_seasons(show_path):
                     })
         return episodes
     
+    # Also collect loose video files sitting directly in show_path (even when season/episode folders exist)
+    seen_rel_paths = set()
+    for item in items:
+        item_path = os.path.join(show_path, item)
+        if os.path.isfile(item_path) and os.path.splitext(item)[1].lower() in VIDEO_EXTENSIONS:
+            s, e = extract_season_episode(item)
+            if s and e and item not in seen_rel_paths:
+                seen_rel_paths.add(item)
+                episodes.append({
+                    'season_folder': '', 'season_num': s, 'episode_num': e,
+                    'filename': item, 'year': extract_year(item),
+                    'size': os.path.getsize(item_path) / (1024**3),
+                    'rel_path': item
+                })
+
     for season_folder in season_folders:
         season_path = os.path.join(show_path, season_folder)
         season_match = re.search(r'(\d{1,2})', season_folder)
@@ -496,12 +518,14 @@ def scan_tv_show_seasons(show_path):
                             if file_year and not season_year: season_year = file_year
                             # Store relative path from season folder
                             rel_path = os.path.relpath(file_path, os.path.join(show_path))
-                            season_episodes.append({
-                                'season_folder': season_folder, 'season_num': s, 'episode_num': e,
-                                'filename': file, 'year': file_year, 
-                                'size': os.path.getsize(file_path) / (1024**3),
-                                'rel_path': rel_path
-                            })
+                            if rel_path not in seen_rel_paths:
+                                seen_rel_paths.add(rel_path)
+                                season_episodes.append({
+                                    'season_folder': season_folder, 'season_num': s, 'episode_num': e,
+                                    'filename': file, 'year': file_year,
+                                    'size': os.path.getsize(file_path) / (1024**3),
+                                    'rel_path': rel_path
+                                })
         except Exception: pass
         for ep in season_episodes:
             if not ep['year']: ep['year'] = season_year
@@ -599,11 +623,23 @@ def organize_season_structure(show_path):
         if s_match and not episode_folder_pattern.search(folder):
             existing_seasons[int(s_match.group(2))] = folder
     
+    # Step 1b: Identify loose episode FILES sitting directly in the show root
+    loose_episode_files = {}  # season_num -> [filenames]
+    try:
+        for item in os.listdir(show_path):
+            item_path = os.path.join(show_path, item)
+            if os.path.isfile(item_path) and os.path.splitext(item)[1].lower() in VIDEO_EXTENSIONS:
+                s, e = extract_season_episode(item)
+                if s is not None:
+                    loose_episode_files.setdefault(s, []).append(item)
+    except Exception:
+        pass
+
     # Step 2: Plan moves — loose episode folders into season folders
     for snum, ep_folders in sorted(loose_episodes.items()):
         target_season = f"Season {snum}"
         target_path = os.path.join(show_path, target_season)
-        
+
         for ep_folder in sorted(ep_folders):
             old_path = os.path.join(show_path, ep_folder)
             new_path = os.path.join(target_path, ep_folder)
@@ -612,6 +648,20 @@ def organize_season_structure(show_path):
                 'old_path': old_path,
                 'new_path': new_path,
                 'description': f"  📦 {ep_folder}  →  {target_season}/{ep_folder}"
+            })
+
+    # Step 2b: Plan moves — loose episode files into season folders
+    for snum, filenames in sorted(loose_episode_files.items()):
+        target_season = f"Season {snum}"
+        target_path = os.path.join(show_path, target_season)
+        for filename in sorted(filenames):
+            old_path = os.path.join(show_path, filename)
+            new_path = os.path.join(target_path, filename)
+            changes.append({
+                'type': 'move_to_season',
+                'old_path': old_path,
+                'new_path': new_path,
+                'description': f"  📦 {filename}  →  {target_season}/{filename}"
             })
     
     # Step 3: Plan renames — normalize season folder names
@@ -626,14 +676,46 @@ def organize_season_structure(show_path):
                 'new_path': new_path,
                 'description': f"  ✏️  {folder_name}  →  {target_name}"
             })
-    
+
+    # Step 4: Flatten episode-named subfolders inside existing season folders.
+    # e.g. Season 4/Show S04E10 Title/Show.S04E10.mp4  →  Season 4/Show.S04E10.mp4
+    MEDIA_EXTENSIONS = set(VIDEO_EXTENSIONS) | {'.nfo', '.jpg', '.jpeg', '.png', '.srt', '.sub', '.ass', '.ssa'}
+    for snum, folder_name in sorted(existing_seasons.items()):
+        season_path = os.path.join(show_path, folder_name)
+        if not os.path.isdir(season_path):
+            continue
+        try:
+            for ep_dir in sorted(os.listdir(season_path)):
+                ep_dir_path = os.path.join(season_path, ep_dir)
+                if not os.path.isdir(ep_dir_path):
+                    continue
+                if not episode_folder_pattern.search(ep_dir):
+                    continue
+                # Move each media file from the episode subfolder up to the season folder
+                try:
+                    for media_file in sorted(os.listdir(ep_dir_path)):
+                        media_path = os.path.join(ep_dir_path, media_file)
+                        if os.path.isfile(media_path) and os.path.splitext(media_file)[1].lower() in MEDIA_EXTENSIONS:
+                            new_media_path = os.path.join(season_path, media_file)
+                            changes.append({
+                                'type': 'flatten_to_season',
+                                'old_path': media_path,
+                                'new_path': new_media_path,
+                                'ep_dir': ep_dir_path,
+                                'description': f"  📂→📄 {folder_name}/{ep_dir}/{media_file}  →  {folder_name}/{media_file}"
+                            })
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     return changes
 
 
 def _folder_has_episodes_or_seasons(path):
-    """Check if a folder directly contains episode folders (SxxExx / NxN) or season folders."""
+    """Check if a folder directly contains episode folders (SxxExx / NxN), season folders, or loose episode files."""
     try:
-        folders = [f for f in os.listdir(path) if os.path.isdir(os.path.join(path, f))]
+        items = os.listdir(path)
     except Exception:
         return False
     # Matches SxxExx or bare NxN (e.g. 1x2, 9x9) — both are clear episode indicators
@@ -644,7 +726,16 @@ def _folder_has_episodes_or_seasons(path):
     season_like_pat = re.compile(r'^([^\-\|.]+?)\s+[Ss](\d{1,2})(?:\s*\(?\d{4}\)?)?\s*$')
     def _is_season_like(f):
         return bool(season_like_pat.match(f))
-    return any(ep_pat.search(f) or season_pat.search(f) or _is_season_like(f) for f in folders)
+    for f in items:
+        full = os.path.join(path, f)
+        if os.path.isdir(full):
+            if ep_pat.search(f) or season_pat.search(f) or _is_season_like(f):
+                return True
+        elif os.path.isfile(full):
+            # Loose video file with episode marker — e.g. Show.S01E01.mkv in show root
+            if os.path.splitext(f)[1].lower() in VIDEO_EXTENSIONS and ep_pat.search(f):
+                return True
+    return False
 
 
 def run_organizer(folder=None):
@@ -731,13 +822,22 @@ def run_organizer(folder=None):
         errors: int = 0
         
         flat_changes = [(show, c) for show, changes in all_changes for c in changes]
-        flat_changes.sort(key=lambda x: 0 if x[1]['type'] == 'move_to_season' else 1)
-        
+        # Order: move season groups first, then flatten files inside season folders, then renames
+        def _sort_key(x):
+            t = x[1]['type']
+            if t == 'move_to_season': return 0
+            if t == 'flatten_to_season': return 1
+            return 2  # rename_season
+        flat_changes.sort(key=_sort_key)
+
         # Collect successful moves in order so the undo script can reverse them correctly.
         # Renames must be undone BEFORE the moves they depend on — we track them separately.
-        undo_renames: list[tuple[str, str]] = []  # (actual_dst, actual_src)
-        undo_moves:   list[tuple[str, str]] = []  # (actual_dst, actual_src)
-        
+        undo_renames:  list[tuple[str, str]] = []  # (actual_dst, actual_src)
+        undo_moves:    list[tuple[str, str]] = []  # (actual_dst, actual_src)
+        undo_flattens: list[tuple[str, str, str]] = []  # (actual_dst, actual_src, ep_dir)
+        # Track which ep_dirs had successful flattens so we can rmdir them after
+        ep_dirs_to_clean: set[str] = set()
+
         for show, c in flat_changes:
             old_p = Path(c['old_path'])
             new_p = Path(c['new_path'])
@@ -754,6 +854,9 @@ def run_organizer(folder=None):
                 actual_dst = str(new_p.resolve()) if new_p.exists() else str(new_p)
                 if c['type'] == 'rename_season':
                     undo_renames.append((actual_dst, str(old_p)))
+                elif c['type'] == 'flatten_to_season':
+                    undo_flattens.append((actual_dst, str(old_p), c['ep_dir']))
+                    ep_dirs_to_clean.add(c['ep_dir'])
                 else:
                     undo_moves.append((actual_dst, str(old_p)))
                 success += 1  # type: ignore
@@ -761,6 +864,14 @@ def run_organizer(folder=None):
             except Exception as e:
                 errors += 1  # type: ignore
                 print(f"  ❌ {c['description'].strip()}: {e}")
+
+        # Remove now-empty episode subfolders that were flattened (best-effort)
+        for ep_dir in ep_dirs_to_clean:
+            try:
+                if os.path.isdir(ep_dir) and not os.listdir(ep_dir):
+                    os.rmdir(ep_dir)
+            except Exception:
+                pass
         
         print(f"\n✅ Done! {success} changes applied, {errors} errors.")
         
@@ -776,6 +887,19 @@ def run_organizer(folder=None):
                     f.write('#!/bin/bash\necho "Undoing organize changes..."\n')
                 # Undo renames first (reverse order)
                 for dst, src in reversed(undo_renames):
+                    if os.name == 'nt':
+                        f.write(f'move "{dst}" "{src}"\n')
+                    else:
+                        f.write(f'mv "{dst}" "{src}"\n')
+                # Undo flattens (reverse order) — recreate ep_dir then move file back
+                seen_ep_dirs: set[str] = set()
+                for dst, src, ep_dir in reversed(undo_flattens):
+                    if ep_dir not in seen_ep_dirs:
+                        seen_ep_dirs.add(ep_dir)
+                        if os.name == 'nt':
+                            f.write(f'mkdir "{ep_dir}"\n')
+                        else:
+                            f.write(f'mkdir -p "{ep_dir}"\n')
                     if os.name == 'nt':
                         f.write(f'move "{dst}" "{src}"\n')
                     else:
@@ -1111,9 +1235,17 @@ def detect_changes(df_movies, movies_path, df_tv, tv_path, scheme, folder_patter
                         changes.append({'type': 'movie_file', 'old_name': vf, 'new_name': new_file_name, 'old_path': str(old_file_path), 'new_path': str(new_file_path), 'exists': old_file_path.exists()})
     
     if df_tv is not None and tv_path:
+        # Pattern to detect when the scanner was run on a single show root:
+        # in that case each "show folder" in the Excel is actually a Season X folder.
+        _season_folder_re = re.compile(r'^Season\s+\d+$', re.IGNORECASE)
+
         for show_folder, show_episodes in df_tv.groupby('Show Folder'):
             first_ep = show_episodes.iloc[0]
-            
+
+            # If the show_folder matches "Season N", the tv_path IS the show root
+            # and each show_folder entry is really a season — don't nest paths further.
+            show_is_season = bool(_season_folder_re.match(str(show_folder)))
+
             # Use LLM result if available for show folder, otherwise regex
             if llm_results and show_folder in llm_results:  # type: ignore
                 llm_r = llm_results[show_folder]  # type: ignore
@@ -1123,33 +1255,34 @@ def detect_changes(df_movies, movies_path, df_tv, tv_path, scheme, folder_patter
                 base_show = clean_title(show_folder, folder_patterns, folder_case_sensitive)
                 title = get_val(first_ep, 'Title Fixed', base_show, is_literal=True)
             if not title or pd.isna(title): continue
-            
+
             new_show_folder = build_tv_show_folder_name(title, None, scheme)
-            if new_show_folder != show_folder:
+            if new_show_folder != show_folder and not show_is_season:
                 changes.append({'type': 'tv_show', 'old_name': show_folder, 'new_name': new_show_folder, 'old_path': str(Path(tv_path) / str(show_folder)), 'new_path': str(Path(tv_path) / new_show_folder), 'exists': (Path(tv_path) / str(show_folder)).exists()})
-            
+
             for season_num, season_episodes in show_episodes.groupby('Season'):
                 if pd.isna(season_num): continue
                 season_num = int(season_num)
                 season_year = season_episodes.iloc[0].get('Season Year', '')
                 old_season_folder = f"Season {season_num}"
                 new_season_folder = build_season_folder_name(season_num, season_year, scheme)
-                if new_season_folder != old_season_folder:
+                # Only propose season-folder rename when show_folder is a real show (not itself a season)
+                if new_season_folder != old_season_folder and not show_is_season:
                     changes.append({'type': 'tv_season', 'old_name': old_season_folder, 'new_name': new_season_folder, 'old_path': str(Path(tv_path) / str(show_folder) / old_season_folder), 'new_path': str(Path(tv_path) / str(show_folder) / new_season_folder), 'exists': (Path(tv_path) / str(show_folder) / old_season_folder).exists()})
-                
+
                 for _, episode in season_episodes.iterrows():
                     episode_file = episode.get('Episode File', '')
                     quality = get_val(episode, 'Quality Fixed', 'Quality')
                     size_gb = episode.get('Size (GB)', '')
                     if not episode_file or pd.isna(episode_file): continue
-                    
+
                     # Apply file patterns to episode filename manually
                     episode_base = Path(str(episode_file)).name
                     orig_name, orig_ext = os.path.splitext(episode_base)
                     # Extract season/episode to protect it during stripping
                     s, e = extract_season_episode(episode_base)
                     se_code = f"S{s:02d}E{e:02d}" if s and e else ""
-                    
+
                     # Use LLM result if available, otherwise regex
                     if llm_results and episode_base in llm_results:  # type: ignore
                         llm_r = llm_results[episode_base]  # type: ignore
@@ -1160,7 +1293,7 @@ def detect_changes(df_movies, movies_path, df_tv, tv_path, scheme, folder_patter
                         ep_clean = clean_title(episode_base, file_patterns, file_case_sensitive)
                         if se_code and se_code not in ep_clean:
                             ep_clean = f"{se_code} - {ep_clean}"
-                    
+
                     # Build name and ensure original extension is preserved
                     new_episode_name = build_episode_file_name(ep_clean, season_year, quality, size_gb, scheme)
                     # Force the original extension back on in case clean_title stripped it
@@ -1170,7 +1303,12 @@ def detect_changes(df_movies, movies_path, df_tv, tv_path, scheme, folder_patter
                     old_episode_name = episode_base
                     if new_episode_name != old_episode_name:
                         old_path = Path(tv_path) / str(show_folder) / str(episode_file)
-                        new_path = Path(tv_path) / str(show_folder) / new_season_folder / new_episode_name
+                        if show_is_season:
+                            # tv_path is the show root; show_folder IS the season folder —
+                            # place the renamed episode directly inside it (flatten episode subfolders)
+                            new_path = Path(tv_path) / str(show_folder) / new_episode_name
+                        else:
+                            new_path = Path(tv_path) / str(show_folder) / new_season_folder / new_episode_name
                         changes.append({'type': 'tv_episode', 'old_name': old_episode_name, 'new_name': new_episode_name, 'old_path': str(old_path), 'new_path': str(new_path), 'exists': old_path.exists()})
     return changes
 
