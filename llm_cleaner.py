@@ -4,7 +4,7 @@ Supports: Gemini, OpenAI, and Ollama (local).
 Uses only stdlib (urllib + json) — no pip installs required.
 """
 
-import json, os, urllib.request, urllib.error, ssl
+import json, os, urllib.request, urllib.error, ssl, time
 
 LLM_CONFIG_FILE = ".media_llm_config.json"
 
@@ -52,36 +52,61 @@ Return ONLY the JSON array, nothing else:"""
 
 # ─── API Callers ──────────────────────────────────────────────────────
 
-def _make_request(url, data, headers, timeout=60):
-    """Make an HTTP POST request and return the response body as string."""
+def _make_request(url, data, headers, timeout=60, retries=3):
+    """Make an HTTP POST request and return the response body as string with retries."""
     body = json.dumps(data).encode('utf-8')
-    req = urllib.request.Request(url, data=body, headers=headers, method='POST')
     
-    # Create SSL context that works on Windows
+    # Create SSL context that works on Windows/macOS
     ctx = ssl.create_default_context()
     
-    try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            return json.loads(resp.read().decode('utf-8'))
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode('utf-8') if e.fp else ''
-        raise Exception(f"HTTP {e.code}: {error_body[:200]}")  # type: ignore
-    except urllib.error.URLError as e:
-        raise Exception(f"Connection failed: {e.reason}")
+    last_err = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, data=body, headers=headers, method='POST')
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8') if e.fp else ''
+            # If 429 (Too Many Requests), wait and retry
+            if e.code == 429:
+                wait = (attempt + 1) * 5
+                time.sleep(wait)
+                continue
+            raise Exception(f"HTTP {e.code}: {error_body[:200]}")
+        except Exception as e:
+            last_err = e
+            time.sleep(2)
+            continue
+            
+    raise last_err or Exception("Request failed after retries")
 
 
 def call_gemini(filenames, api_key, model="gemini-2.0-flash"):
     """Call Google Gemini API."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    
+    # Using JSON mode if supported (Gemini 1.5+)
+    is_json_mode = "1.5" in model or "2.0" in model
+    
     data = {
         "contents": [{"parts": [{"text": build_prompt(filenames)}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 8192}
+        "generationConfig": {
+            "temperature": 0.1, 
+            "maxOutputTokens": 8192,
+        }
     }
+    
+    if is_json_mode:
+        data["generationConfig"]["responseMimeType"] = "application/json" # type: ignore
+        
     headers = {"Content-Type": "application/json"}
     
     resp = _make_request(url, data, headers, timeout=120)
-    text = resp['candidates'][0]['content']['parts'][0]['text']
-    return _parse_llm_response(text, filenames)
+    try:
+        text = resp['candidates'][0]['content']['parts'][0]['text']
+        return _parse_llm_response(text, filenames)
+    except (KeyError, IndexError) as e:
+        raise Exception(f"Gemini API format error: {e}")
 
 
 def call_openai(filenames, api_key, model="gpt-4o-mini"):
@@ -94,7 +119,8 @@ def call_openai(filenames, api_key, model="gpt-4o-mini"):
             {"role": "user", "content": build_prompt(filenames)}
         ],
         "temperature": 0.1,
-        "max_tokens": 8192
+        "max_tokens": 8192,
+        "response_format": {"type": "json_object"}
     }
     headers = {
         "Content-Type": "application/json",
@@ -102,8 +128,11 @@ def call_openai(filenames, api_key, model="gpt-4o-mini"):
     }
     
     resp = _make_request(url, data, headers, timeout=120)
-    text = resp['choices'][0]['message']['content']
-    return _parse_llm_response(text, filenames)
+    try:
+        text = resp['choices'][0]['message']['content']
+        return _parse_llm_response(text, filenames)
+    except (KeyError, IndexError) as e:
+        raise Exception(f"OpenAI API format error: {e}")
 
 
 def list_ollama_models(base_url="http://localhost:11434"):
@@ -128,6 +157,7 @@ def call_ollama(filenames, model="llama3", base_url="http://localhost:11434"):
             {"role": "user", "content": build_prompt(filenames)}
         ],
         "stream": False,
+        "format": "json", # Forces JSON output
         "options": {"temperature": 0.1}
     }
     headers = {"Content-Type": "application/json"}
@@ -142,7 +172,6 @@ def call_ollama(filenames, model="llama3", base_url="http://localhost:11434"):
 def _parse_llm_response(text, original_filenames):
     """Parse the LLM's JSON response into a dict of {original: {title, year, quality}}."""
     if not text or not text.strip():
-        print("      ⚠️ LLM returned empty response")
         return {}
     
     raw_text = text.strip()
@@ -150,9 +179,10 @@ def _parse_llm_response(text, original_filenames):
     # Strip markdown code fences if present
     if raw_text.startswith('```'):
         lines = raw_text.split('\n')
+        # Skip the ```json or ``` line
         raw_text = '\n'.join(lines[1:])
         if raw_text.rstrip().endswith('```'):
-            raw_text = raw_text.rstrip()[:-3]  # type: ignore
+            raw_text = raw_text.rstrip()[:-3] # type: ignore
         raw_text = raw_text.strip()
     
     # Try direct JSON parse first
@@ -162,19 +192,24 @@ def _parse_llm_response(text, original_filenames):
     except json.JSONDecodeError:
         pass
     
-    # Try to extract JSON array from text
+    # If the LLM returned a wrapped object like {"results": [...]}, unwrap it
+    if isinstance(results, dict) and len(results) == 1:
+        key = next(iter(results))
+        if isinstance(results[key], list):
+            results = results[key]
+    
+    # Try to extract JSON array from text if direct parse failed
     if results is None:
         start = raw_text.find('[')
         end = raw_text.rfind(']')
         if start != -1 and end != -1 and end > start:
-            json_candidate = raw_text[start:end+1]  # type: ignore
+            json_candidate = raw_text[start:end+1] # type: ignore
             try:
                 results = json.loads(json_candidate)
             except json.JSONDecodeError:
-                # Try fixing common local model issues: trailing commas, single quotes
-                fixed = json_candidate.replace("'", '"')
-                # Remove trailing commas before ] or }
+                # Try fixing common local model issues
                 import re as _re
+                fixed = json_candidate.replace("'", '"')
                 fixed = _re.sub(r',\s*]', ']', fixed)
                 fixed = _re.sub(r',\s*}', '}', fixed)
                 try:
@@ -183,13 +218,13 @@ def _parse_llm_response(text, original_filenames):
                     pass
     
     if results is None:
-        # Show first 300 chars of the response for debugging
-        preview = raw_text[:300].replace('\n', ' ')  # type: ignore
-        print(f"      ⚠️ Could not parse LLM response as JSON. Preview: {preview}...")
         return {}
     
+    # If it's a single dict instead of a list, wrap it
+    if isinstance(results, dict):
+        results = [results]
+    
     if not isinstance(results, list):
-        print(f"      ⚠️ LLM returned {type(results).__name__} instead of a list")
         return {}
     
     # Build lookup dict - be flexible with field names
@@ -197,30 +232,26 @@ def _parse_llm_response(text, original_filenames):
     for item in results:
         if not isinstance(item, dict):
             continue
+            
         # Try multiple possible field names the LLM might use
-        original = item.get('original', '') or item.get('filename', '') or item.get('input', '') or item.get('name', '')
-        title = item.get('title', '') or item.get('clean_title', '') or item.get('cleaned', '')
-        year = item.get('year', '') or item.get('release_year', '')
-        quality = item.get('quality', '') or item.get('resolution', '')
+        original = item.get('original') or item.get('filename') or item.get('input') or item.get('name')
+        title = item.get('title') or item.get('clean_title') or item.get('cleaned')
+        year = item.get('year') or item.get('release_year')
+        quality = item.get('quality') or item.get('resolution')
         
         if original and title:
-            cleaned[original] = {
+            cleaned[str(original)] = {
                 'title': str(title).strip(),
                 'year': str(year).strip() if year else '',
                 'quality': str(quality).strip() if quality else ''
             }
-    
-    if not cleaned and results:
-        # We parsed JSON but couldn't match fields - show what we got
-        sample = results[0] if results else {}
-        print(f"      ⚠️ Parsed {len(results)} items but couldn't extract data. Sample keys: {list(sample.keys()) if isinstance(sample, dict) else 'N/A'}")
     
     return cleaned
 
 
 # ─── Main Entry Point ─────────────────────────────────────────────────
 
-def clean_titles_with_llm(filenames, provider, api_key=None, model=None, ollama_url=None):
+def clean_titles_with_llm(filenames, provider, api_key=None, model=None, ollama_url=None, pbar=None):
     """
     Clean a list of filenames using the specified LLM provider.
     Returns dict: {original_filename: {title, year, quality}}
@@ -228,17 +259,12 @@ def clean_titles_with_llm(filenames, provider, api_key=None, model=None, ollama_
     if not filenames:
         return {}
     
-    # Process in batches — smaller for local models
-    batch_size = 10 if provider == 'ollama' else 25
+    # Process in batches — smaller for local models to avoid context overflow/timeout
+    batch_size = 15 if provider == 'ollama' else 40
     all_results = {}
     
     for i in range(0, len(filenames), batch_size):
-        batch = filenames[i:i+batch_size]  # type: ignore
-        batch_num = (int(i) // int(batch_size)) + 1
-        total_batches = (len(filenames) + int(batch_size) - 1) // int(batch_size)
-        
-        if total_batches > 1:
-            print(f"   🤖 Processing batch {batch_num}/{total_batches} ({len(batch)} names)...")
+        batch = filenames[i:i+batch_size] # type: ignore
         
         try:
             if provider == 'gemini':
@@ -251,7 +277,13 @@ def clean_titles_with_llm(filenames, provider, api_key=None, model=None, ollama_
                 raise Exception(f"Unknown provider: {provider}")
             
             all_results.update(results)
+            
+            if pbar:
+                pbar.update(len(batch))
         except Exception as e:
-            print(f"   ❌ LLM error on batch {batch_num}: {e}")
-    
+            if pbar:
+                pbar.write(f"   ❌ LLM error on batch: {e}")
+            else:
+                print(f"   ❌ LLM error on batch: {e}")
+                
     return all_results

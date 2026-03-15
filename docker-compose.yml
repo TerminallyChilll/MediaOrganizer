@@ -1,6 +1,6 @@
-version: '3.8'
-
 services:
+  # 🧪 Interactive Wizard: Use this to run the CLI normally
+  # Command: docker compose run --rm media-organizer
   media-organizer:
     build: .
     image: media-organizer:latest
@@ -12,8 +12,31 @@ services:
       # Mount the current directory so configs and the excel sheet persist
       - .:/app
       # ⚠️ IMPORTANT: Mount your actual media folders here!
-      # Format is "- /host/path/to/media:/container/path"
-      # Examples:
-      # - /volume1/Media/Movies:/media/Movies
-      # - /volume1/Media/TV Shows:/media/TV_Shows
-      # - C:\Users\Shared\Videos:/media/Videos
+      # We recommend mapping them to /media/Movies and /media/TV_Shows
+      - /mnt/nas-media/Movies:/media/Movies:ro
+      - /mnt/nas-media/TV Shows:/media/TV_Shows:ro
+    environment:
+      - TZ=${TZ:-America/New_York}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # 🤖 Automated Task: Example for running a non-interactive scan
+  # Command: docker compose run --rm media-scanner
+  media-scanner:
+    image: media-organizer:latest
+    container_name: media-scanner
+    volumes:
+      - .:/app
+      - /mnt/nas-media/Movies:/media/Movies:ro
+      - /mnt/nas-media/TV Shows:/media/TV_Shows:ro
+    environment:
+      - TZ=${TZ:-America/New_York}
+    command: ["python", "media_organizer.py", "--action", "scan", "--movies", "/media/Movies", "--tv", "/media/TV_Shows", "--output", "automated_scan.xlsx", "--no-emoji"]
+
+networks:
+  default:
+    name: pangolin
+    external: true

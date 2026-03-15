@@ -898,62 +898,67 @@ def run_scanner(movies_path=None, tv_path=None, output_file=None):
     if movies or tv_shows:
         print(f"\n📊 {'Updating' if append_mode else 'Creating'} Excel file: {output_file}")
         
+        movies_df = pd.DataFrame()
+        tv_df = pd.DataFrame()
+        meta_dict = {}
+
         if append_mode:
             try:
-                # Need to read existing data to append properly if sheets exist
-                existing_movies, existing_tv = pd.DataFrame(), pd.DataFrame()
-                existing_meta_dict: dict[str, str] = {}
-                
                 excel = pd.ExcelFile(output_file)
                 if 'Movies' in excel.sheet_names:
-                    existing_movies = pd.read_excel(output_file, sheet_name='Movies')
+                    movies_df = pd.read_excel(output_file, sheet_name='Movies')
                 if 'TV Shows' in excel.sheet_names:
-                    existing_tv = pd.read_excel(output_file, sheet_name='TV Shows')
+                    tv_df = pd.read_excel(output_file, sheet_name='TV Shows')
                 if 'Metadata' in excel.sheet_names:
                     df_meta = pd.read_excel(output_file, sheet_name='Metadata')
-                    existing_meta_dict = dict(zip(df_meta['Key'].astype(str), df_meta['Value'].astype(str)))
+                    meta_dict = dict(zip(df_meta['Key'].astype(str), df_meta['Value'].astype(str)))
                     
-                # Append new data
                 if movies:
                     df_new_m = pd.DataFrame(movies)
-                    movies_df = pd.concat([existing_movies, df_new_m]).drop_duplicates(subset=['Folder Name'], keep='last')
-                else:
-                    movies_df = existing_movies
-                    
+                    movies_df = pd.concat([movies_df, df_new_m]).drop_duplicates(subset=['Folder Name'], keep='last')
                 if tv_shows:
                     df_new_t = pd.DataFrame(tv_shows)
-                    tv_df = pd.concat([existing_tv, df_new_t]).drop_duplicates(subset=['Show Folder', 'Season', 'Episode'], keep='last')
-                else:
-                    tv_df = existing_tv
-                    
-                # Update Metadata
-                if movies_path: existing_meta_dict['Movies Path'] = movies_path
-                if tv_path: existing_meta_dict['TV Shows Path'] = tv_path
-                meta_df = pd.DataFrame(list(existing_meta_dict.items()), columns=['Key', 'Value'])
-
-                with pd.ExcelWriter(output_file, engine='openpyxl', mode='w') as writer:
-                    if not movies_df.empty: movies_df.to_excel(writer, sheet_name='Movies', index=False)
-                    if not tv_df.empty: tv_df.to_excel(writer, sheet_name='TV Shows', index=False)
-                    meta_df.to_excel(writer, sheet_name='Metadata', index=False)
-                    
+                    tv_df = pd.concat([tv_df, df_new_t]).drop_duplicates(subset=['Show Folder', 'Season', 'Episode'], keep='last')
             except Exception as e:
-                print(f"❌ Error appending to Excel: {e}")
+                print(f"❌ Error reading existing Excel: {e}")
                 return
         else:
-            try:
-                with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-                    if movies: pd.DataFrame(movies).to_excel(writer, sheet_name='Movies', index=False)
-                    if tv_shows: pd.DataFrame(tv_shows).to_excel(writer, sheet_name='TV Shows', index=False)
-                    
-                    # Save Base Directory Paths in Metadata sheet
-                    metadata = []
-                    if movies_path: metadata.append({'Key': 'Movies Path', 'Value': movies_path})
-                    if tv_path: metadata.append({'Key': 'TV Shows Path', 'Value': tv_path})
-                    pd.DataFrame(metadata).to_excel(writer, sheet_name='Metadata', index=False)
-            except PermissionError:
-                print(f"\n❌ Cannot write to '{output_file.name}' — it is open in another program.")
-                print("   Please close the file and try again.")
-                return
+            if movies: movies_df = pd.DataFrame(movies)
+            if tv_shows: tv_df = pd.DataFrame(tv_shows)
+
+        # Update Metadata
+        if movies_path: meta_dict['Movies Path'] = str(movies_path)
+        if tv_path: meta_dict['TV Shows Path'] = str(tv_path)
+        meta_dict['Last Scan'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        meta_df = pd.DataFrame(list(meta_dict.items()), columns=['Key', 'Value'])
+
+        try:
+            with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+                # Write sheets
+                if not movies_df.empty: movies_df.to_excel(writer, sheet_name='Movies', index=False)
+                if not tv_df.empty: tv_df.to_excel(writer, sheet_name='TV Shows', index=False)
+                meta_df.to_excel(writer, sheet_name='Metadata', index=False)
+                
+                # Auto-adjust column widths for all sheets
+                for sheetname in writer.sheets:
+                    worksheet = writer.sheets[sheetname]
+                    for col in worksheet.columns:
+                        max_length = 0
+                        column = col[0].column_letter # type: ignore
+                        for cell in col:
+                            try:
+                                if len(str(cell.value)) > max_length:
+                                    max_length = len(str(cell.value))
+                            except: pass
+                        adjusted_width = (max_length + 2)
+                        worksheet.column_dimensions[column].width = min(adjusted_width, 60) # Cap at 60
+                        
+        except PermissionError:
+            print(f"\n❌ Cannot write to '{output_file.name}' — it is open in another program.")
+            return
+        except Exception as e:
+            print(f"❌ Error writing Excel: {e}")
+            return
             
         print(f"✅ Saved results to {output_file}")
 
@@ -1296,7 +1301,8 @@ def run_renamer(movies_path=None, tv_path=None, excel_path=None):
                     
                     print(f"   📋 Processing {len(unique_names)} unique names...")
                     ollama_host = ollama_url if provider == 'ollama' else None
-                    llm_results = clean_titles_with_llm(unique_names, provider, api_key, model, ollama_url=ollama_host)
+                    with tqdm(total=len(unique_names), desc="🤖 AI Cleaning") as pbar:
+                        llm_results = clean_titles_with_llm(unique_names, provider, api_key, model, ollama_url=ollama_host, pbar=pbar)
                     
                     if llm_results:
                         print(f"   ✅ AI cleaned {len(llm_results)}/{len(unique_names)} names successfully!")
@@ -1727,7 +1733,13 @@ def run_extension_converter():
 # MAIN ENTRY
 # =========================
 
-def run_wizard():
+def run_wizard(args=None):
+    """Main interactive menu / wizard."""
+    # Handle non-interactive CLI args
+    if args and args.action:
+        _handle_cli_args(args)
+        return
+
     global USE_EMOJIS
     config_path = os.path.join(os.getcwd(), CONFIG_FILE_NAME)
     
@@ -1805,7 +1817,6 @@ def run_wizard():
             if choice == '7':
                 break
 
-                
             if choice == '6':
                 run_text_export()
                 continue
@@ -1887,13 +1898,52 @@ def run_wizard():
                 run_scanner(movies_path=movies_path, tv_path=tv_path, output_file=excel_path)
             
             else:
-                print("Invalid choice. Please enter 1-7.")
+                print("Invalid choice. Please enter 0-7.")
                 
         except BackNavigationException:
             pass # Already at top menu
 
+def _handle_cli_args(args):
+    """Handle non-interactive CLI execution."""
+    print(f"🚀 Running non-interactive action: {args.action}")
+    
+    movies_path = Path(args.movies).resolve() if args.movies else None
+    tv_path = Path(args.tv).resolve() if args.tv else None
+    excel_path = Path(args.output or "media_library.xlsx").resolve()
+    
+    if args.action == 'scan':
+        run_scanner(movies_path=movies_path, tv_path=tv_path, output_file=excel_path)
+    elif args.action == 'organize':
+        if not tv_path:
+            print("❌ Error: --tv path is required for 'organize' action.")
+            sys.exit(1)
+        run_organizer(folder=tv_path)
+    elif args.action == 'rename':
+        run_renamer(movies_path=movies_path, tv_path=tv_path, excel_path=excel_path)
+    elif args.action == 'full':
+        if tv_path: run_organizer(folder=tv_path)
+        run_scanner(movies_path=movies_path, tv_path=tv_path, output_file=excel_path)
+        run_renamer(movies_path=movies_path, tv_path=tv_path, excel_path=excel_path)
+    else:
+        print(f"❌ Unknown action: {args.action}")
+        sys.exit(1)
+
 def main():
-    run_wizard()
+    import argparse
+    parser = argparse.ArgumentParser(description="Unified Media Organizer")
+    parser.add_argument('--action', choices=['scan', 'organize', 'rename', 'full'], help="Non-interactive action to perform")
+    parser.add_argument('--movies', help="Path to movies folder")
+    parser.add_argument('--tv', help="Path to TV shows folder")
+    parser.add_argument('--output', help="Excel output file name")
+    parser.add_argument('--no-emoji', action='store_true', help="Disable emoji output")
+    
+    args = parser.parse_args()
+    
+    if args.no_emoji:
+        global USE_EMOJIS
+        USE_EMOJIS = False
+        
+    run_wizard(args)
 
 if __name__ == "__main__":
     if hasattr(sys.stdout, 'reconfigure'):
