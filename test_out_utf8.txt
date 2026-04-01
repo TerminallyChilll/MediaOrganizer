@@ -1,0 +1,25 @@
+
+============================================================
+  MEDIA ORGANIZER — organize_season_structure() Tests
+============================================================
+
+[FAIL]  WATCH-style folders are NOT treated as seasons
+       Expected: 0
+       Got:      2
+[PASS]  S01/S02/S03 produce 3 rename changes
+[PASS]  Target names are Season 1/2/3
+[PASS]  Snowfall S01/S02/S03 produce 3 rename changes
+[PASS]  3 loose episode folders produce 3 moves
+[PASS]  S01 episodes moved to Season 1
+[PASS]  S02 episodes moved to Season 2
+[PASS]  Already-organized show produces 0 changes
+[PASS]  Folder with SxxExx episode folders detected
+[PASS]  Folder with Season N folders detected
+[FAIL]  WATCH-style root folder NOT detected as having seasons
+       Expected: False
+       Got:      True
+
+============================================================
+  Results: 9/11 passed
+============================================================
+
