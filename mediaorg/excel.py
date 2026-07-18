@@ -229,7 +229,7 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
 
             new_folder = _clean(row.get('Folder Fixed')) or build_movie_folder_name(
                 p, _clean(row.get('Size (GB)')) if scheme.movie_folder_include_size else None, scheme)
-            if new_folder and new_folder != old_folder:
+            if new_folder and new_folder != Path(old_folder).name:
                 # Preserve the parent directory when Folder Name contains a
                 # nested path (e.g. "Collection/Movie.2020" from a recursive
                 # scan) so the rename stays in-place.
@@ -312,7 +312,7 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
             if not show_is_season:
                 new_show = _clean(first.get('Folder Fixed')) or \
                     build_tv_show_folder_name(p_show, scheme)
-                if new_show and new_show != show_folder:
+                if new_show and new_show != Path(show_folder).name:
                     # Preserve parent dir for nested show folders from
                     # recursive TV scans (e.g. "Parent/ShowName").
                     show_parent = Path(show_folder).parent
