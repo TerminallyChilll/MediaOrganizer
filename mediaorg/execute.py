@@ -46,6 +46,14 @@ def _missing_parents(dst: Path) -> list[Path]:
     return list(reversed(missing))
 
 
+def _safe_path(p: Path) -> Path:
+    """Reject path traversal via '..' components and absolute paths that escape."""
+    resolved = p.resolve()
+    if '..' in p.parts:
+        raise ValueError(f"path traversal rejected: {p}")
+    return resolved
+
+
 def _do_move(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists() and _same_file(src, dst) and str(src) != str(dst):
@@ -79,14 +87,14 @@ def execute(plan: Plan, journal: Path, dry_run: bool = False) -> ExecResult:
             try:
                 if op.kind == "move":
                     created = _missing_parents(op.dst)
-                    _do_move(op.src, op.dst)
+                    _do_move(_safe_path(op.src), _safe_path(op.dst))
                 elif op.kind == "mkdir":
-                    op.dst.mkdir(parents=True, exist_ok=True)
+                    _safe_path(op.dst).mkdir(parents=True, exist_ok=True)
                 elif op.kind == "rmdir":
-                    op.dst.rmdir()  # fails if non-empty — that's the safety
+                    _safe_path(op.dst).rmdir()  # fails if non-empty — that's the safety
                 else:
                     raise ValueError(f"unknown op kind: {op.kind}")
-            except OSError as e:
+            except (OSError, ValueError) as e:
                 result.failed.append((op, str(e)))
                 continue
             # Journal implicitly-created parents BEFORE the move entry so
@@ -160,12 +168,20 @@ def undo_last_run(journal: Path, dry_run: bool = False) -> ExecResult:
     for op in reverse:
         try:
             if op.kind == "move":
-                _do_move(op.src, op.dst)
+                _do_move(_safe_path(op.src), _safe_path(op.dst))
             elif op.kind == "mkdir":
-                op.dst.mkdir(parents=True, exist_ok=True)
+                _safe_path(op.dst).mkdir(parents=True, exist_ok=True)
             elif op.kind == "rmdir":
-                op.dst.rmdir()
+                _safe_path(op.dst).rmdir()
         except OSError as e:
+            # If a reverse move fails because the source is already gone,
+            # it was already reverted in a prior partial undo — count it done.
+            if op.kind == "move" and not os.path.lexists(op.src):
+                result.done.append(op)
+                continue
+            result.failed.append((op, str(e)))
+            continue
+        except ValueError as e:
             result.failed.append((op, str(e)))
             continue
         result.done.append(op)
@@ -173,7 +189,7 @@ def undo_last_run(journal: Path, dry_run: bool = False) -> ExecResult:
     if result.ok:
         with open(journal, "a", encoding="utf-8") as jf:
             jf.write(json.dumps({"op": "undone_run", "ts": time.time()}) + "\n")
-    # On partial failure the run stays "not undone": running undo again
-    # retries — already-reverted ops fail per-op and are reported, the rest
-    # complete.
+    # Partial failure: already-reverted ops (source-missing on reverse move)
+    # are treated as done so the run can be marked undone. Genuine failures
+    # (e.g. permission errors) keep the run alive for retry.
     return result

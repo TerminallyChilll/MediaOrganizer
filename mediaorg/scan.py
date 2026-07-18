@@ -59,7 +59,7 @@ def scan_movies(movies_root: Path, custom_patterns: list[str] = ()) -> list[dict
             'Year': year or '', 'Year Fixed': '',
             'Quality': quality or '', 'Quality Fixed': '',
             'Size (GB)': folder_size_gb(folder_path),
-            'Video Files': ', '.join(video_files), 'Files Fixed': '',
+            'Video Files': ' | '.join(video_files), 'Files Fixed': '',
         })
     return rows
 

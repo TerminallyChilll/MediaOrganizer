@@ -24,6 +24,8 @@ def apply_plan(plan):
         elif op.kind == "rmdir":
             if not any(op.dst.iterdir()):
                 op.dst.rmdir()
+        elif op.kind == "mkdir":
+            op.dst.mkdir(parents=True, exist_ok=True)
 
 
 # --- Regressions from the old (failing) suite -------------------------------
@@ -182,7 +184,8 @@ def test_plan_loose_movies(tmp_path):
     touch(tmp_path / "Already Foldered (2019)" / "m.mkv")
     plan = plan_loose_movies(tmp_path)
     dsts = {str(o.dst.relative_to(tmp_path)) for o in plan.ops}
-    assert dsts == {"Some.Movie.2020/Some.Movie.2020.mkv",
+    assert dsts == {"Some.Movie.2020",
+                    "Some.Movie.2020/Some.Movie.2020.mkv",
                     "Some.Movie.2020/Some.Movie.2020.srt"}
     apply_plan(plan)
     assert plan_loose_movies(tmp_path).ops == []  # idempotent

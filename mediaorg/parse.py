@@ -95,7 +95,8 @@ def parse_name(name: str, kind_hint: str | None = None,
     if title and 'country' in g:
         country = g['country']
         code = getattr(country, 'alpha2', str(country))
-        title = f"{title} ({code})"
+        if not title.endswith(f" ({code})"):
+            title = f"{title} ({code})"
 
     if not title:
         stem = _strip_video_ext(cleaned).strip()

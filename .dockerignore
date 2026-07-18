@@ -9,7 +9,7 @@ __pycache__
 .media_llm_config.json
 .media_renamer_config.json
 *.xlsx
-*.txt
+# *.txt  — removed: requirements.txt is needed for Docker build
 *.bat
 *.sh
 .vscode

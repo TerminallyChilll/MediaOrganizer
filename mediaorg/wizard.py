@@ -4,6 +4,7 @@ ASCII markers only ([OK], [!], ->): no emoji, no cp1252 crashes.
 """
 
 import argparse
+import getpass
 import json
 import os
 import sys
@@ -243,11 +244,8 @@ def run_organize(tv_path: str, dry_run: bool = False) -> None:
 
 def run_scan(movies_path, tv_path, excel_path: Path, dry_run: bool = False) -> None:
     patterns = load_custom_patterns()
-    if movies_path and not dry_run:
-        loose = plan_loose_movies(Path(movies_path))
-        if loose.ops or loose.skipped:
-            print("\nLoose movie files found in the Movies root:")
-            confirm_and_execute(loose, _journal_path(), dry_run, "loose-file moves")
+    # Loose movie moves are part of organize, not scan. Scan is read-only.
+    # The --action full flow handles loose movies in run_organize/run_rename.
 
     movies_rows = scan.scan_movies(Path(movies_path), patterns) if movies_path else []
     tv_rows = scan.scan_tv(Path(tv_path), patterns) if tv_path else []
@@ -278,6 +276,8 @@ def _ask_scheme(config: dict) -> NamingScheme:
         if ask_yes_no("Customize the naming scheme? (no = sensible defaults)",
                       default=False):
             for attr in vars(scheme):
+                if not isinstance(getattr(scheme, attr), bool):
+                    continue
                 label = attr.replace('_', ' ')
                 setattr(scheme, attr, ask_yes_no(f"  {label}?",
                                                  default=getattr(scheme, attr)))
@@ -293,7 +293,7 @@ def _llm_candidates(df_movies, df_tv, patterns) -> list[str]:
         names += [str(v) for v in df_movies['Folder Name'].dropna()]
         for vfs in df_movies.get('Video Files', []):
             if vfs and str(vfs) != 'nan':
-                names += [v.strip() for v in str(vfs).split(',') if v.strip()]
+                names += [v.strip() for v in str(vfs).split('|') if v.strip()]
     if df_tv is not None:
         names += [str(v) for v in df_tv['Show Folder'].dropna().unique()]
         names += [Path(str(v)).name for v in df_tv['Episode File'].dropna()]
@@ -345,11 +345,12 @@ def _ask_llm_results(df_movies, df_tv, patterns) -> dict:
                                          ollama_url=url)
     provider = prompt_input("Provider - [1] Gemini  [2] OpenAI [1]: ", default='1')
     provider = 'gemini' if provider != '2' else 'openai'
-    key = cfg.get(f'{provider}_key') or prompt_input(f"{provider} API key: ")
+    key = cfg.get(f'{provider}_key') or getpass.getpass(f"{provider} API key (input hidden): ")
     if not key:
         return {}
     cfg[f'{provider}_key'] = key
     llm.save_llm_config(cfg)
+    print(f"[!] API key saved to {llm.LLM_CONFIG_FILE} in plaintext. Restrict file permissions.")
     print(f"Cleaning {len(candidates)} name(s) with {provider}...")
     return llm.clean_titles_with_llm(candidates, provider, api_key=key)
 

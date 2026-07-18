@@ -147,11 +147,21 @@ def _companion_ops(video_path: Path, old_base: str, new_base: str) -> list[Op]:
 
 # --- Rename planning from the sheet -----------------------------------------
 
+def _safe_int_year(val) -> int | None:
+    """Convert a year value to int, returning None on failure."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    try:
+        return int(float(str(val).strip()))
+    except (ValueError, TypeError):
+        return None
+
+
 def _parsed_from_llm(llm_r: dict, fallback: ParsedName) -> ParsedName:
     p = ParsedName(**{**fallback.__dict__})
     p.title = llm_r.get('title') or p.title
     if llm_r.get('year'):
-        p.year = int(llm_r['year'])
+        p.year = _safe_int_year(llm_r['year'])
     p.source = "llm"
     return p
 
@@ -182,9 +192,9 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
             if get_val(row, 'Title Fixed', ''):
                 p.title = get_val(row, 'Title Fixed', '')
             if get_val(row, 'Year Fixed', ''):
-                p.year = int(get_val(row, 'Year Fixed', ''))
+                p.year = _safe_int_year(get_val(row, 'Year Fixed', ''))
             elif not p.year and _clean(row.get('Year')):
-                p.year = int(_clean(row.get('Year')))
+                p.year = _safe_int_year(_clean(row.get('Year')))
             quality = get_val(row, 'Quality Fixed', 'Quality')
             if quality:
                 p.quality = quality
@@ -232,7 +242,7 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
             s1 = show_eps[show_eps['Season'].astype(str).str.strip().isin(['1', '1.0'])]
             s1_year = _clean(s1.iloc[0].get('Season Year')) if len(s1) else ''
             if s1_year:
-                p_show.year = int(s1_year)
+                p_show.year = _safe_int_year(s1_year)
 
             season_ops: list[Op] = []
             for season_num, season_eps in show_eps.groupby('Season'):
@@ -260,13 +270,13 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
                         pe.episodes = [e]
                     if get_val(episode, 'Quality Fixed', ''):
                         pe.quality = get_val(episode, 'Quality Fixed', '')
-                    pe.year = int(season_year) if season_year else pe.year
+                    pe.year = _safe_int_year(season_year) if season_year else pe.year
 
                     new_base = _clean(episode.get('File Fixed')) or build_episode_file_name(
                         pe, ext,
                         _clean(episode.get('Size (GB)')) if scheme.tv_episode_include_size else None,
                         scheme)
-                    if not new_base.endswith(ext):
+                    if not new_base.lower().endswith(ext.lower()):
                         new_base += ext
                     if new_base != base:
                         ops.extend(_companion_ops(old_path, base, new_base))

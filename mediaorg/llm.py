@@ -15,14 +15,16 @@ def load_llm_config():
         try:
             with open(LLM_CONFIG_FILE, 'r') as f:
                 return json.load(f)
-        except Exception: pass
+        except Exception as e:
+            print(f"   [!] Could not load LLM config: {e}")
     return {}
 
 def save_llm_config(config):
     try:
         with open(LLM_CONFIG_FILE, 'w') as f:
             json.dump(config, f, indent=2)
-    except Exception: pass
+    except Exception as e:
+        print(f"   [!] Could not save LLM config: {e}")
 
 
 # ─── Shared Prompt ────────────────────────────────────────────────────
@@ -162,9 +164,12 @@ def call_ollama(filenames, model="llama3", base_url="http://localhost:11434"):
     }
     headers = {"Content-Type": "application/json"}
     
-    resp = _make_request(url, data, headers, timeout=300)
-    text = resp.get('message', {}).get('content', '')
-    return _parse_llm_response(text, filenames)
+    try:
+        resp = _make_request(url, data, headers, timeout=300)
+        text = resp.get('message', {}).get('content', '')
+        return _parse_llm_response(text, filenames)
+    except Exception as e:
+        raise Exception(f"Ollama API error: {e}")
 
 
 # ─── Response Parsing ─────────────────────────────────────────────────
