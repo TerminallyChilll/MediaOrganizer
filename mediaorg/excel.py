@@ -213,6 +213,13 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
                     pf = _parsed_from_llm(llm_results[vf], pf)
                 if get_val(row, 'Title Fixed', ''):
                     pf.title = get_val(row, 'Title Fixed', '')
+                # Honor Fixed-column overrides on file-level parses too,
+                # so Year Fixed / Quality Fixed apply uniformly to both
+                # folder and file renames.
+                if get_val(row, 'Year Fixed', ''):
+                    pf.year = _safe_int_year(get_val(row, 'Year Fixed', ''))
+                if get_val(row, 'Quality Fixed', 'Quality'):
+                    pf.quality = get_val(row, 'Quality Fixed', 'Quality')
                 pf.year = pf.year or p.year
                 pf.quality = pf.quality or p.quality
                 new_file = build_movie_file_name(pf, ext, _clean(row.get('Size (GB)')) if scheme.movie_file_include_size else None, scheme)

@@ -300,11 +300,16 @@ def run_scan(movies_path, tv_path, excel_path: Path, dry_run: bool = False) -> N
             print("   [!] Structured scan has gaps — running recursive walk for TV...")
             rec = scan.scan_recursive_tv(Path(tv_path), patterns)
             if rec:
-                structured = {r['Show Folder']: r for r in tv_rows
-                              if r.get('Episode File')}
+                # Key by (Show Folder, Episode File) so episodes from
+                # different sources for the same show don't clobber each
+                # other — a structured scan for "Show/S01/E01" shouldn't
+                # block a recursive find of "Show/Extras/E02".
+                structured = {(r['Show Folder'], r.get('Episode File', ''))
+                              for r in tv_rows if r.get('Episode File')}
                 added = 0
                 for rr in rec:
-                    if rr['Show Folder'] not in structured:
+                    key = (rr['Show Folder'], rr.get('Episode File', ''))
+                    if key not in structured:
                         tv_rows.append(rr)
                         added += 1
                 print(f"   [OK] Recursive scan added {added} episode(s) "
