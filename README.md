@@ -1,71 +1,71 @@
-# Unified Media Organizer
+# Media Organizer
 
-A cross-platform tool to scan media libraries, organize TV show structures, and cleanly rename media files using Regex or local/cloud LLMs (Gemini, OpenAI, Ollama).
+A cross-platform tool to scan media libraries, organize TV show structures, and cleanly rename media files — powered by [guessit](https://github.com/guessit-io/guessit) (the same filename parser the Sonarr/Bazarr ecosystem relies on), with optional LLM help (Ollama, OpenAI, Gemini) for hopeless filenames.
 
 ## Features
-- **Clean File Names:** Remove scene release garbage, resolution tags, and years to create clean folder and file names.
-- **Organize TV Structures:** Automatically grab loose `S01E01` files and group them into appropriate `Season X` folders.
-- **Scan & Journal:** Outputs everything to a `.xlsx` spreadsheet so you always have a backup record of your library.
-- **Undo Scripts:** Every rename action generates an `undo_all.bat`/`.sh` script in case you don't like the results.
-- **Fix Extensions:** Detects missing video extensions (e.g. accidentally stripped `.mkv`) and restores them via magic bytes.
-- **LLM Support:** Optionally use local (Ollama) or remote (OpenAI/Gemini) AI to parse incredibly complex/messy filenames perfectly.
+- **Clean file names:** `The.Matrix.1999.1080p.BluRay.x264-RARBG.mkv` → `The Matrix (1999) [1080p].mkv`. Handles the hard cases: `WALL-E`, `Se7en`, `Blade Runner 2049`, `1917`, multi-episode `S01E01E02`, date-based shows, `The Office (US)`.
+- **Organize TV structures:** loose `S01E01` files/folders are grouped into `Season X` folders; duplicate season folders (`S02` + `Season 2`) are merged; subtitles and `.nfo` files move (and rename) together with their episode.
+- **Safe by design:** every change is planned first, previewed, and only applied after you confirm. Collisions are never overwritten — conflicting changes are skipped and reported. `--dry-run` shows the plan without touching anything. Scanning never modifies files.
+- **Journaled undo:** every applied change is recorded (with the actual paths) in `mediaorg_journal.jsonl`. Menu option `[7]` or `python run.py --undo` reverses the last run — run it again to unwind earlier runs. Works even after a crash mid-run.
+- **Excel journal:** your library is written to an `.xlsx`. Edit the `… Fixed` columns to override any title/year/quality and the next rename pass uses your values.
+- **Fix extensions:** restore stripped video extensions via magic-byte detection, or bulk-convert one extension to another.
+- **LLM support (optional):** names guessit can't parse are offered to a local (Ollama) or cloud (OpenAI/Gemini) model.
 
 ## Installation & Usage
 
-### 📥 1. Download the App
-You can download the code using Git in your terminal:
+### 1. Download
 ```bash
-git clone https://github.com/TerminallyChilll/MediaOganizer.git
-cd MediaOganizer
+git clone https://github.com/TerminallyChilll/MediaOrganizer.git
+cd MediaOrganizer
 ```
-*(Alternatively, you can just click the green "Code" button on GitHub and select "Download ZIP")*
 
----
-### 🪟 Windows
-1. Make sure you have **Python 3.9+** installed. If you don't, download it from [python.org/downloads](https://www.python.org/downloads/).
-   * ⚠️ **CRITICAL:** During the Python setup, you **must** check the box that says **"Add python.exe to PATH"** at the bottom of the very first screen.
+### Windows
+1. Install **Python 3.11+** from [python.org/downloads](https://www.python.org/downloads/) — check **"Add python.exe to PATH"** during setup.
 2. Double-click `install_and_run.bat`.
-3. The script will automatically ensure dependencies are installed, and launch the interactive wizard.
 
-### 🍎 Mac / 🐧 Linux
-1. Make sure you have **Python 3.9+** installed (via `brew`, `apt`, or your system's package manager).
-2. Open a terminal and navigate to this folder.
-3. Run: `chmod +x install_and_run.sh`
-4. Run: `./install_and_run.sh`
-5. The script will install dependencies via pip and launch the wizard.
+### Mac / Linux
+1. Install **Python 3.11+** (via `brew`, `apt`, …).
+2. `chmod +x install_and_run.sh && ./install_and_run.sh`
 
-### 🐳 Docker (Advanced)
-If you prefer running inside a container to avoid installing Python or pip packages on your host system:
+### Docker
+1. Edit `docker-compose.yml` to map your media folders.
+2. `docker compose run --rm media-organizer` (use `run`, not `up` — the wizard is interactive).
 
-1. Edit `docker-compose.yml` to map your real media folders to `/media` volume mounts.
-2. Run the application interactively:
-   ```bash
-   docker compose run --rm media-organizer
-   ```
-   *(Note: This uses Docker Compose V2. You must use `run` instead of `up` so you can interact with the terminal prompts!)*
+## How it works
+Launching `python run.py` opens the interactive wizard:
 
-## How to Use the App
-After launching the script via one of the methods above, you will be greeted by the **Interactive Wizard**. The wizard will hold your hand through the entire process:
+```
+[1] Clean file names        (scan -> preview -> rename)
+[2] Organize TV structure   (loose episodes -> Season folders)
+[3] Do both                 (organize -> scan -> rename)
+[4] Fix file extensions     (restore missing / bulk convert)
+[5] Scan library only       (create/update the Excel spreadsheet)
+[6] Export library to text file
+[7] Undo last run
+```
 
-1. **Choose an Action:**
-   * **Clean file names:** Renames files to be clean and readable.
-   * **Organize file structure:** Groups loose TV episodes into `Season X` folders.
-   * **Do both:** Runs both of the above actions back-to-back.
-   * **Scan Library:** Just scans your folders and updates the `.xlsx` journal without changing any files.
+Every flow follows the same shape: **plan → preview → confirm → apply → journal**. Nothing touches your files until you've seen the full list of changes and said yes.
 
-2. **Select your Media Folders:**
-   * You'll be prompted to pick your `Movies` folder and your `TV Shows` folder (you can press Enter to skip one).
-   * You can use the built-in folder picker popups, browse directories directly inside the terminal, or paste the folder paths manually.
+### Non-interactive use
+```bash
+python run.py --action scan     --movies /media/Movies --tv /media/TV --output lib.xlsx
+python run.py --action organize --tv /media/TV
+python run.py --action rename   --output lib.xlsx
+python run.py --action full     --movies /media/Movies --tv /media/TV
+python run.py --undo            # reverse the last run
+# add --dry-run to any of the above to preview without changing anything
+```
 
-3. **Choose a Renaming Engine:**
-   * **Regex (Fastest):** Strips out year tags, resolution (`1080p`), and scene groups instantly using built-in rules.
-   * **Ollama (Free LLM):** If you run Ollama locally, the AI will perfectly extract clean names without breaking a sweat, even on badly obfuscated files.
-   * **Cloud LLM (Paid/API):** Connect to OpenAI or Google Gemini if you want cloud-powered AI intelligence.
-
-4. **Review & Execute:**
-   * The app will scan your library, generate a preview of all the changes it's about to make, and ask for confirmation before it touches any files.
-   * **Safe Undo:** After files are renamed, the app automatically generates an `undo_all.bat` (Windows) or `undo_all.sh` (Mac/Linux) script right next to it. If you ever realize you made a mistake, just run it, and all of your files will be instantly reverted back to their original names and locations!
+### The Fixed-columns workflow
+1. Run a scan (`[5]`). Open the `.xlsx`.
+2. Anywhere the auto-detected `Title` / `Year` / `Quality` is wrong, type the correct value in the matching `… Fixed` column (or put a complete name in `Folder Fixed` / `File Fixed`).
+3. Run the rename (`[1]`) — your values win.
 
 ## Requirements
-* Python 3.9 or higher
-* `pandas`, `openpyxl`, `tqdm` (automatically installed by `run.py`)
+Python 3.11+. Dependencies (`pandas`, `openpyxl`, `tqdm`, `guessit`) are installed automatically by `run.py`.
+
+## Development
+```bash
+python -m venv .venv && .venv/bin/pip install -r requirements.txt pytest
+.venv/bin/python -m pytest
+```
