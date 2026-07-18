@@ -200,7 +200,7 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
                 p.quality = quality
 
             # Files first (children before parent).
-            for vf in str(row.get('Video Files') or '').split(','):
+            for vf in str(row.get('Video Files') or '').split('|'):
                 vf = vf.strip()
                 if not vf:
                     continue
@@ -263,7 +263,7 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
                                     custom_patterns=custom_patterns)
                     if base in llm_results:
                         pe = _parsed_from_llm(llm_results[base], pe)
-                    pe.title = p_show.title
+                    pe.title = p_show.title if not show_is_season else (pe.title or Path(tv_path).name)
                     s, e = extract_season_episode(base)
                     pe.season = s if s is not None else season_num
                     if not pe.episodes and e is not None:

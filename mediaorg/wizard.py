@@ -561,6 +561,10 @@ def main() -> None:
     elif args.action == 'full':
         if tv:
             run_organize(tv, dry_run=args.dry_run)
+        if movies:
+            loose = plan_loose_movies(Path(movies))
+            if loose.ops:
+                confirm_and_execute(loose, _journal_path(), args.dry_run, "loose-file moves")
         run_scan(movies, tv, xlsx, dry_run=args.dry_run)
         run_rename(movies, tv, xlsx, dry_run=args.dry_run)
 

@@ -47,11 +47,10 @@ def _missing_parents(dst: Path) -> list[Path]:
 
 
 def _safe_path(p: Path) -> Path:
-    """Reject path traversal via '..' components and absolute paths that escape."""
-    resolved = p.resolve()
+    """Reject path traversal via '..' components."""
     if '..' in p.parts:
         raise ValueError(f"path traversal rejected: {p}")
-    return resolved
+    return p.resolve()
 
 
 def _do_move(src: Path, dst: Path) -> None:
@@ -75,6 +74,7 @@ def execute(plan: Plan, journal: Path, dry_run: bool = False) -> ExecResult:
         return result
 
     run_id = uuid.uuid4().hex[:12]
+    ops_logged = 0
     with open(journal, "a", encoding="utf-8") as jf:
         def log(entry: dict) -> None:
             jf.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -105,7 +105,9 @@ def execute(plan: Plan, journal: Path, dry_run: bool = False) -> ExecResult:
                  "src": str(op.src) if op.src else None,
                  "dst": str(op.dst), "ts": time.time()})
             result.done.append(op)
-        log({"op": "end_run", "id": run_id, "ts": time.time()})
+            ops_logged += 1
+        if ops_logged:
+            log({"op": "end_run", "id": run_id, "ts": time.time()})
     return result
 
 

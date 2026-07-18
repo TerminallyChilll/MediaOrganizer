@@ -183,7 +183,24 @@ def plan_season_structure(show_path: Path) -> Plan:
 
     media_exts = VIDEO_EXTS | COMPANION_EXTS
 
-    # 1. Flatten episode-named subfolders inside season folders; rmdir after.
+    # 1. Merge duplicate season folders into the canonical one FIRST — so
+    #    that the flatten step below sees the merged content.
+    for snum, names in sorted(season_dirs.items()):
+        canon = canonical(snum)
+        for extra in names:
+            if extra == canon:
+                continue
+            extra_path = show_path / extra
+            try:
+                children = sorted(e.name for e in os.scandir(extra_path))
+            except OSError:
+                continue
+            for child in children:
+                ops.append(Op("move", extra_path / child,
+                              show_path / canon / child))
+            ops.append(Op("rmdir", None, extra_path))
+
+    # 2. Flatten episode-named subfolders inside season folders; rmdir after.
     for snum, names in sorted(season_dirs.items()):
         for season_name in names:
             season_path = show_path / season_name
@@ -208,22 +225,6 @@ def plan_season_structure(show_path: Path) -> Plan:
                         moved_any = True
                 if moved_any:
                     ops.append(Op("rmdir", None, ep_path))
-
-    # 2. Merge duplicate season folders into the canonical one.
-    for snum, names in sorted(season_dirs.items()):
-        canon = canonical(snum)
-        for extra in names:
-            if extra == canon:
-                continue
-            extra_path = show_path / extra
-            try:
-                children = sorted(e.name for e in os.scandir(extra_path))
-            except OSError:
-                continue
-            for child in children:
-                ops.append(Op("move", extra_path / child,
-                              show_path / canon / child))
-            ops.append(Op("rmdir", None, extra_path))
 
     # 3. Move loose episode folders into the season folder (existing name).
     for snum, ep_folders in sorted(loose_ep_folders.items()):
