@@ -30,3 +30,12 @@ rm -f install_and_run.bat Dockerfile docker-compose.yml
     
 # Run the universal Python launcher
 python3 run.py
+if [ $? -ne 0 ]; then
+    echo ""
+    echo "========================================"
+    echo "Something went wrong! Running Doctor..."
+    echo "========================================"
+    python3 run.py --doctor --fix
+    echo ""
+    echo "After the doctor finishes, try running this launcher again."
+fi

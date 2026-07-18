@@ -30,6 +30,15 @@ if exist docker-compose.yml del docker-compose.yml
 
 :: Run the universal Python launcher
 python run.py
+if %ERRORLEVEL% NEQ 0 (
+    echo.
+    echo ========================================
+    echo Something went wrong! Running Doctor...
+    echo ========================================
+    python run.py --doctor --fix
+    echo.
+    echo After the doctor finishes, try running this launcher again.
+)
 
 echo.
 pause

@@ -33,6 +33,23 @@ def install_dependencies():
         print("✅ All dependencies are already installed.")
     except ImportError:
         print("📦 Missing dependencies detected. Installing now...")
+
+        # If pip itself is missing, try bootstrapping it first.
+        try:
+            import pip  # noqa: F401
+        except ImportError:
+            print("   pip module not found — bootstrapping via ensurepip...")
+            try:
+                subprocess.check_call([sys.executable, "-m", "ensurepip", "--upgrade"],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                print("   pip bootstrapped.")
+            except subprocess.CalledProcessError:
+                print("❌ pip is not installed and ensurepip failed.")
+                print("   Reinstall Python from https://www.python.org/downloads/")
+                print("   and make sure 'pip' is checked in the installer.")
+                print("   Or run: python run.py --doctor --fix")
+                sys.exit(1)
+
         try:
             # Install dependencies quietly
             subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", req_file, "--quiet"])
@@ -45,9 +62,16 @@ def install_dependencies():
             except subprocess.CalledProcessError as e:
                 print(f"❌ Failed to install dependencies: {e}")
                 print("Please try running: pip install -r requirements.txt manually.")
+                print("Or run: python run.py --doctor --fix")
                 sys.exit(1)
 
 def main():
+    # ── Doctor mode ──
+    if "--doctor" in sys.argv:
+        from mediaorg.doctor import run_doctor
+        auto = "--fix" in sys.argv
+        sys.exit(run_doctor(auto_fix=auto))
+
     check_python_version()
     install_dependencies()
     
@@ -58,11 +82,13 @@ def main():
         wizard.main()
     except ImportError as e:
         print(f"❌ Critical Error: Could not load the mediaorg package. Make sure it's in the same directory. ({e})")
+        print("Try running: python run.py --doctor")
         sys.exit(1)
     except Exception as e:
         print(f"❌ Critical Error: {e}")
         import traceback
         traceback.print_exc()
+        print("\nTry running: python run.py --doctor")
         sys.exit(1)
 
 if __name__ == "__main__":
