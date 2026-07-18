@@ -282,8 +282,8 @@ def clean_titles_with_llm(filenames, provider, api_key=None, model=None, ollama_
                 pbar.update(len(batch))
         except Exception as e:
             if pbar:
-                pbar.write(f"   ❌ LLM error on batch: {e}")
+                pbar.write(f"   [!] LLM error on batch: {e}")
             else:
-                print(f"   ❌ LLM error on batch: {e}")
+                print(f"   [!] LLM error on batch: {e}")
                 
     return all_results

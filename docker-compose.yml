@@ -34,7 +34,7 @@ services:
       - /mnt/nas-media/TV Shows:/media/TV_Shows:ro
     environment:
       - TZ=${TZ:-America/New_York}
-    command: ["python", "media_organizer.py", "--action", "scan", "--movies", "/media/Movies", "--tv", "/media/TV_Shows", "--output", "automated_scan.xlsx", "--no-emoji"]
+    command: ["python", "run.py", "--action", "scan", "--movies", "/media/Movies", "--tv", "/media/TV_Shows", "--output", "automated_scan.xlsx"]
 
 networks:
   default:

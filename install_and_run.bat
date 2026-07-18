@@ -13,7 +13,7 @@ if %ERRORLEVEL% NEQ 0 (
     echo [ERROR] Python is not installed or not in your system PATH.
     echo.
     echo Please follow these steps:
-    echo 1. Download Python 3.9 or newer from: https://www.python.org/downloads/
+    echo 1. Download Python 3.11 or newer from: https://www.python.org/downloads/
     echo 2. Run the installer.
     echo 3. *** CRITICAL: Check the box "Add python.exe to PATH" at the bottom of the screen! ***
     echo 4. Click "Install Now".

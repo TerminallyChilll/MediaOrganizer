@@ -8,3 +8,11 @@ custom_strip_patterns.json
 *.xlsx
 *.csv
 .DS_Store
+mediaorg_journal*.jsonl
+undo_*.bat
+undo_*.sh
+test_out*.txt
+test_results.txt
+media_library_*.txt
+.pytest_cache/
+.venv/

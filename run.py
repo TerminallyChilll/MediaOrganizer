@@ -17,8 +17,8 @@ if hasattr(sys.stdout, 'reconfigure'):
         pass
 
 def check_python_version():
-    if sys.version_info < (3, 9):
-        print(f"❌ Error: Python 3.9 or newer is required. You are using Python {sys.version_info.major}.{sys.version_info.minor}.")
+    if sys.version_info < (3, 11):
+        print(f"❌ Error: Python 3.11 or newer is required. You are using Python {sys.version_info.major}.{sys.version_info.minor}.")
         sys.exit(1)
 
 def install_dependencies():
@@ -29,20 +29,9 @@ def install_dependencies():
 
     print("🔍 Checking dependencies...")
     try:
-        # First check if we need to install anything
-        # using pip freeze or pkg_resources
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            import pkg_resources  # type: ignore
-        
-        with open(req_file, 'r') as f:
-            requirements = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-            
-        pkg_resources.require(requirements)
+        import pandas, openpyxl, tqdm, guessit  # noqa: F401
         print("✅ All dependencies are already installed.")
-        
-    except Exception:
+    except ImportError:
         print("📦 Missing dependencies detected. Installing now...")
         try:
             # Install dependencies quietly
@@ -65,10 +54,10 @@ def main():
     # Now import the actual application and run it
     print("🚀 Launching Media Organizer...\n")
     try:
-        import media_organizer  # type: ignore
-        media_organizer.main()
+        from mediaorg import wizard  # type: ignore
+        wizard.main()
     except ImportError as e:
-        print(f"❌ Critical Error: Could not load media_organizer.py. Make sure it's in the same directory. ({e})")
+        print(f"❌ Critical Error: Could not load the mediaorg package. Make sure it's in the same directory. ({e})")
         sys.exit(1)
     except Exception as e:
         print(f"❌ Critical Error: {e}")
