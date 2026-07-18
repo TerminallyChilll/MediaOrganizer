@@ -290,7 +290,9 @@ def run_scan(movies_path, tv_path, excel_path: Path, dry_run: bool = False) -> N
                 # Placeholder rows for containers that now have recursive
                 # descendants must go — otherwise plan_renames renames the
                 # parent before the child ops and strands their paths.
-                covered = {Path(rr['Folder Name']).parts[0] for rr in added_rows}
+                # Root-level rows ('.') have no parts and cover no placeholder.
+                covered = {Path(rr['Folder Name']).parts[0] for rr in added_rows
+                           if rr['Folder Name'] != '.'}
                 movies_rows[:] = [r for r in movies_rows
                                   if r.get('Video Files')
                                   or r['Folder Name'] not in covered]
