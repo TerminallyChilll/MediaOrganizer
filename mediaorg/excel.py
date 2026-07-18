@@ -223,7 +223,15 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
             new_folder = _clean(row.get('Folder Fixed')) or build_movie_folder_name(
                 p, _clean(row.get('Size (GB)')) if scheme.movie_folder_include_size else None, scheme)
             if new_folder and new_folder != old_folder:
-                ops.append(Op("move", folder_path, movies_path / new_folder))
+                # Preserve the parent directory when Folder Name contains a
+                # nested path (e.g. "Collection/Movie.2020" from a recursive
+                # scan) so the rename stays in-place.
+                parent_dir = Path(old_folder).parent
+                if parent_dir != Path('.') and parent_dir != Path(''):
+                    dest = movies_path / parent_dir / new_folder
+                else:
+                    dest = movies_path / new_folder
+                ops.append(Op("move", folder_path, dest))
 
     if df_tv is not None and tv_path:
         tv_path = Path(tv_path)
@@ -298,6 +306,13 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
                 new_show = _clean(first.get('Folder Fixed')) or \
                     build_tv_show_folder_name(p_show, scheme)
                 if new_show and new_show != show_folder:
-                    ops.append(Op("move", show_path, tv_path / new_show))
+                    # Preserve parent dir for nested show folders from
+                    # recursive TV scans (e.g. "Parent/ShowName").
+                    show_parent = Path(show_folder).parent
+                    if show_parent != Path('.') and show_parent != Path(''):
+                        dest = tv_path / show_parent / new_show
+                    else:
+                        dest = tv_path / new_show
+                    ops.append(Op("move", show_path, dest))
 
     return check_collisions(ops)

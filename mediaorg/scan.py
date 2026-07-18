@@ -212,3 +212,74 @@ def scan_recursive(root: Path, custom_patterns: list[str] = ()) -> list[dict]:
         })
 
     return rows
+
+
+def scan_recursive_tv(root: Path, custom_patterns: list[str] = ()) -> list[dict]:
+    """Like :func:`scan_recursive` but returns TV-schema rows (one per
+    episode file) suitable for writing to the ``TV Shows`` sheet.
+
+    Every video file found under *root* becomes one row; its parent directory
+    becomes the ``Show Folder``.  Season / episode numbers are extracted from
+    the filename when possible, otherwise default to season 0 / episode 0 so
+    the row is still visible in the spreadsheet.
+    """
+    root = Path(root)
+    if not root.is_dir():
+        return []
+
+    # ── walk the whole tree and collect every video file ──────────────────
+    all_files: list[tuple[Path, Path]] = []  # (show_path, video_path)
+    walk_errors: list[str] = []
+    try:
+        for dirpath, dirnames, filenames in os.walk(
+            root, onerror=lambda err: walk_errors.append(str(err))
+        ):
+            dirnames.sort()
+            for f in sorted(filenames):
+                if Path(f).suffix.lower() in VIDEO_EXTS:
+                    all_files.append((Path(dirpath), Path(dirpath) / f))
+    except OSError as exc:
+        walk_errors.append(str(exc))
+
+    if not all_files:
+        if walk_errors:
+            print(f"   [!] Could not read directory: {'; '.join(walk_errors)}")
+        return []
+
+    rows: list[dict] = []
+    for show_path, video_path in tqdm(
+        sorted(all_files, key=lambda x: (str(x[0]), x[1].name)),
+        desc="Scanning TV recursively", unit="file"
+    ):
+        try:
+            show_folder = str(show_path.relative_to(root))
+        except ValueError:
+            show_folder = str(show_path)
+        if show_folder == ".":
+            show_folder = str(show_path.name) or str(show_path)
+
+        # Parse show title from the folder name
+        p_show = parse_name(show_path.name, custom_patterns=custom_patterns)
+        # Parse season/episode/quality from the filename
+        pf = parse_name(video_path.name, kind_hint="episode",
+                        custom_patterns=custom_patterns)
+        s, ep = extract_season_episode(video_path.name)
+
+        try:
+            size_gb = round(video_path.stat().st_size / (1024 ** 3), 2)
+        except OSError:
+            size_gb = 0.0
+
+        rows.append({
+            'Show Folder': show_folder, 'Folder Fixed': '',
+            'Title': p_show.title, 'Title Fixed': '',
+            'Season': s if s is not None else '',
+            'Season Year': pf.year or p_show.year or '',
+            'Episode': ep if ep is not None else '',
+            'Episode File': str(video_path.relative_to(show_path)),
+            'File Fixed': '',
+            'Quality': pf.quality or '', 'Quality Fixed': '',
+            'Size (GB)': size_gb,
+        })
+
+    return rows

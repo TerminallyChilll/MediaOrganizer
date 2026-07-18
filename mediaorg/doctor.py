@@ -97,10 +97,17 @@ def check_configs() -> list[tuple[str, str, str]]:
     """Validate every JSON state file in the working directory.
 
     Returns a list of (status, filename, detail) triples.
+
+    .. note::
+
+       ``mediaorg_journal.jsonl`` is intentionally NOT validated here — it
+       is a JSONL journal (one JSON object per line), not a single JSON
+       document, so :func:`json.loads` would fail on a healthy journal.
+       Use :func:`check_journal` for journal integrity instead.
     """
     results = []
     for name in (".media_renamer_config.json", ".media_llm_config.json",
-                  "custom_strip_patterns.json", "mediaorg_journal.jsonl"):
+                 "custom_strip_patterns.json"):
         results.append(_validate_json(Path(name)))
     return results
 

@@ -270,26 +270,25 @@ def run_scan(movies_path, tv_path, excel_path: Path, dry_run: bool = False) -> N
     movies_rows = scan.scan_movies(Path(movies_path), patterns) if movies_path else []
     tv_rows = scan.scan_tv(Path(tv_path), patterns) if tv_path else []
 
-    # ── recursive fallback: when the structured scanner finds nothing the
-    # directory layout probably doesn't match the expected Movies/Show/Season
-    # convention.  Walk the whole tree instead so users with arbitrary folder
-    # structures still get a useful inventory.
+    # ── recursive fallback: when a structured scanner finds nothing the
+    # directory layout probably doesn't match the expected convention.
+    # Apply per-root so one empty side doesn't block the other.
+    if movies_path and not movies_rows:
+        print("   [!] Movies structured scan found nothing — trying recursive walk...")
+        movies_rows = scan.scan_recursive(Path(movies_path), patterns)
+        if movies_rows:
+            print(f"   [OK] Recursive scan found {len(movies_rows)} folder(s) "
+                  f"under Movies path.")
+    if tv_path and not tv_rows:
+        print("   [!] TV structured scan found nothing — trying recursive walk...")
+        tv_rows = scan.scan_recursive_tv(Path(tv_path), patterns)
+        if tv_rows:
+            print(f"   [OK] Recursive scan found {len(tv_rows)} episode(s) "
+                  f"under TV Shows path.")
     if not movies_rows and not tv_rows:
-        print("   [!] Structured scan found nothing — trying recursive walk...")
-        if movies_path:
-            movies_rows = scan.scan_recursive(Path(movies_path), patterns)
-            if movies_rows:
-                print(f"   [OK] Recursive scan found {len(movies_rows)} folder(s) "
-                      f"under Movies path.")
-        if tv_path:
-            tv_rows = scan.scan_recursive(Path(tv_path), patterns)
-            if tv_rows:
-                print(f"   [OK] Recursive scan found {len(tv_rows)} folder(s) "
-                      f"under TV Shows path.")
-        if not movies_rows and not tv_rows:
-            print("[!] Nothing found to scan — not even with recursive walk.")
-            print("    Check that the path contains video files and is accessible.")
-            return
+        print("[!] Nothing found to scan — not even with recursive walk.")
+        print("    Check that the path contains video files and is accessible.")
+        return
 
     if dry_run:
         print(f"\n[dry-run] Would save {len(movies_rows)} movie row(s), {len(tv_rows)} TV row(s) "
