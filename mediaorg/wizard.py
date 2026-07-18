@@ -270,26 +270,47 @@ def run_scan(movies_path, tv_path, excel_path: Path, dry_run: bool = False) -> N
     movies_rows = scan.scan_movies(Path(movies_path), patterns) if movies_path else []
     tv_rows = scan.scan_tv(Path(tv_path), patterns) if tv_path else []
 
-    # ── recursive fallback: when a structured scanner finds nothing the
-    # directory layout probably doesn't match the expected convention.
-    # Apply per-root so one empty side doesn't block the other.
-    # Gate on whether any row actually contains media — scan_movies and
-    # scan_tv emit placeholder rows for top-level folders even when no
-    # video files were found inside, so a non-empty list isn't enough.
-    movies_has_media = any(r.get('Video Files') for r in movies_rows)
-    if movies_path and not movies_has_media:
-        print("   [!] Movies structured scan found no media — trying recursive walk...")
-        movies_rows = scan.scan_recursive(Path(movies_path), patterns)
-        if movies_rows:
-            print(f"   [OK] Recursive scan found {len(movies_rows)} folder(s) "
-                  f"under Movies path.")
-    tv_has_media = any(r.get('Episode File') for r in tv_rows)
-    if tv_path and not tv_has_media:
-        print("   [!] TV structured scan found no media — trying recursive walk...")
-        tv_rows = scan.scan_recursive_tv(Path(tv_path), patterns)
-        if tv_rows:
-            print(f"   [OK] Recursive scan found {len(tv_rows)} episode(s) "
-                  f"under TV Shows path.")
+    # ── recursive supplement: the structured scanners only look one level
+    # deep, so deeply nested media (e.g. "Collection/Movie/file.mkv") is
+    # missed.  Run the recursive walk whenever the structured scan produced
+    # any placeholder rows (no actual media) or found nothing at all, and
+    # merge the results — structured rows with media take priority.
+    if movies_path:
+        movies_has_gaps = (not movies_rows
+                           or any(not r.get('Video Files') for r in movies_rows))
+        if movies_has_gaps:
+            print("   [!] Structured scan has gaps — running recursive walk for Movies...")
+            rec = scan.scan_recursive(Path(movies_path), patterns)
+            if rec:
+                structured = {r['Folder Name']: r for r in movies_rows
+                              if r.get('Video Files')}
+                added = 0
+                for rr in rec:
+                    if rr['Folder Name'] not in structured:
+                        movies_rows.append(rr)
+                        added += 1
+                print(f"   [OK] Recursive scan added {added} folder(s) "
+                      f"(total {len(movies_rows)}).")
+            elif not movies_rows:
+                print("   [!] Recursive scan also found nothing.")
+    if tv_path:
+        tv_has_gaps = (not tv_rows
+                       or any(not r.get('Episode File') for r in tv_rows))
+        if tv_has_gaps:
+            print("   [!] Structured scan has gaps — running recursive walk for TV...")
+            rec = scan.scan_recursive_tv(Path(tv_path), patterns)
+            if rec:
+                structured = {r['Show Folder']: r for r in tv_rows
+                              if r.get('Episode File')}
+                added = 0
+                for rr in rec:
+                    if rr['Show Folder'] not in structured:
+                        tv_rows.append(rr)
+                        added += 1
+                print(f"   [OK] Recursive scan added {added} episode(s) "
+                      f"(total {len(tv_rows)}).")
+            elif not tv_rows:
+                print("   [!] Recursive scan also found nothing.")
     if not movies_rows and not tv_rows:
         print("[!] Nothing found to scan — not even with recursive walk.")
         print("    Check that the path contains video files and is accessible.")

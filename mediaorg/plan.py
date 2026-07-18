@@ -35,8 +35,8 @@ class Plan:
 # SxxEyy (group 1=season) or bare NxN like "1x2"/"9x9" (groups 2, 3).
 EPISODE_PATTERN = re.compile(
     r'(?:[Ss](\d{1,2})[Ee]\d{1,2}|(?<!\d)(\d{1,2})[xX](\d{1,2})(?!\d))')
-# Pure season folders: "Season 1", "S01".
-SEASON_FOLDER_PATTERN = re.compile(r'^(?:season\s*|s)(\d{1,2})$', re.IGNORECASE)
+# Pure season folders: "Season 1", "S01", "Season 1 (2024)".
+SEASON_FOLDER_PATTERN = re.compile(r'^(?:season\s*|s)(\d{1,2})(?:\s*\(\d{4}\))?$', re.IGNORECASE)
 # Abbreviated "ShowTitle S02" form only — no dashes/pipes/dots, optional year.
 SEASON_LIKE_PATTERN = re.compile(r'^([^\-\|.]+?)\s+[Ss](\d{1,2})(?:\s*\(?\d{4}\)?)?\s*$')
 
