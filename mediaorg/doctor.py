@@ -79,20 +79,25 @@ def check_package_structure() -> tuple[str, str]:
     return _ok("Package structure intact")
 
 
-def _validate_json(path: Path) -> tuple[str, str]:
+def _validate_json(path: Path) -> tuple[str, str, str]:
+    """Return (status, filename, detail)."""
+    name = path.name
     if not path.exists():
-        return _warn(f"{path.name} not present (will be created on first use)")
+        return ("WARN", name, f"{name} not present (will be created on first use)")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, (dict, list)):
-            return _err(f"{path.name} is not a JSON object/array")
-        return _ok(f"{path.name} — valid JSON")
+            return ("FAIL", name, f"{name} is not a JSON object/array")
+        return ("OK", name, f"{name} — valid JSON")
     except json.JSONDecodeError as e:
-        return _err(f"{path.name} is corrupted: {e}")
+        return ("FAIL", name, f"{name} is corrupted: {e}")
 
 
-def check_configs() -> list[tuple[str, str]]:
-    """Validate every JSON state file in the working directory."""
+def check_configs() -> list[tuple[str, str, str]]:
+    """Validate every JSON state file in the working directory.
+
+    Returns a list of (status, filename, detail) triples.
+    """
     results = []
     for name in (".media_renamer_config.json", ".media_llm_config.json",
                   "custom_strip_patterns.json", "mediaorg_journal.jsonl"):
@@ -287,13 +292,11 @@ def run_doctor(*, auto_fix: bool = False) -> int:
 
     # 5. Config files
     print("\n── Config files ──")
-    for s, msg in check_configs():
-        name = msg.split(" ")[0]
+    for s, name, msg in check_configs():
         report(s, name, msg)
         if s == "FAIL" and auto_fix:
-            fname = msg.split(" ")[0]
-            sf, mf = fix_corrupted_config(Path(fname))
-            report(sf, f"{fname} (fix)", mf)
+            sf, mf = fix_corrupted_config(Path(name))
+            report(sf, f"{name} (fix)", mf)
             if sf == "OK":
                 fixed += 1
 
@@ -322,7 +325,7 @@ def run_doctor(*, auto_fix: bool = False) -> int:
         print(f"❌ {issues} issue(s) found, {fixed} fixed, {warnings} warning(s).")
         if not auto_fix:
             print("   Re-run with --doctor --fix to attempt automatic repair.")
-        return 0 if issues == 0 else 1
+        return 1
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────

@@ -47,9 +47,19 @@ def _missing_parents(dst: Path) -> list[Path]:
 
 
 def _safe_path(p: Path) -> Path:
-    """Reject path traversal via '..' components."""
+    """Reject path traversal via '..' components and symlink escapes."""
     if '..' in p.parts:
         raise ValueError(f"path traversal rejected: {p}")
+    # Reject paths containing symlink components that could redirect
+    # outside the intended directory tree.
+    for ancestor in (p if p.is_absolute() else Path.cwd() / p).parents:
+        try:
+            if ancestor.is_symlink():
+                raise ValueError(
+                    f"symlink traversal rejected: {p} "
+                    f"(component {ancestor} is a symlink)")
+        except OSError:
+            pass  # permissions, deleted file — not our concern
     return p.resolve()
 
 
@@ -106,8 +116,7 @@ def execute(plan: Plan, journal: Path, dry_run: bool = False) -> ExecResult:
                  "dst": str(op.dst), "ts": time.time()})
             result.done.append(op)
             ops_logged += 1
-        if ops_logged:
-            log({"op": "end_run", "id": run_id, "ts": time.time()})
+        log({"op": "end_run", "id": run_id, "ts": time.time()})
     return result
 
 

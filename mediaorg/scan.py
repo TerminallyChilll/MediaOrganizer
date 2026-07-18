@@ -153,7 +153,9 @@ def scan_recursive(root: Path, custom_patterns: list[str] = ()) -> list[dict]:
     folder_files: dict[Path, list[Path]] = {}
     walk_errors: list[str] = []
     try:
-        for dirpath, dirnames, filenames in os.walk(root):
+        for dirpath, dirnames, filenames in os.walk(
+            root, onerror=lambda err: walk_errors.append(str(err))
+        ):
             dirnames.sort()
             vids = sorted(
                 f for f in filenames
