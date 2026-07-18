@@ -284,12 +284,17 @@ def run_scan(movies_path, tv_path, excel_path: Path, dry_run: bool = False) -> N
             if rec:
                 structured = {r['Folder Name']: r for r in movies_rows
                               if r.get('Video Files')}
-                added = 0
-                for rr in rec:
-                    if rr['Folder Name'] not in structured:
-                        movies_rows.append(rr)
-                        added += 1
-                print(f"   [OK] Recursive scan added {added} folder(s) "
+                added_rows = [rr for rr in rec
+                              if rr['Folder Name'] not in structured]
+                movies_rows.extend(added_rows)
+                # Placeholder rows for containers that now have recursive
+                # descendants must go — otherwise plan_renames renames the
+                # parent before the child ops and strands their paths.
+                covered = {Path(rr['Folder Name']).parts[0] for rr in added_rows}
+                movies_rows[:] = [r for r in movies_rows
+                                  if r.get('Video Files')
+                                  or r['Folder Name'] not in covered]
+                print(f"   [OK] Recursive scan added {len(added_rows)} folder(s) "
                       f"(total {len(movies_rows)}).")
             elif not movies_rows:
                 print("   [!] Recursive scan also found nothing.")
@@ -306,13 +311,18 @@ def run_scan(movies_path, tv_path, excel_path: Path, dry_run: bool = False) -> N
                 # block a recursive find of "Show/Extras/E02".
                 structured = {(r['Show Folder'], r.get('Episode File', ''))
                               for r in tv_rows if r.get('Episode File')}
-                added = 0
-                for rr in rec:
-                    key = (rr['Show Folder'], rr.get('Episode File', ''))
-                    if key not in structured:
-                        tv_rows.append(rr)
-                        added += 1
-                print(f"   [OK] Recursive scan added {added} episode(s) "
+                added_rows = [rr for rr in rec
+                              if (rr['Show Folder'], rr.get('Episode File', ''))
+                              not in structured]
+                tv_rows.extend(added_rows)
+                # Drop placeholder show rows now covered by recursive finds
+                # (same stale-parent-rename hazard as the movies side).
+                covered = {Path(rr['Show Folder']).parts[0] for rr in added_rows
+                           if rr['Show Folder'] != '.'}
+                tv_rows[:] = [r for r in tv_rows
+                              if r.get('Episode File')
+                              or r['Show Folder'] not in covered]
+                print(f"   [OK] Recursive scan added {len(added_rows)} episode(s) "
                       f"(total {len(tv_rows)}).")
             elif not tv_rows:
                 print("   [!] Recursive scan also found nothing.")

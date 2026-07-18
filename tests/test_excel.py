@@ -158,3 +158,25 @@ def test_append_changes_sheet(tmp_path):
     assert df.iloc[0]['From'] == '/a/old.mkv'
     # Other sheets survived the append.
     assert read_library(xlsx)[0] is not None
+
+
+def test_root_show_rows_use_selected_folder_name(tmp_path):
+    # Recursive TV scans record root-level episodes with Show Folder '.'
+    # — the rename planner must use the selected folder's name as the
+    # title and never rename the root itself (PR review regression).
+    import pandas as pd
+    root = tmp_path / "The Office"
+    root.mkdir()
+    (root / "The.Office.S01E01.720p.mkv").write_text("x")
+    df_tv = pd.DataFrame([{
+        'Show Folder': '.', 'Folder Fixed': '',
+        'Title': 'The Office', 'Title Fixed': '',
+        'Season': 1, 'Season Year': '', 'Episode': 1,
+        'Episode File': 'The.Office.S01E01.720p.mkv', 'File Fixed': '',
+        'Quality': '720p', 'Quality Fixed': '', 'Size (GB)': 0.0,
+    }])
+    plan = plan_renames(None, None, df_tv, root, NamingScheme())
+    names = {o.src.name: o.dst.name for o in plan.ops}
+    assert names["The.Office.S01E01.720p.mkv"] == "The Office S01E01 [720p].mkv"
+    # The selected root folder itself is never a rename target.
+    assert all(o.src != root for o in plan.ops)

@@ -37,6 +37,9 @@ EPISODE_PATTERN = re.compile(
     r'(?:[Ss](\d{1,2})[Ee]\d{1,2}|(?<!\d)(\d{1,2})[xX](\d{1,2})(?!\d))')
 # Pure season folders: "Season 1", "S01", "Season 1 (2024)".
 SEASON_FOLDER_PATTERN = re.compile(r'^(?:season\s*|s)(\d{1,2})(?:\s*\(\d{4}\))?$', re.IGNORECASE)
+# Already-normalized names the organizer must leave untouched (incl. the
+# year-tagged form the rename scheme produces).
+_CANONICAL_SEASON = re.compile(r'^Season \d{1,2}( \(\d{4}\))?$')
 # Abbreviated "ShowTitle S02" form only — no dashes/pipes/dots, optional year.
 SEASON_LIKE_PATTERN = re.compile(r'^([^\-\|.]+?)\s+[Ss](\d{1,2})(?:\s*\(?\d{4}\)?)?\s*$')
 
@@ -174,11 +177,18 @@ def plan_season_structure(show_path: Path) -> Plan:
                 loose_ep_files.setdefault(s, []).append(f)
 
     def canonical(snum: int) -> str:
-        """Existing folder that season content should land in (pre-rename)."""
+        """Existing folder that season content should land in (pre-rename).
+
+        A year-tagged "Season N (YYYY)" is a deliberate rename-scheme output
+        and counts as already canonical — organize must not strip the year.
+        """
         existing = season_dirs.get(snum, [])
         target = f"Season {snum}"
         if target in existing:
             return target
+        for name in existing:
+            if _CANONICAL_SEASON.match(name):
+                return name
         return existing[0] if existing else target
 
     media_exts = VIDEO_EXTS | COMPANION_EXTS
@@ -240,10 +250,10 @@ def plan_season_structure(show_path: Path) -> Plan:
             ops.append(Op("move", show_path / filename, target / filename))
 
     # 5. Rename season folders to "Season N" — last, so nothing above
-    #    depends on the new name.
+    #    depends on the new name. "Season N (YYYY)" is left as-is.
     for snum, names in sorted(season_dirs.items()):
         canon = canonical(snum)
-        if canon != f"Season {snum}":
+        if not _CANONICAL_SEASON.match(canon):
             ops.append(Op("move", show_path / canon,
                           show_path / f"Season {snum}"))
 

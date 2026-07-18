@@ -88,13 +88,16 @@ def install_dependencies():
                 sys.exit(1)
 
 def main():
+    # Version guard first: doctor.py uses modern syntax and would crash on
+    # import under an unsupported Python before showing the upgrade message.
+    check_python_version()
+
     # ── Doctor mode ──
     if "--doctor" in sys.argv:
         from mediaorg.doctor import run_doctor
         auto = "--fix" in sys.argv
         sys.exit(run_doctor(auto_fix=auto))
 
-    check_python_version()
     install_dependencies()
     
     # Now import the actual application and run it

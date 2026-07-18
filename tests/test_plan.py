@@ -228,3 +228,19 @@ def test_builders_and_sanitize():
 
     assert sanitize('Bad:Name<>"') == "BadName"
     assert sanitize("Trailing. ") == "Trailing"
+
+
+def test_year_tagged_season_folder_left_alone(tmp_path):
+    # "Season 1 (2024)" is what the rename scheme produces; organize must
+    # not strip the year (PR review regression).
+    touch(tmp_path / "Season 1 (2024)" / "Show.S01E01.mkv")
+    plan = plan_season_structure(tmp_path)
+    assert plan.ops == [] and plan.skipped == []
+
+
+def test_loose_files_join_year_tagged_season(tmp_path):
+    touch(tmp_path / "Season 1 (2024)" / "Show.S01E01.mkv")
+    touch(tmp_path / "Show.S01E02.mkv")
+    plan = plan_season_structure(tmp_path)
+    assert [str(o.dst.relative_to(tmp_path)) for o in plan.ops] == \
+        ["Season 1 (2024)/Show.S01E02.mkv"]
