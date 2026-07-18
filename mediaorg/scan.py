@@ -180,7 +180,7 @@ def scan_recursive(root: Path, custom_patterns: list[str] = ()) -> list[dict]:
         except ValueError:
             folder_name = str(folder_path)
         if folder_name == ".":
-            folder_name = str(folder_path.name) or str(folder_path)
+            folder_name = "."
 
         p = parse_name(folder_path.name, custom_patterns=custom_patterns)
         video_names = [vp.name for vp in video_paths]
@@ -256,7 +256,7 @@ def scan_recursive_tv(root: Path, custom_patterns: list[str] = ()) -> list[dict]
         except ValueError:
             show_folder = str(show_path)
         if show_folder == ".":
-            show_folder = str(show_path.name) or str(show_path)
+            show_folder = "."
 
         # Parse show title from the folder name
         p_show = parse_name(show_path.name, custom_patterns=custom_patterns)

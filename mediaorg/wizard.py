@@ -273,14 +273,19 @@ def run_scan(movies_path, tv_path, excel_path: Path, dry_run: bool = False) -> N
     # ── recursive fallback: when a structured scanner finds nothing the
     # directory layout probably doesn't match the expected convention.
     # Apply per-root so one empty side doesn't block the other.
-    if movies_path and not movies_rows:
-        print("   [!] Movies structured scan found nothing — trying recursive walk...")
+    # Gate on whether any row actually contains media — scan_movies and
+    # scan_tv emit placeholder rows for top-level folders even when no
+    # video files were found inside, so a non-empty list isn't enough.
+    movies_has_media = any(r.get('Video Files') for r in movies_rows)
+    if movies_path and not movies_has_media:
+        print("   [!] Movies structured scan found no media — trying recursive walk...")
         movies_rows = scan.scan_recursive(Path(movies_path), patterns)
         if movies_rows:
             print(f"   [OK] Recursive scan found {len(movies_rows)} folder(s) "
                   f"under Movies path.")
-    if tv_path and not tv_rows:
-        print("   [!] TV structured scan found nothing — trying recursive walk...")
+    tv_has_media = any(r.get('Episode File') for r in tv_rows)
+    if tv_path and not tv_has_media:
+        print("   [!] TV structured scan found no media — trying recursive walk...")
         tv_rows = scan.scan_recursive_tv(Path(tv_path), patterns)
         if tv_rows:
             print(f"   [OK] Recursive scan found {len(tv_rows)} episode(s) "
