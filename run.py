@@ -38,9 +38,16 @@ def install_dependencies():
             _inst = _pkg_version(_pkg)
             # Compare as integer tuples — string comparison of version
             # numbers is fragile (e.g. "2.10" < "2.2" lexicographically).
-            _inst_tup = tuple(int(x) for x in _inst.split('.'))
+            # Strip trailing non-numeric segments ("2.3a1" → "2.3") so
+            # int() doesn't choke on pre-release suffixes; treat an
+            # unparseable version as acceptable rather than crashing.
+            _inst_num = _inst.split('-')[0].split('+')[0]
+            try:
+                _inst_tup = tuple(int(x) for x in _inst_num.split('.'))
+            except ValueError:
+                continue  # can't parse — assume it's fine
             _min_tup = tuple(int(x) for x in _min.split('.'))
-            if _inst_tup[:2] < _min_tup[:2]:
+            if _inst_tup < _min_tup:
                 _stale.append(f"{_pkg}=={_inst} (need >={_min})")
         if _stale:
             print(f"⚠️  Outdated packages: {', '.join(_stale)}")
