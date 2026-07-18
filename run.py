@@ -36,7 +36,11 @@ def install_dependencies():
         _stale = []
         for _pkg, _min in _min_versions.items():
             _inst = _pkg_version(_pkg)
-            if _inst < _min:
+            # Compare as integer tuples — string comparison of version
+            # numbers is fragile (e.g. "2.10" < "2.2" lexicographically).
+            _inst_tup = tuple(int(x) for x in _inst.split('.'))
+            _min_tup = tuple(int(x) for x in _min.split('.'))
+            if _inst_tup[:2] < _min_tup[:2]:
                 _stale.append(f"{_pkg}=={_inst} (need >={_min})")
         if _stale:
             print(f"⚠️  Outdated packages: {', '.join(_stale)}")
