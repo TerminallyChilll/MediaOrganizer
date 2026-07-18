@@ -213,6 +213,13 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
                     pf = _parsed_from_llm(llm_results[vf], pf)
                 if get_val(row, 'Title Fixed', ''):
                     pf.title = get_val(row, 'Title Fixed', '')
+                # Honor Fixed-column overrides on file-level parses too,
+                # so Year Fixed / Quality Fixed apply uniformly to both
+                # folder and file renames.
+                if get_val(row, 'Year Fixed', ''):
+                    pf.year = _safe_int_year(get_val(row, 'Year Fixed', ''))
+                if get_val(row, 'Quality Fixed', 'Quality'):
+                    pf.quality = get_val(row, 'Quality Fixed', 'Quality')
                 pf.year = pf.year or p.year
                 pf.quality = pf.quality or p.quality
                 new_file = build_movie_file_name(pf, ext, _clean(row.get('Size (GB)')) if scheme.movie_file_include_size else None, scheme)
@@ -222,8 +229,16 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
 
             new_folder = _clean(row.get('Folder Fixed')) or build_movie_folder_name(
                 p, _clean(row.get('Size (GB)')) if scheme.movie_folder_include_size else None, scheme)
-            if new_folder and new_folder != old_folder:
-                ops.append(Op("move", folder_path, movies_path / new_folder))
+            if new_folder and new_folder != Path(old_folder).name:
+                # Preserve the parent directory when Folder Name contains a
+                # nested path (e.g. "Collection/Movie.2020" from a recursive
+                # scan) so the rename stays in-place.
+                parent_dir = Path(old_folder).parent
+                if parent_dir != Path('.') and parent_dir != Path(''):
+                    dest = movies_path / parent_dir / new_folder
+                else:
+                    dest = movies_path / new_folder
+                ops.append(Op("move", folder_path, dest))
 
     if df_tv is not None and tv_path:
         tv_path = Path(tv_path)
@@ -232,9 +247,13 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
             first = show_eps.iloc[0]
             # Scanner run on a single show root: "show folders" are seasons.
             show_is_season = bool(_SEASON_FOLDER_RE.match(show_folder))
-            show_path = tv_path / show_folder
+            # Recursive scans record root-level episodes as '.': the show is
+            # the selected tv_path itself.
+            show_is_root = show_folder == '.'
+            show_path = tv_path if show_is_root else tv_path / show_folder
 
-            p_show = parse_name(show_folder, custom_patterns=custom_patterns)
+            p_show = parse_name(Path(tv_path).name if show_is_root else show_folder,
+                                custom_patterns=custom_patterns)
             if show_folder in llm_results:
                 p_show = _parsed_from_llm(llm_results[show_folder], p_show)
             if get_val(first, 'Title Fixed', ''):
@@ -294,10 +313,17 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
 
             ops.extend(season_ops)
 
-            if not show_is_season:
+            if not show_is_season and not show_is_root:
                 new_show = _clean(first.get('Folder Fixed')) or \
                     build_tv_show_folder_name(p_show, scheme)
-                if new_show and new_show != show_folder:
-                    ops.append(Op("move", show_path, tv_path / new_show))
+                if new_show and new_show != Path(show_folder).name:
+                    # Preserve parent dir for nested show folders from
+                    # recursive TV scans (e.g. "Parent/ShowName").
+                    show_parent = Path(show_folder).parent
+                    if show_parent != Path('.') and show_parent != Path(''):
+                        dest = tv_path / show_parent / new_show
+                    else:
+                        dest = tv_path / new_show
+                    ops.append(Op("move", show_path, dest))
 
     return check_collisions(ops)
