@@ -54,7 +54,6 @@ def _safe_path(p: Path) -> Path:
 
 
 def _do_move(src: Path, dst: Path) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists() and _same_file(src, dst) and str(src) != str(dst):
         # Case-only rename on a case-insensitive filesystem: two-step.
         tmp = src.with_name(src.name + ".mediaorg_tmp")
@@ -63,6 +62,7 @@ def _do_move(src: Path, dst: Path) -> None:
         return
     if os.path.lexists(dst):
         raise FileExistsError(f"target already exists: {dst}")
+    dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(src), str(dst))
 
 

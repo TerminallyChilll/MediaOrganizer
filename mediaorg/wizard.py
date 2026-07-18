@@ -236,9 +236,19 @@ def run_organize(tv_path: str, dry_run: bool = False) -> None:
         plan.merge(plan_season_structure(root))
     else:
         for entry in sorted(os.scandir(root), key=lambda e: e.name):
-            if entry.is_dir(follow_symlinks=False) and \
-                    folder_has_episodes_or_seasons(Path(entry.path)):
-                plan.merge(plan_season_structure(Path(entry.path)))
+            if entry.is_dir(follow_symlinks=False):
+                child = Path(entry.path)
+                if folder_has_episodes_or_seasons(child):
+                    plan.merge(plan_season_structure(child))
+                else:
+                    # Descend one more level for nested Show/Show/Season layouts.
+                    try:
+                        for sub in sorted(os.scandir(child), key=lambda e: e.name):
+                            if sub.is_dir(follow_symlinks=False) and \
+                                    folder_has_episodes_or_seasons(Path(sub.path)):
+                                plan.merge(plan_season_structure(Path(sub.path)))
+                    except OSError:
+                        pass
     confirm_and_execute(plan, _journal_path(), dry_run, "TV structure changes")
 
 
@@ -251,6 +261,11 @@ def run_scan(movies_path, tv_path, excel_path: Path, dry_run: bool = False) -> N
     tv_rows = scan.scan_tv(Path(tv_path), patterns) if tv_path else []
     if not movies_rows and not tv_rows:
         print("[!] Nothing found to scan.")
+        return
+
+    if dry_run:
+        print(f"\n[dry-run] Would save {len(movies_rows)} movie row(s), {len(tv_rows)} TV row(s) "
+              f"to {excel_path}")
         return
 
     append = False
