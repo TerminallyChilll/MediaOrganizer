@@ -134,3 +134,79 @@ def scan_tv(tv_root: Path, custom_patterns: list[str] = ()) -> list[dict]:
                 'Size (GB)': ep['size'],
             })
     return rows
+
+
+def scan_recursive(root: Path, custom_patterns: list[str] = ()) -> list[dict]:
+    """Recursively walk *every* directory under *root*, find all video files,
+    and return one row per containing folder (Movies-sheet format).
+
+    Unlike ``scan_movies`` / ``scan_tv`` this makes no assumption about the
+    directory layout — it simply walks the whole tree with :func:`os.walk`,
+    which makes it safe for deeply nested or irregular structures and for
+    SMB/GVFS mounts where only the top-level path is navigable.
+    """
+    root = Path(root)
+    if not root.is_dir():
+        return []
+
+    # ── collect video files keyed by their parent folder ──────────────────
+    folder_files: dict[Path, list[Path]] = {}
+    walk_errors: list[str] = []
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort()
+            vids = sorted(
+                f for f in filenames
+                if Path(f).suffix.lower() in VIDEO_EXTS)
+            if vids:
+                folder_files[Path(dirpath)] = [Path(dirpath) / f for f in vids]
+    except OSError as exc:
+        walk_errors.append(str(exc))
+
+    if not folder_files:
+        if walk_errors:
+            print(f"   [!] Could not read directory: {'; '.join(walk_errors)}")
+        return []
+
+    rows: list[dict] = []
+    for folder_path, video_paths in tqdm(
+        sorted(folder_files.items()), desc="Scanning recursively", unit="folder"
+    ):
+        # Human-friendly label: path relative to root (or "." for root itself)
+        try:
+            folder_name = str(folder_path.relative_to(root))
+        except ValueError:
+            folder_name = str(folder_path)
+        if folder_name == ".":
+            folder_name = str(folder_path.name) or str(folder_path)
+
+        p = parse_name(folder_path.name, custom_patterns=custom_patterns)
+        video_names = [vp.name for vp in video_paths]
+
+        # Fill year/quality from video files when the folder name lacks them
+        year, quality = p.year, p.quality
+        for vp in video_paths:
+            if year and quality:
+                break
+            pf = parse_name(vp.name, custom_patterns=custom_patterns)
+            year = year or pf.year
+            quality = quality or pf.quality
+
+        # Total size of all video files in this folder
+        total_gb = 0.0
+        for vp in video_paths:
+            try:
+                total_gb += vp.stat().st_size / (1024 ** 3)
+            except OSError:
+                pass
+
+        rows.append({
+            'Folder Name': folder_name, 'Folder Fixed': '',
+            'Title': p.title, 'Title Fixed': '',
+            'Year': year or '', 'Year Fixed': '',
+            'Quality': quality or '', 'Quality Fixed': '',
+            'Size (GB)': round(total_gb, 2),
+            'Video Files': ' | '.join(video_names), 'Files Fixed': '',
+        })
+
+    return rows

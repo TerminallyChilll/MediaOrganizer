@@ -89,8 +89,18 @@ def browse_for_folder(prompt: str, allow_skip: bool = True) -> str | None:
                 print("   Falling back to terminal browser...")
                 folder = _cli_folder_browser(allow_skip)
             if folder:
-                print(f"   [OK] Selected: {folder}")
-                return folder
+                # GUI pickers on Linux can return virtual paths (GVFS, SMB
+                # "//server/share" URIs) that don't exist on the filesystem.
+                valid = _validate_path(folder)
+                if valid:
+                    folder = valid
+                    print(f"   [OK] Selected: {folder}")
+                    return folder
+                print(f"   [!] Path does not exist or is not a directory: {folder}")
+                print("   This can happen with network shares selected via GUI.")
+                print("   Try pasting the mounted path manually (option 3), or")
+                print("   use the terminal browser (option 2) to navigate to it.")
+                # loop back so user can try another method
         elif choice == '2':
             folder = _cli_folder_browser(allow_skip)
             if folder:
@@ -259,9 +269,27 @@ def run_scan(movies_path, tv_path, excel_path: Path, dry_run: bool = False) -> N
 
     movies_rows = scan.scan_movies(Path(movies_path), patterns) if movies_path else []
     tv_rows = scan.scan_tv(Path(tv_path), patterns) if tv_path else []
+
+    # ── recursive fallback: when the structured scanner finds nothing the
+    # directory layout probably doesn't match the expected Movies/Show/Season
+    # convention.  Walk the whole tree instead so users with arbitrary folder
+    # structures still get a useful inventory.
     if not movies_rows and not tv_rows:
-        print("[!] Nothing found to scan.")
-        return
+        print("   [!] Structured scan found nothing — trying recursive walk...")
+        if movies_path:
+            movies_rows = scan.scan_recursive(Path(movies_path), patterns)
+            if movies_rows:
+                print(f"   [OK] Recursive scan found {len(movies_rows)} folder(s) "
+                      f"under Movies path.")
+        if tv_path:
+            tv_rows = scan.scan_recursive(Path(tv_path), patterns)
+            if tv_rows:
+                print(f"   [OK] Recursive scan found {len(tv_rows)} folder(s) "
+                      f"under TV Shows path.")
+        if not movies_rows and not tv_rows:
+            print("[!] Nothing found to scan — not even with recursive walk.")
+            print("    Check that the path contains video files and is accessible.")
+            return
 
     if dry_run:
         print(f"\n[dry-run] Would save {len(movies_rows)} movie row(s), {len(tv_rows)} TV row(s) "
@@ -446,14 +474,30 @@ def run_text_export() -> None:
     out = Path(prompt_input("Output file [media_library.txt]: ",
                             default="media_library.txt"))
     lines = []
-    for dirpath, dirnames, filenames in os.walk(folder):
-        dirnames.sort()
-        depth = Path(dirpath).relative_to(folder).parts
-        indent = "  " * len(depth)
-        lines.append(f"{indent}{Path(dirpath).name}/")
-        for f in sorted(filenames):
-            lines.append(f"{indent}  {f}")
-    out.write_text("\n".join(lines), encoding="utf-8")
+    try:
+        for dirpath, dirnames, filenames in os.walk(folder):
+            dirnames.sort()
+            try:
+                depth = Path(dirpath).relative_to(folder).parts
+            except ValueError:
+                depth = ()
+            indent = "  " * len(depth)
+            lines.append(f"{indent}{Path(dirpath).name}/")
+            for f in sorted(filenames):
+                lines.append(f"{indent}  {f}")
+    except OSError as exc:
+        print(f"   [!] Could not walk directory: {exc}")
+    if not lines:
+        print("[!] No files or folders found. The path may be inaccessible "
+              "or empty.")
+        print("    If this is a network share, ensure it is mounted and "
+              "accessible from the terminal.")
+        return
+    try:
+        out.write_text("\n".join(lines), encoding="utf-8")
+    except OSError as exc:
+        print(f"   [!] Could not write output file: {exc}")
+        return
     print(f"[OK] Exported {len(lines)} line(s) to {out}")
 
 
