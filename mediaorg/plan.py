@@ -269,7 +269,8 @@ def plan_loose_movies(movies_root: Path) -> Plan:
         folder = movies_root / p.stem
         if not p.stem or '..' in p.stem or '/' in p.stem or '\\' in p.stem:
             continue  # reject empty or path-traversal stems
-        ops.append(Op("mkdir", None, folder))
+        if not folder.exists():
+            ops.append(Op("mkdir", None, folder))
         ops.append(Op("move", p, folder / p.name))
         for comp in companion_files(p):
             ops.append(Op("move", comp, folder / comp.name))

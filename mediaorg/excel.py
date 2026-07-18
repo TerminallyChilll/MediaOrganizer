@@ -200,7 +200,10 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
                 p.quality = quality
 
             # Files first (children before parent).
-            for vf in str(row.get('Video Files') or '').split('|'):
+            # Support both pipe (new scanner) and comma (legacy scanner) delimiters.
+            vf_str = str(row.get('Video Files') or '')
+            delim = '|' if '|' in vf_str else ','
+            for vf in vf_str.split(delim):
                 vf = vf.strip()
                 if not vf:
                     continue
