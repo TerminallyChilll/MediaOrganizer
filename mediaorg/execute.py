@@ -50,14 +50,16 @@ def _safe_path(p: Path) -> Path:
     """Reject path traversal via '..' components and symlink escapes."""
     if '..' in p.parts:
         raise ValueError(f"path traversal rejected: {p}")
-    # Reject paths containing symlink components that could redirect
-    # outside the intended directory tree.
-    for ancestor in (p if p.is_absolute() else Path.cwd() / p).parents:
+    # Reject paths where any component (including the leaf) is a symlink
+    # that could redirect outside the intended directory tree.  Use the
+    # absolute path so relative lookups are resolved against cwd.
+    check = p if p.is_absolute() else Path.cwd() / p
+    for component in [*check.parents, check]:
         try:
-            if ancestor.is_symlink():
+            if component.is_symlink():
                 raise ValueError(
                     f"symlink traversal rejected: {p} "
-                    f"(component {ancestor} is a symlink)")
+                    f"(component {component} is a symlink)")
         except OSError:
             pass  # permissions, deleted file — not our concern
     return p.resolve()
