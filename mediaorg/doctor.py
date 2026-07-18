@@ -292,6 +292,7 @@ def run_doctor(*, auto_fix: bool = False) -> int:
                 s, msg = check_deps()
                 if s == "OK":
                     fixed += 1
+                    issues -= 1
 
     # 4. Package structure
     s, msg = check_package_structure()

@@ -258,6 +258,19 @@ def scan_recursive_tv(root: Path, custom_patterns: list[str] = ()) -> list[dict]
         if show_folder == ".":
             show_folder = "."
 
+        # When the immediate parent looks like a season folder
+        # (e.g. "Season 1", "s01"), use its parent as the show folder
+        # so nested layouts such as Genre/Show/Season 1/file.mkv
+        # correctly record Show Folder = Genre/Show.
+        if _SEASONISH_DIR.search(show_path.name):
+            try:
+                show_folder = str(show_path.parent.relative_to(root))
+            except ValueError:
+                show_folder = str(show_path.parent)
+            if show_folder == ".":
+                show_folder = "."
+            show_path = show_path.parent
+
         # Parse show title from the folder name
         p_show = parse_name(show_path.name, custom_patterns=custom_patterns)
         # Parse season/episode/quality from the filename
@@ -273,9 +286,9 @@ def scan_recursive_tv(root: Path, custom_patterns: list[str] = ()) -> list[dict]
         rows.append({
             'Show Folder': show_folder, 'Folder Fixed': '',
             'Title': p_show.title, 'Title Fixed': '',
-            'Season': s if s is not None else '',
+            'Season': s if s is not None else '0',
             'Season Year': pf.year or p_show.year or '',
-            'Episode': ep if ep is not None else '',
+            'Episode': ep if ep is not None else '0',
             'Episode File': str(video_path.relative_to(show_path)),
             'File Fixed': '',
             'Quality': pf.quality or '', 'Quality Fixed': '',
