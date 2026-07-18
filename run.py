@@ -30,6 +30,17 @@ def install_dependencies():
     print("🔍 Checking dependencies...")
     try:
         import pandas, openpyxl, tqdm, guessit  # noqa: F401
+        # Verify versions meet minimums from requirements.txt
+        from importlib.metadata import version as _pkg_version
+        _min_versions = {'pandas': '2.2', 'openpyxl': '3.1', 'tqdm': '4.66', 'guessit': '3.8'}
+        _stale = []
+        for _pkg, _min in _min_versions.items():
+            _inst = _pkg_version(_pkg)
+            if _inst < _min:
+                _stale.append(f"{_pkg}=={_inst} (need >={_min})")
+        if _stale:
+            print(f"⚠️  Outdated packages: {', '.join(_stale)}")
+            raise ImportError("outdated dependencies")
         print("✅ All dependencies are already installed.")
     except ImportError:
         print("📦 Missing dependencies detected. Installing now...")

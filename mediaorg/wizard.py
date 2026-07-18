@@ -504,8 +504,11 @@ def run_text_export() -> None:
     out = Path(prompt_input("Output file [media_library.txt]: ",
                             default="media_library.txt"))
     lines = []
+    walk_errs: list[str] = []
     try:
-        for dirpath, dirnames, filenames in os.walk(folder):
+        for dirpath, dirnames, filenames in os.walk(
+            folder, onerror=lambda e: walk_errs.append(str(e))
+        ):
             dirnames.sort()
             try:
                 depth = Path(dirpath).relative_to(folder).parts
@@ -517,6 +520,9 @@ def run_text_export() -> None:
                 lines.append(f"{indent}  {f}")
     except OSError as exc:
         print(f"   [!] Could not walk directory: {exc}")
+    if walk_errs:
+        print(f"   [!] {len(walk_errs)} subdirectory error(s) during walk "
+              f"— export may be incomplete.")
     if not lines:
         print("[!] No files or folders found. The path may be inaccessible "
               "or empty.")

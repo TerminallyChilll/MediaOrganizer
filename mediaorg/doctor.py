@@ -307,6 +307,7 @@ def run_doctor(*, auto_fix: bool = False) -> int:
             report(sf, f"{name} (fix)", mf)
             if sf == "OK":
                 fixed += 1
+                issues -= 1
 
     # 6. Journal integrity
     s, msg = check_journal()
