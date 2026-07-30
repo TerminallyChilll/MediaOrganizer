@@ -65,7 +65,7 @@ def test_fixed_column_overrides_flow_into_plan(tmp_path):
 
     df_movies, df_tv, _ = read_library(xlsx)
     plan = plan_renames(df_movies, movies, df_tv, None, NamingScheme())
-    dsts = sorted(str(o.dst.relative_to(movies)) for o in plan.ops)
+    dsts = sorted(o.dst.relative_to(movies).as_posix() for o in plan.ops)
     assert dsts == [
         "Teh.Matirx.1999.1080p/The Matrix (1999) [1080p].mkv",
         "The Matrix (1999) [1080p]",

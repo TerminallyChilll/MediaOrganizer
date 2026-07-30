@@ -88,7 +88,7 @@ def test_loose_episode_folders_get_grouped(tmp_path):
     (tmp_path / "Show S01E02 720p").mkdir()
     (tmp_path / "Show S02E01").mkdir()
     plan = plan_season_structure(tmp_path)
-    dsts = {str(o.dst.relative_to(tmp_path)) for o in plan.ops}
+    dsts = {o.dst.relative_to(tmp_path).as_posix() for o in plan.ops}
     assert dsts == {"Season 1/Show S01E01 720p",
                     "Season 1/Show S01E02 720p",
                     "Season 2/Show S02E01"}
@@ -101,7 +101,7 @@ def test_loose_episode_files_move_with_companions(tmp_path):
     touch(tmp_path / "Show.S01E01.nfo")
     touch(tmp_path / "unrelated.txt")
     plan = plan_season_structure(tmp_path)
-    dsts = {str(o.dst.relative_to(tmp_path)) for o in plan.ops}
+    dsts = {o.dst.relative_to(tmp_path).as_posix() for o in plan.ops}
     assert dsts == {"Season 1/Show.S01E01.720p.mkv",
                     "Season 1/Show.S01E01.srt",
                     "Season 1/Show.S01E01.nfo"}
@@ -112,7 +112,7 @@ def test_flatten_episode_dirs_inside_season(tmp_path):
     touch(ep_dir / "Show.S04E10.mp4")
     touch(ep_dir / "Show.S04E10.srt")
     plan = plan_season_structure(tmp_path)
-    moves = {str(o.dst.relative_to(tmp_path)) for o in plan.ops if o.kind == "move"}
+    moves = {o.dst.relative_to(tmp_path).as_posix() for o in plan.ops if o.kind == "move"}
     assert moves == {"Season 4/Show.S04E10.mp4", "Season 4/Show.S04E10.srt"}
     rmdirs = [o.dst for o in plan.ops if o.kind == "rmdir"]
     assert rmdirs == [ep_dir]
@@ -132,7 +132,7 @@ def test_merge_duplicate_season_folders(tmp_path):
 def test_season_zero_specials(tmp_path):
     touch(tmp_path / "Show.S00E01.Special.mkv")
     plan = plan_season_structure(tmp_path)
-    assert [str(o.dst.relative_to(tmp_path)) for o in plan.ops] == \
+    assert [o.dst.relative_to(tmp_path).as_posix() for o in plan.ops] == \
         ["Season 0/Show.S00E01.Special.mkv"]
 
 
@@ -186,7 +186,7 @@ def test_plan_loose_movies(tmp_path):
     touch(tmp_path / "Some.Movie.2020.srt")
     touch(tmp_path / "Already Foldered (2019)" / "m.mkv")
     plan = plan_loose_movies(tmp_path)
-    dsts = {str(o.dst.relative_to(tmp_path)) for o in plan.ops}
+    dsts = {o.dst.relative_to(tmp_path).as_posix() for o in plan.ops}
     assert dsts == {"Some.Movie.2020",
                     "Some.Movie.2020/Some.Movie.2020.mkv",
                     "Some.Movie.2020/Some.Movie.2020.srt"}
@@ -245,7 +245,7 @@ def test_loose_files_join_year_tagged_season(tmp_path):
     touch(tmp_path / "Season 1 (2024)" / "Show.S01E01.mkv")
     touch(tmp_path / "Show.S01E02.mkv")
     plan = plan_season_structure(tmp_path)
-    assert [str(o.dst.relative_to(tmp_path)) for o in plan.ops] == \
+    assert [o.dst.relative_to(tmp_path).as_posix() for o in plan.ops] == \
         ["Season 1 (2024)/Show.S01E02.mkv"]
 
 
@@ -357,7 +357,7 @@ def test_appledouble_sidecar_is_not_media(tmp_path):
     touch(tmp_path / "._Show.S01E01.mkv")
     touch(tmp_path / ".DS_Store")
     plan = plan_season_structure(tmp_path)
-    dsts = [str(o.dst.relative_to(tmp_path)) for o in plan.ops]
+    dsts = [o.dst.relative_to(tmp_path).as_posix() for o in plan.ops]
     assert dsts == ["Season 1/Show.S01E01.mkv"]
     assert plan.skipped == []
 
