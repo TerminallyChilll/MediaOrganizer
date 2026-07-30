@@ -12,7 +12,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from .parse import COMPANION_EXTS, ParsedName, is_junk_name, parse_name
+from .parse import (COMPANION_EXTS, VIDEO_EXTS, ParsedName, is_junk_name,
+                    parse_name)
 from .plan import (EPISODE_PATTERN, SEASON_FOLDER_PATTERN, NamingScheme, Op,
                    Plan, build_episode_file_name, build_movie_file_name,
                    build_movie_folder_name, build_season_folder_name,
@@ -164,8 +165,9 @@ def _companion_ops(video_path: Path, old_base: str, new_base: str) -> list[Op]:
             continue
         # Normalise before the prefix test, or a subtitle stored NFD next to an
         # NFC video is orphaned instead of being renamed alongside it.
-        if norm(p.stem).startswith(norm(old_stem)):
-            tail = norm(p.stem)[len(norm(old_stem)):]
+        normed_stem, normed_old = norm(p.stem), norm(old_stem)
+        if normed_stem.startswith(normed_old):
+            tail = normed_stem[len(normed_old):]
         elif code != (None, None) and extract_season_episode(p.name) == code:
             # Keep whatever follows the episode code (e.g. ".en" language tag).
             m = EPISODE_PATTERN.search(p.stem)
@@ -351,8 +353,13 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
 
                     file_fixed = _clean(episode.get('File Fixed'))
                     if file_fixed:
-                        # Route the override through sanitize too.
-                        stem = Path(file_fixed).stem if Path(file_fixed).suffix else file_fixed
+                        # Route the override through sanitize too. Only strip a
+                        # RECOGNISED media extension: Path.suffix on
+                        # "Show S01E01 - Mr. Robot" is ". Robot", so a blanket
+                        # strip truncated dotted titles to "Show S01E01 - Mr".
+                        suffix = Path(file_fixed).suffix.lower()
+                        known_ext = suffix in VIDEO_EXTS or suffix in COMPANION_EXTS
+                        stem = Path(file_fixed).stem if known_ext else file_fixed
                         new_base = sanitize(stem)
                     else:
                         new_base = build_episode_file_name(

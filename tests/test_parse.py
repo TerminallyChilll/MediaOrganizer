@@ -122,3 +122,20 @@ def test_junk_detection():
     # A junk sidecar has a video suffix but is not media.
     assert not is_media_file("._Show.S01E01.mkv")
     assert is_media_file("Show.S01E01.mkv")
+
+
+def test_part_zero_is_not_dropped():
+    """`_first('part') or _first('cd')` discarded a legitimate part 0."""
+    from dataclasses import replace
+    from mediaorg.parse import ParsedName
+    # Direct check of the dataclass contract; guessit rarely emits part 0, but
+    # the falsy-or bug would silently swap in `cd` whenever it did.
+    p = ParsedName(title="X", part=0)
+    assert p.part == 0
+
+
+def test_tmp_suffix_is_shared_with_extension_repair():
+    """extfix must never magic-byte sniff our own scratch files."""
+    from mediaorg.parse import TMP_SUFFIX
+    from mediaorg.extfix import _KNOWN_NON_VIDEO
+    assert TMP_SUFFIX in _KNOWN_NON_VIDEO

@@ -272,8 +272,11 @@ def test_recover_removes_a_partial_copy(tmp_path, journal):
     dst.write_text("half")  # simulate a copy that died partway
     with open(journal, "w", encoding="utf-8") as f:
         f.write(json.dumps({"op": "begin_run", "id": "r1", "v": 2}) + "\n")
+        # dst_existed False == "nothing was there when we started", so
+        # whatever sits there now is ours to clean up.
         f.write(json.dumps({"op": "intent", "kind": "move", "seq": 1,
-                            "src": str(src), "dst": str(dst)}) + "\n")
+                            "src": str(src), "dst": str(dst),
+                            "dst_existed": False}) + "\n")
 
     notes = ex.recover(journal, dry_run=True)
     assert notes and "incomplete copy" in notes[0]
@@ -398,3 +401,127 @@ def test_folder_rename_is_undoable_after_its_contents_change(tmp_path, journal):
     result = undo_last_run(journal)
     assert result.ok, result.failed
     assert snapshot(lib) == before
+
+
+# --- Review-round hardening --------------------------------------------------
+
+def test_recovery_never_deletes_a_pre_existing_destination(tmp_path, journal):
+    """The P1: an intent is journaled before the mutation, so a move that fails
+    on an already-occupied destination also leaves an unfinished intent.
+    Recovery must not mistake that innocent file for a partial copy of ours —
+    run_undo() calls recovery automatically, so this was reachable from a
+    plain `--undo`."""
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    src = touch(lib / "a.mkv")
+    victim = lib / "out.mkv"
+    victim.write_text("something the user cares about")
+
+    result = execute(Plan(ops=[Op("move", src, victim)]), journal, roots=[lib])
+    assert not result.ok and "already exists" in result.failed[0][1]
+
+    # The intent is on disk with no completion...
+    intents = ex.list_runs(journal)[0]["intents"]
+    assert len(intents) == 1 and intents[0]["dst_existed"] is True
+
+    # ...and recovery must leave the victim completely alone.
+    assert ex.recover(journal) == []
+    assert victim.read_text() == "something the user cares about"
+    assert src.exists()
+
+
+def test_recovery_of_v1_intent_without_the_flag_is_a_no_op(tmp_path, journal):
+    """Journals written before dst_existed existed must fail safe."""
+    src = touch(tmp_path / "src.mkv")
+    dst = tmp_path / "dst.mkv"
+    dst.write_text("unknown provenance")
+    with open(journal, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"op": "begin_run", "id": "r1", "v": 2}) + "\n")
+        f.write(json.dumps({"op": "intent", "kind": "move", "seq": 1,
+                            "src": str(src), "dst": str(dst)}) + "\n")
+    assert ex.recover(journal) == []
+    assert dst.read_text() == "unknown provenance"
+
+
+def test_forced_out_of_order_undo_fails_instead_of_stranding_a_file(tmp_path, journal):
+    """a->b then b->c. Forcing the older run first looks for `b`, which is now
+    `c`. Counting that as 'already reverted' would retire the run and leave `a`
+    permanently unrecoverable."""
+    a = touch(tmp_path / "a.mkv")
+    execute(Plan(ops=[Op("move", a, tmp_path / "b.mkv")]), journal)
+    execute(Plan(ops=[Op("move", tmp_path / "b.mkv", tmp_path / "c.mkv")]), journal)
+    older = ex.list_runs(journal)[0]["id"]
+
+    result, err = ex.undo_run(journal, older, force=True)
+    assert err == ""
+    assert not result.ok, "forced out-of-order undo must not silently succeed"
+    # The run stays pending, so `a` is still recoverable via the correct order.
+    assert any(r["id"] == older and not r["undone"] for r in ex.list_runs(journal))
+
+    assert undo_last_run(journal).ok        # c -> b
+    assert undo_last_run(journal).ok        # b -> a
+    assert a.read_text() == "a.mkv"
+
+
+def test_undo_last_dry_run_previews_distinct_runs(tmp_path, journal):
+    """A dry run never advances the journal, so looping undo_last_run showed
+    the newest run N times instead of the newest N runs."""
+    a = touch(tmp_path / "a.mkv")
+    execute(Plan(ops=[Op("move", a, tmp_path / "b.mkv")]), journal)
+    execute(Plan(ops=[Op("move", tmp_path / "b.mkv", tmp_path / "c.mkv")]), journal)
+    execute(Plan(ops=[Op("move", tmp_path / "c.mkv", tmp_path / "d.mkv")]), journal)
+
+    preview = ex.undo_last(journal, 3, dry_run=True)
+    pairs = [(op.src.name, op.dst.name) for op in preview.done]
+    assert pairs == [("d.mkv", "c.mkv"), ("c.mkv", "b.mkv"), ("b.mkv", "a.mkv")]
+    # Nothing was touched and nothing was retired.
+    assert (tmp_path / "d.mkv").exists()
+    assert len(ex.pending_runs(journal)) == 3
+
+
+def test_undo_dry_run_skips_an_empty_newest_run(tmp_path, journal):
+    """The real path retires an all-failed run and carries on; the preview must
+    agree with the operation it represents."""
+    a = touch(tmp_path / "a.mkv")
+    execute(Plan(ops=[Op("move", a, tmp_path / "b.mkv")]), journal)
+    execute(Plan(ops=[Op("move", tmp_path / "gone.mkv", tmp_path / "x.mkv")]), journal)
+    assert [len(r["ops"]) for r in ex.list_runs(journal)] == [1, 0]
+
+    preview = undo_last_run(journal, dry_run=True)
+    assert [(op.src.name, op.dst.name) for op in preview.done] == [("b.mkv", "a.mkv")]
+
+
+def test_undo_last_zero_is_a_no_op(tmp_path, journal):
+    a = touch(tmp_path / "a.mkv")
+    execute(Plan(ops=[Op("move", a, tmp_path / "b.mkv")]), journal)
+    result = ex.undo_last(journal, 0)
+    assert result.done == [] and result.ok
+    assert (tmp_path / "b.mkv").exists()
+
+
+def test_junk_only_dir_of_os_directories_is_quarantined(tmp_path, journal):
+    """@eaDir (Synology) is a directory, so the folder looked like it had real
+    subdirectories and rmdir kept failing."""
+    lib = tmp_path / "lib"
+    d = lib / "Season 2"
+    (d / "@eaDir").mkdir(parents=True)
+    (d / "@eaDir" / "thumb.jpg").write_text("nas thumbnail")
+    before = snapshot(lib)
+
+    result = execute(Plan(ops=[Op("rmdir", None, d)]), journal, roots=[lib])
+    assert result.ok, result.failed
+    assert not d.exists()
+    assert (lib / ".mediaorg_trash" / "@eaDir" / "thumb.jpg").exists()
+
+    assert undo_last_run(journal).ok
+    assert snapshot(lib) == before
+
+
+def test_free_name_is_bounded(tmp_path):
+    base = tmp_path / "x.txt"
+    base.write_text("0")
+    for n in range(1, 6):
+        (tmp_path / f"x.{n}.txt").write_text(str(n))
+    assert ex._free_name(base).name == "x.6.txt"
+    with pytest.raises(OSError):
+        ex._free_name(base, limit=3)

@@ -29,12 +29,11 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .parse import is_junk_name
+from .parse import TMP_SUFFIX, is_junk_dir, is_junk_name
 from .plan import Op, Plan
 
 JOURNAL_FILE = "mediaorg_journal.jsonl"
 JOURNAL_VERSION = 2
-TMP_SUFFIX = ".mediaorg_tmp"
 TRASH_DIR = ".mediaorg_trash"
 
 # Backoff for files held open by another program (Plex/Jellyfin/VLC streaming
@@ -189,13 +188,16 @@ def _is_case_only_rename(src: Path, dst: Path) -> bool:
             and src.name.casefold() == dst.name.casefold())
 
 
-def _free_tmp_path(src: Path) -> Path:
+def _free_tmp_path(src: Path, limit: int = 1000) -> Path:
     candidate = src.with_name(src.name + TMP_SUFFIX)
-    n = 0
-    while os.path.lexists(candidate):
-        n += 1
+    if not os.path.lexists(candidate):
+        return candidate
+    for n in range(1, limit + 1):
         candidate = src.with_name(f"{src.name}{TMP_SUFFIX}.{n}")
-    return candidate
+        if not os.path.lexists(candidate):
+            return candidate
+    raise OSError(errno.EEXIST,
+                  f"no free temp name for {src} after {limit} attempts")
 
 
 def _fsync_path(path: Path) -> None:
@@ -232,10 +234,13 @@ def _move_across(src: Path, dst: Path) -> None:
         shutil.rmtree(src)
         return
 
-    expected = src.stat().st_size
+    # lstat on both sides: copy2 is told not to follow symlinks, so for a
+    # symlinked file it copies the link itself. stat() would compare the
+    # target's size against the link's and fail a perfectly good copy.
+    expected = src.lstat().st_size
     shutil.copy2(src, dst, follow_symlinks=False)
     _fsync_path(dst)
-    actual = dst.stat().st_size
+    actual = dst.lstat().st_size
     if actual != expected:
         raise OSError(errno.EIO,
                       f"copy verification failed: {dst} is {actual} bytes, "
@@ -288,7 +293,12 @@ def _describe(exc: BaseException) -> str:
 # --- Junk quarantine --------------------------------------------------------
 
 def _junk_children(directory: Path) -> list[Path]:
-    """OS metadata files that would make an otherwise-empty rmdir fail."""
+    """OS metadata entries that would make an otherwise-empty rmdir fail.
+
+    Junk *directories* count too: a folder holding only Synology's `@eaDir`
+    still fails rmdir, and treating any subdirectory as "real content" left
+    those stuck forever.
+    """
     try:
         entries = list(os.scandir(directory))
     except OSError:
@@ -296,8 +306,9 @@ def _junk_children(directory: Path) -> list[Path]:
     junk = []
     for entry in entries:
         if entry.is_dir(follow_symlinks=False):
-            return []  # a real subdirectory: not "empty but for junk"
-        if not is_junk_name(entry.name):
+            if not is_junk_dir(entry.name):
+                return []  # real content: not "empty but for junk"
+        elif not is_junk_name(entry.name):
             return []
         junk.append(Path(entry.path))
     return sorted(junk)
@@ -313,13 +324,16 @@ def _trash_dir(target: Path, roots: list[Path]) -> Path:
     return target.parent / TRASH_DIR
 
 
-def _free_name(path: Path) -> Path:
-    candidate = path
-    n = 0
-    while os.path.lexists(candidate):
-        n += 1
+def _free_name(path: Path, limit: int = 1000) -> Path:
+    """An unused name near `path`. Bounded so it can never spin forever."""
+    if not os.path.lexists(path):
+        return path
+    for n in range(1, limit + 1):
         candidate = path.with_name(f"{path.stem}.{n}{path.suffix}")
-    return candidate
+        if not os.path.lexists(candidate):
+            return candidate
+    raise OSError(errno.EEXIST,
+                  f"no free name for {path} after {limit} attempts")
 
 
 # --- Journal writing --------------------------------------------------------
@@ -388,13 +402,23 @@ def execute(plan: Plan, journal: Path, dry_run: bool = False, *,
                     _validate_op_path(op.dst, check_roots)
                     created = _missing_parents(dst)
 
-                    def on_tmp(tmp: Path, _seq=seq, _src=src, _dst=dst) -> None:
+                    # Whether the destination was already occupied BEFORE we
+                    # touched anything. The intent has to be journaled before
+                    # the mutation, which means it is also written when the
+                    # move then fails on a pre-existing destination — and
+                    # without this flag recovery would mistake that innocent
+                    # file for a partial copy of ours and delete it.
+                    dst_existed = os.path.lexists(dst)
+
+                    def on_tmp(tmp: Path, _seq=seq, _src=src, _dst=dst,
+                               _existed=dst_existed) -> None:
                         jw.log({"op": "intent", "kind": "move", "seq": _seq,
                                 "src": str(_src), "dst": str(_dst),
-                                "tmp": str(tmp)})
+                                "tmp": str(tmp), "dst_existed": _existed})
 
                     jw.log({"op": "intent", "kind": "move", "seq": seq,
-                            "src": str(src), "dst": str(dst)})
+                            "src": str(src), "dst": str(dst),
+                            "dst_existed": dst_existed})
                     _retrying(lambda: _do_move(src, dst, on_tmp=on_tmp))
                     entry = {"op": "move", "src": str(src), "dst": str(dst),
                              "seq": seq, **_stat_fields(dst)}
@@ -429,7 +453,7 @@ def execute(plan: Plan, journal: Path, dry_run: bool = False, *,
                                     "seq": seq})
                         for j in junk:
                             jdst = _free_name(trash / j.name)
-                            os.rename(j, jdst)
+                            _retrying(lambda a=j, b=jdst: os.rename(a, b))
                             jw.log({"op": "move", "src": str(j),
                                     "dst": str(jdst), "seq": seq,
                                     **_stat_fields(jdst)})
@@ -557,7 +581,15 @@ def recover(journal: Path, dry_run: bool = False) -> list[str]:
                 continue
 
             if (kind == "move" and src is not None and dst is not None
-                    and os.path.lexists(src) and os.path.lexists(dst)):
+                    and os.path.lexists(src) and os.path.lexists(dst)
+                    # ONLY when we positively recorded that the destination did
+                    # not exist when we started — i.e. anything there now was
+                    # created by us. A failed move onto a pre-existing file
+                    # also leaves an unfinished intent, and deleting *that*
+                    # destroys a file we never owned. Journals without the
+                    # flag (v1, or v2 before this was added) fall through to
+                    # "leave it alone", which is the safe default.
+                    and intent.get("dst_existed") is False):
                 # The move never completed and the source is intact, so what
                 # sits at dst is a partial copy we created. Removing it also
                 # unblocks retries: the collision check would otherwise see it
@@ -617,7 +649,15 @@ def _identity_matches(path: Path, recorded: dict) -> tuple[bool, str]:
 
 
 def _apply_reverse(reverse: list[Op], identities: dict[str, dict],
-                   *, force: bool) -> ExecResult:
+                   *, force: bool, lenient: bool) -> ExecResult:
+    """Apply reversed ops.
+
+    `lenient` allows "the source is already gone, so an earlier partial undo
+    must have reverted this" — true only when undoing the NEWEST pending run.
+    Out of order it is a lie: with runs `a->b` then `b->c`, reversing the older
+    run looks for `b`, which is now `c`, and treating that as done would retire
+    the run and strand `a` permanently.
+    """
     result = ExecResult()
     roots = _implicit_roots(reverse)
     for op in reverse:
@@ -642,7 +682,8 @@ def _apply_reverse(reverse: list[Op], identities: dict[str, dict],
         except OSError as e:
             # A reverse move whose source is already gone was reverted by an
             # earlier partial undo — count it done so the run can complete.
-            if op.kind == "move" and not os.path.lexists(_op_path(op.src)):
+            if (lenient and op.kind == "move"
+                    and not os.path.lexists(_op_path(op.src))):
                 result.done.append(op)
                 continue
             result.failed.append((op, _describe(e)))
@@ -659,7 +700,12 @@ def _undo_record(run: dict, journal: Path, *, dry_run: bool,
     reverse = _reverse_ops(run["ops"])
     if dry_run:
         return ExecResult(done=reverse, dry_run=True)
-    result = _apply_reverse(reverse, _identity_by_path(run["ops"]), force=force)
+    # Leniency is decided here, once, so every caller gets it right: it is
+    # only safe when this run is the newest one still pending.
+    pending = pending_runs(journal)
+    lenient = bool(pending) and pending[-1]["id"] == run["id"]
+    result = _apply_reverse(reverse, _identity_by_path(run["ops"]),
+                            force=force, lenient=lenient)
     if result.ok:
         _mark_undone(journal, run["id"])
     return result
@@ -668,18 +714,25 @@ def _undo_record(run: dict, journal: Path, *, dry_run: bool,
 def undo_last_run(journal: Path, dry_run: bool = False, *,
                   force: bool = False) -> ExecResult:
     """Reverse-replay the last un-undone run. Repeatable for earlier runs."""
+    if dry_run:
+        # Mirror what the real path does: it retires runs with no entries to
+        # reverse and carries on, so the preview must skip them too or it
+        # disagrees with the operation it is previewing.
+        for run in reversed(pending_runs(journal)):
+            if run["ops"]:
+                return _undo_record(run, journal, dry_run=True, force=force)
+        return ExecResult(dry_run=True)
+
     while True:
         pending = pending_runs(journal)
         if not pending:
-            return ExecResult(dry_run=dry_run)
+            return ExecResult()
         run = pending[-1]
         if run["ops"]:
-            return _undo_record(run, journal, dry_run=dry_run, force=force)
+            return _undo_record(run, journal, dry_run=False, force=force)
         # A run in which every op failed has no entries to reverse. Returning
         # here without marking it undone (the old behaviour) made every
         # earlier run unreachable forever, so retire it and carry on.
-        if dry_run:
-            return ExecResult(dry_run=True)
         _mark_undone(journal, run["id"])
 
 
@@ -746,8 +799,20 @@ def undo_last(journal: Path, count: int = 1, dry_run: bool = False, *,
               force: bool = False) -> ExecResult:
     """Undo the newest `count` runs, newest first."""
     combined = ExecResult(dry_run=dry_run)
-    for _ in range(max(1, count)):
-        result = undo_last_run(journal, dry_run=dry_run, force=force)
+    if count < 1:
+        return combined
+
+    if dry_run:
+        # A dry run never writes `undone_run`, so the journal never advances —
+        # calling undo_last_run in a loop would preview the SAME run `count`
+        # times. Walk the pending runs directly instead.
+        with_ops = [r for r in pending_runs(journal) if r["ops"]]
+        for run in reversed(with_ops[-count:]):
+            combined.done.extend(_reverse_ops(run["ops"]))
+        return combined
+
+    for _ in range(count):
+        result = undo_last_run(journal, force=force)
         combined.done.extend(result.done)
         combined.failed.extend(result.failed)
         if result.failed or not result.done:

@@ -220,7 +220,7 @@ def _crosses_devices(plan: Plan) -> list[Op]:
             probe = op.dst.parent
             while not probe.exists() and probe.parent != probe:
                 probe = probe.parent
-            if probe.exists() and os.stat(probe).st_dev != src_dev:
+            if probe.exists() and os.stat(probe, follow_symlinks=False).st_dev != src_dev:
                 crossing.append(op)
         except OSError:
             continue
@@ -313,7 +313,7 @@ def _report_misfiled(movies_rows, tv_rows, patterns) -> None:
             if not vf:
                 continue
             if parse_name(vf, custom_patterns=patterns).kind == 'episode':
-                misfiled_tv.append(f"{row['Folder Name']}/{vf}")
+                misfiled_tv.append(f"{row.get('Folder Name', '?')}/{vf}")
     for row in tv_rows:
         rel = str(row.get('Episode File') or '')
         if not rel or _clean_season(row.get('Season')):
@@ -846,7 +846,8 @@ def main() -> None:
         return
     if args.undo or args.undo_run or args.undo_session or args.undo_last:
         run_undo(dry_run=args.dry_run, run_id=args.undo_run,
-                 session=args.undo_session, count=args.undo_last or 1,
+                 session=args.undo_session,
+                 count=1 if args.undo_last is None else args.undo_last,
                  force=args.force)
         return
     if not args.action:

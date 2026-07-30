@@ -311,3 +311,29 @@ def test_specials_are_not_given_an_invented_name(tmp_path):
     plan = excel.plan_renames(None, None, pd.DataFrame(rows), tmp_path,
                               NamingScheme())
     assert plan.ops == [] and plan.skipped == []
+
+
+def test_file_fixed_keeps_a_dotted_title(tmp_path):
+    """Path.suffix on "Show S01E01 - Mr. Robot" is ". Robot", so a blanket
+    suffix strip truncated the override to "Show S01E01 - Mr.mkv"."""
+    show = tmp_path / "Show"
+    (show / "Season 1").mkdir(parents=True)
+    (show / "Season 1" / "Show.S01E01.mkv").write_text("x")
+
+    rows = scan.scan_tv(tmp_path)
+    df_tv = pd.DataFrame(rows)
+    df_tv.loc[0, 'File Fixed'] = 'Show S01E01 - Mr. Robot'
+    plan = excel.plan_renames(None, None, df_tv, tmp_path, NamingScheme())
+    assert [o.dst.name for o in plan.ops] == ['Show S01E01 - Mr. Robot.mkv']
+
+
+def test_file_fixed_still_strips_a_real_media_extension(tmp_path):
+    show = tmp_path / "Show"
+    (show / "Season 1").mkdir(parents=True)
+    (show / "Season 1" / "Show.S01E01.mkv").write_text("x")
+
+    rows = scan.scan_tv(tmp_path)
+    df_tv = pd.DataFrame(rows)
+    df_tv.loc[0, 'File Fixed'] = 'Renamed Episode.mkv'
+    plan = excel.plan_renames(None, None, df_tv, tmp_path, NamingScheme())
+    assert [o.dst.name for o in plan.ops] == ['Renamed Episode.mkv']

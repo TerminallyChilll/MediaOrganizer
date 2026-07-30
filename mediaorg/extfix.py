@@ -4,15 +4,16 @@ bulk-convert one extension to another. Emits Ops for the journaled executor."""
 import os
 from pathlib import Path
 
-from .parse import VIDEO_EXTS, is_junk_dir, is_junk_name
+from .parse import TMP_SUFFIX, VIDEO_EXTS, is_junk_dir, is_junk_name
 from .plan import Op, Plan, check_collisions
 
 _KNOWN_NON_VIDEO = {'.nfo', '.srt', '.sub', '.idx', '.jpg', '.jpeg', '.png',
                     '.txt', '.nzb', '.bat', '.sh', '.py', '.json', '.xlsx',
                     '.xls', '.jsonl',
                     # Our own crash scar: without this, a restore pass would
-                    # magic-byte sniff it and append a video extension.
-                    '.mediaorg_tmp'}
+                    # magic-byte sniff it and append a video extension. Taken
+                    # from execute so the two can never drift apart.
+                    TMP_SUFFIX}
 
 
 def detect_extension(filepath: Path) -> str | None:

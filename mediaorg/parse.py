@@ -53,6 +53,12 @@ def is_media_file(name: str, exts=None) -> bool:
 
 CUSTOM_PATTERNS_FILE = "custom_strip_patterns.json"
 
+# Suffix of the scratch file a case-only rename passes through. Defined here,
+# with the other file-classification constants, so both the executor (which
+# creates it) and extfix (which must never treat it as media) share one source
+# of truth — and so planners never have to import the executor.
+TMP_SUFFIX = ".mediaorg_tmp"
+
 # Only what guessit can't know: site prefixes, HTML entities, user patterns.
 # A trailing delimiter is REQUIRED. The old pattern ended in `\S+` with an
 # optional dash, so with no whitespace in the name it swallowed the whole
@@ -176,7 +182,10 @@ def parse_name(name: str, kind_hint: str | None = None,
         return val[0] if isinstance(val, list) and val else val
 
     edition = _first('edition')
-    part = _first('part') or _first('cd')
+    # Explicit None check: `part or cd` would discard a legitimate part 0.
+    part = _first('part')
+    if part is None:
+        part = _first('cd')
     try:
         part = int(part) if part is not None else None
     except (TypeError, ValueError):
