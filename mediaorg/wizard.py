@@ -8,12 +8,16 @@ import getpass
 import json
 import os
 import sys
+import uuid
+from datetime import datetime
 from pathlib import Path
 
 from . import excel, extfix, llm, scan
-from .execute import JOURNAL_FILE, execute, last_run_ops, undo_last_run
+from .execute import (execute, journal_path, last_run_ops, list_runs,
+                      pending_runs, recover, undo_last, undo_last_run,
+                      undo_run, undo_session)
 from .parse import load_custom_patterns, parse_name
-from .plan import (NamingScheme, Plan, folder_has_episodes_or_seasons,
+from .plan import (NamingScheme, Op, Plan, folder_has_episodes_or_seasons,
                    plan_loose_movies, plan_season_structure)
 
 CONFIG_FILE = ".media_renamer_config.json"
@@ -201,8 +205,31 @@ def paginated_preview(lines: list[str], page_size: int = 20) -> bool:
             return False
 
 
+def _crosses_devices(plan: Plan) -> list[Op]:
+    """Moves that land on a different filesystem than their source.
+
+    Those are byte copies, not renames — they can take minutes for a media
+    file, so the preview should not present them as instantaneous.
+    """
+    crossing = []
+    for op in plan.ops:
+        if op.kind != "move" or not op.src:
+            continue
+        try:
+            src_dev = os.stat(op.src, follow_symlinks=False).st_dev
+            probe = op.dst.parent
+            while not probe.exists() and probe.parent != probe:
+                probe = probe.parent
+            if probe.exists() and os.stat(probe).st_dev != src_dev:
+                crossing.append(op)
+        except OSError:
+            continue
+    return crossing
+
+
 def confirm_and_execute(plan: Plan, journal: Path, dry_run: bool = False,
-                        label: str = "changes") -> list:
+                        label: str = "changes", *, roots=None,
+                        session: str | None = None) -> list:
     """Preview a plan, ask, execute. Returns executed journal-style entries."""
     lines = [f"  {op.kind.upper():6} {op.src if op.src else ''}  ->  {op.dst}"
              for op in plan.ops]
@@ -215,6 +242,12 @@ def confirm_and_execute(plan: Plan, journal: Path, dry_run: bool = False,
         return []
     print(f"\nPlanned {label}: {len(plan.ops)} operation(s), "
           f"{len(plan.skipped)} skipped due to conflicts.")
+    crossing = _crosses_devices(plan)
+    if crossing:
+        print(f"  [!] {len(crossing)} of these cross a filesystem boundary and "
+              f"will be COPIED, not renamed.")
+        print(f"      That can take a while for large files. Each copy is "
+              f"size-verified before the original is removed.")
     if dry_run:
         for line in lines:
             print(line)
@@ -223,7 +256,7 @@ def confirm_and_execute(plan: Plan, journal: Path, dry_run: bool = False,
     if not paginated_preview(lines):
         print("Aborted. No changes made.")
         return []
-    result = execute(plan, journal)
+    result = execute(plan, journal, roots=roots, label=label, session=session)
     print(f"\n[OK] {len(result.done)} operation(s) applied.")
     for op, err in result.failed:
         print(f"  [!] FAILED: {op.src or op.dst}: {err}")
@@ -236,10 +269,12 @@ def confirm_and_execute(plan: Plan, journal: Path, dry_run: bool = False,
 # --- Flows -------------------------------------------------------------------
 
 def _journal_path() -> Path:
-    return Path.cwd() / JOURNAL_FILE
+    """The journal, anchored to the app rather than the current directory."""
+    return journal_path()
 
 
-def run_organize(tv_path: str, dry_run: bool = False) -> None:
+def run_organize(tv_path: str, dry_run: bool = False, *,
+                 session: str | None = None) -> None:
     root = Path(tv_path)
     plan = Plan()
     if folder_has_episodes_or_seasons(root):
@@ -259,7 +294,54 @@ def run_organize(tv_path: str, dry_run: bool = False) -> None:
                                 plan.merge(plan_season_structure(Path(sub.path)))
                     except OSError:
                         pass
-    confirm_and_execute(plan, _journal_path(), dry_run, "TV structure changes")
+    confirm_and_execute(plan, _journal_path(), dry_run, "TV structure changes",
+                        roots=[root], session=session)
+
+
+def _report_misfiled(movies_rows, tv_rows, patterns) -> None:
+    """Point out media that looks like it is in the wrong library.
+
+    guessit already works out movie-vs-episode for every name; that verdict was
+    computed and thrown away. Reporting it is deliberate: renames stay
+    in-place, so moving something between the Movies and TV trees is a
+    different, explicit operation - this just stops it being invisible.
+    """
+    misfiled_tv, misfiled_movies = [], []
+    for row in movies_rows:
+        for vf in str(row.get('Video Files') or '').split('|'):
+            vf = vf.strip()
+            if not vf:
+                continue
+            if parse_name(vf, custom_patterns=patterns).kind == 'episode':
+                misfiled_tv.append(f"{row['Folder Name']}/{vf}")
+    for row in tv_rows:
+        rel = str(row.get('Episode File') or '')
+        if not rel or _clean_season(row.get('Season')):
+            continue
+        if parse_name(Path(rel).name, custom_patterns=patterns).kind == 'movie':
+            misfiled_movies.append(f"{row['Show Folder']}/{rel}")
+
+    if misfiled_tv:
+        print(f"\n   [!] {len(misfiled_tv)} file(s) in the Movies folder look "
+              f"like TV episodes:")
+        for name in misfiled_tv[:5]:
+            print(f"       {name}")
+        if len(misfiled_tv) > 5:
+            print(f"       ... and {len(misfiled_tv) - 5} more")
+    if misfiled_movies:
+        print(f"\n   [!] {len(misfiled_movies)} file(s) in the TV folder look "
+              f"like movies:")
+        for name in misfiled_movies[:5]:
+            print(f"       {name}")
+        if len(misfiled_movies) > 5:
+            print(f"       ... and {len(misfiled_movies) - 5} more")
+    if misfiled_tv or misfiled_movies:
+        print("       Renaming leaves these where they are. Move them to the "
+              "right folder\n       and re-scan if you want them organized.")
+
+
+def _clean_season(val) -> str:
+    return '' if val is None else str(val).strip()
 
 
 def run_scan(movies_path, tv_path, excel_path: Path, dry_run: bool = False) -> None:
@@ -301,11 +383,27 @@ def run_scan(movies_path, tv_path, excel_path: Path, dry_run: bool = False) -> N
             elif not movies_rows:
                 print("   [!] Recursive scan also found nothing.")
     if tv_path:
-        tv_has_gaps = (not tv_rows
-                       or any(not r.get('Episode File') for r in tv_rows))
+        # Only descend recursively for the shows that actually came up empty.
+        # Triggering on "any row anywhere lacks an Episode File" meant a single
+        # movie folder in the TV root dragged the entire tree through the
+        # recursive path.
+        gap_shows = {r['Show Folder'] for r in tv_rows
+                     if not r.get('Episode File')}
+        tv_has_gaps = bool(not tv_rows or gap_shows)
+        if gap_shows and tv_rows:
+            print(f"   [!] {len(gap_shows)} show folder(s) had no detectable "
+                  f"episodes - running a recursive walk for those...")
         if tv_has_gaps:
-            print("   [!] Structured scan has gaps — running recursive walk for TV...")
-            rec = scan.scan_recursive_tv(Path(tv_path), patterns)
+            if not tv_rows:
+                print("   [!] Structured scan found nothing — "
+                      "running recursive walk for TV...")
+                rec = scan.scan_recursive_tv(Path(tv_path), patterns)
+            else:
+                rec = []
+                for show in sorted(gap_shows):
+                    sub = Path(tv_path) / show if show != '.' else Path(tv_path)
+                    rec.extend(scan.scan_recursive_tv(sub, patterns,
+                                                      base=Path(tv_path)))
             if rec:
                 # Key by (Show Folder, Episode File) so episodes from
                 # different sources for the same show don't clobber each
@@ -332,6 +430,8 @@ def run_scan(movies_path, tv_path, excel_path: Path, dry_run: bool = False) -> N
         print("[!] Nothing found to scan — not even with recursive walk.")
         print("    Check that the path contains video files and is accessible.")
         return
+
+    _report_misfiled(movies_rows, tv_rows, patterns)
 
     if dry_run:
         print(f"\n[dry-run] Would save {len(movies_rows)} movie row(s), {len(tv_rows)} TV row(s) "
@@ -440,7 +540,8 @@ def _ask_llm_results(df_movies, df_tv, patterns) -> dict:
     return llm.clean_titles_with_llm(candidates, provider, api_key=key)
 
 
-def run_rename(movies_path, tv_path, excel_path: Path, dry_run: bool = False) -> None:
+def run_rename(movies_path, tv_path, excel_path: Path, dry_run: bool = False,
+               *, session: str | None = None) -> None:
     if not excel_path.exists():
         print(f"[!] Spreadsheet not found: {excel_path}. Run a scan first.")
         return
@@ -456,7 +557,9 @@ def run_rename(movies_path, tv_path, excel_path: Path, dry_run: bool = False) ->
 
     plan = excel.plan_renames(df_movies, movies_path, df_tv, tv_path,
                               scheme, llm_results, patterns)
-    entries = confirm_and_execute(plan, _journal_path(), dry_run, "renames")
+    rename_roots = [Path(p) for p in (movies_path, tv_path) if p]
+    entries = confirm_and_execute(plan, _journal_path(), dry_run, "renames",
+                                  roots=rename_roots, session=session)
     if entries:
         import time as _time
         for e in entries:
@@ -484,29 +587,105 @@ def run_extension_fixer(dry_run: bool = False) -> None:
         plan = extfix.plan_extension_convert(Path(folder), from_ext, to_ext)
     else:
         plan = extfix.plan_extension_restore(Path(folder))
-    confirm_and_execute(plan, _journal_path(), dry_run, "extension fixes")
+    confirm_and_execute(plan, _journal_path(), dry_run, "extension fixes",
+                        roots=[Path(folder)])
 
 
-def run_undo(dry_run: bool = False) -> None:
+def _fmt_ts(ts) -> str:
+    try:
+        return datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return "?"
+
+
+def run_list_runs() -> None:
+    """Show the journal's history so a specific run can be picked."""
     journal = _journal_path()
-    ops = last_run_ops(journal)
-    if not ops:
-        print("[OK] Nothing to undo (no journaled runs).")
+    runs = list_runs(journal)
+    print(f"\nJournal: {journal}")
+    if not runs:
+        print("  (no runs recorded yet)")
         return
-    print(f"\nLast run has {len(ops)} operation(s) to reverse.")
-    if dry_run:
-        result = undo_last_run(journal, dry_run=True)
-        for op in result.done:
-            print(f"  {op.kind.upper():6} {op.src or ''}  ->  {op.dst}")
-        return
-    if not ask_yes_no("Undo it now?", default=True):
-        return
-    result = undo_last_run(journal)
+    print(f"\n  {'RUN':14} {'WHEN':20} {'OPS':>5}  {'STATE':9} LABEL")
+    for run in runs:
+        state = "undone" if run["undone"] else ("open" if run["open"] else "undoable")
+        print(f"  {(run['id'] or '?'):14} {_fmt_ts(run['ts']):20} "
+              f"{len(run['ops']):>5}  {state:9} {run['label'] or ''}")
+    sessions = {r["session"] for r in runs if not r["undone"]}
+    if len(sessions) < len([r for r in runs if not r["undone"]]):
+        print("\n  Runs sharing a session were one action "
+              "- 'python run.py --undo-session' reverses the whole thing.")
+    print("\n  Reverse a specific run:  python run.py --undo-run <RUN>")
+
+
+def _report_undo(result) -> None:
     print(f"[OK] Reverted {len(result.done)} operation(s).")
     for op, err in result.failed:
         print(f"  [!] FAILED: {op.src or op.dst}: {err}")
     if not result.ok:
         print("  [!] Some reversals failed - fix the conflicts and run undo again.")
+
+
+def _run_recovery(dry_run: bool = False) -> None:
+    """Clean up mutations that were interrupted mid-flight."""
+    notes = recover(_journal_path(), dry_run=dry_run)
+    if not notes:
+        return
+    print(f"\n{'[dry-run] Would recover' if dry_run else '[OK] Recovered'} "
+          f"{len(notes)} interrupted change(s):")
+    for note in notes:
+        print(f"  {note}")
+
+
+def run_undo(dry_run: bool = False, *, run_id: str | None = None,
+             session: bool = False, count: int = 1,
+             force: bool = False) -> None:
+    journal = _journal_path()
+    _run_recovery(dry_run)
+
+    if run_id:
+        result, err = undo_run(journal, run_id, dry_run=dry_run, force=force)
+        if err:
+            print(f"[!] {err}")
+            return
+        if dry_run:
+            for op in result.done:
+                print(f"  {op.kind.upper():6} {op.src or ''}  ->  {op.dst}")
+            return
+        _report_undo(result)
+        return
+
+    pending = pending_runs(journal)
+    if not pending:
+        print(f"[OK] Nothing to undo (no journaled runs). Journal: {journal}")
+        return
+
+    if session:
+        target = pending[-1]["session"]
+        group = [r for r in pending if r["session"] == target]
+        total = sum(len(r["ops"]) for r in group)
+        print(f"\nLast action spans {len(group)} run(s), "
+              f"{total} operation(s) to reverse.")
+        if dry_run:
+            result = undo_session(journal, dry_run=True, force=force)
+            for op in result.done:
+                print(f"  {op.kind.upper():6} {op.src or ''}  ->  {op.dst}")
+            return
+        if not ask_yes_no("Undo the whole action now?", default=True):
+            return
+        _report_undo(undo_session(journal, force=force))
+        return
+
+    ops = last_run_ops(journal)
+    print(f"\nLast run has {len(ops)} operation(s) to reverse.")
+    if dry_run:
+        result = undo_last(journal, count, dry_run=True, force=force)
+        for op in result.done:
+            print(f"  {op.kind.upper():6} {op.src or ''}  ->  {op.dst}")
+        return
+    if not ask_yes_no("Undo it now?", default=True):
+        return
+    _report_undo(undo_last(journal, count, force=force))
 
 
 def run_text_export() -> None:
@@ -590,7 +769,11 @@ Tip: type 'back' or 'b' at any prompt to return here.""")
             if choice == '8':
                 break
             elif choice == '7':
-                run_undo()
+                run_list_runs()
+                if pending_runs(_journal_path()):
+                    run_undo(session=ask_yes_no(
+                        "Undo the entire last action (all its runs)?",
+                        default=False))
             elif choice == '6':
                 run_text_export()
             elif choice == '4':
@@ -645,10 +828,26 @@ def main() -> None:
                         help="Show planned changes without touching disk")
     parser.add_argument('--undo', action='store_true',
                         help="Undo the last run from the journal")
+    parser.add_argument('--list-runs', action='store_true',
+                        help="List journaled runs and whether they can be undone")
+    parser.add_argument('--undo-run', metavar='RUN',
+                        help="Undo one specific run by id (see --list-runs)")
+    parser.add_argument('--undo-last', type=int, metavar='N', default=None,
+                        help="Undo the newest N runs")
+    parser.add_argument('--undo-session', action='store_true',
+                        help="Undo every run of the last action "
+                             "(--action full makes several)")
+    parser.add_argument('--force', action='store_true',
+                        help="Undo even if a file was modified since, or out of order")
     args = parser.parse_args()
 
-    if args.undo:
-        run_undo(dry_run=args.dry_run)
+    if args.list_runs:
+        run_list_runs()
+        return
+    if args.undo or args.undo_run or args.undo_session or args.undo_last:
+        run_undo(dry_run=args.dry_run, run_id=args.undo_run,
+                 session=args.undo_session, count=args.undo_last or 1,
+                 force=args.force)
         return
     if not args.action:
         run_wizard()
@@ -666,14 +865,21 @@ def main() -> None:
     elif args.action == 'rename':
         run_rename(movies, tv, xlsx, dry_run=args.dry_run)
     elif args.action == 'full':
+        # One session id across all three phases so a single
+        # `--undo-session` reverses the whole action.
+        session = uuid.uuid4().hex[:12]
         if tv:
-            run_organize(tv, dry_run=args.dry_run)
+            run_organize(tv, dry_run=args.dry_run, session=session)
         if movies:
             loose = plan_loose_movies(Path(movies))
             if loose.ops:
-                confirm_and_execute(loose, _journal_path(), args.dry_run, "loose-file moves")
+                confirm_and_execute(loose, _journal_path(), args.dry_run,
+                                    "loose-file moves", roots=[Path(movies)],
+                                    session=session)
         run_scan(movies, tv, xlsx, dry_run=args.dry_run)
-        run_rename(movies, tv, xlsx, dry_run=args.dry_run)
+        run_rename(movies, tv, xlsx, dry_run=args.dry_run, session=session)
+        if not args.dry_run:
+            print("\nUndo this entire action: python run.py --undo-session")
 
 
 if __name__ == "__main__":

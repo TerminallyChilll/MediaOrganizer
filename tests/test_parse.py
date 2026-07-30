@@ -78,3 +78,47 @@ def test_multi_episode_normalized_to_list():
 def test_defaults():
     p = ParsedName(title="X")
     assert p.episodes == [] and p.year is None and p.source == "guessit"
+
+
+# --- pre_clean must never destroy the name -----------------------------------
+
+@pytest.mark.parametrize("name", [
+    "http://x.com/The.Matrix.1999.mkv",
+    "https://tracker.example/Show.S01E01.mkv",
+    "www.site.org/Movie.2020.mkv",
+])
+def test_pre_clean_never_empties_the_name(name):
+    """`https?://\\S+` used to swallow the whole filename when it had no spaces."""
+    assert pre_clean(name).strip() != ""
+
+
+def test_pre_clean_still_strips_a_delimited_site_prefix():
+    assert pre_clean("www.site.org-Breaking.Bad.S01E01.mkv") == \
+        "Breaking.Bad.S01E01.mkv"
+    assert pre_clean("www.UIndex.org    -    Breaking.Bad.S01E01.720p.mkv") == \
+        "Breaking.Bad.S01E01.720p.mkv"
+
+
+def test_pre_clean_ignores_an_over_greedy_custom_pattern():
+    assert pre_clean("The.Matrix.1999.mkv", [r".*"]) == "The.Matrix.1999.mkv"
+
+
+def test_url_name_still_yields_a_usable_title():
+    p = parse_name("http://x.com/The.Matrix.1999.mkv")
+    assert p.title and p.title != ""
+
+
+def test_edition_and_part_are_captured():
+    assert parse_name("Movie.1999.EXTENDED.1080p.mkv").edition
+    assert parse_name("Movie.1999.Part.2.1080p.mkv").part == 2
+
+
+def test_junk_detection():
+    from mediaorg.parse import is_junk_dir, is_junk_name, is_media_file
+    assert is_junk_name("._Show.S01E01.mkv")
+    assert is_junk_name(".DS_Store") and is_junk_name("Thumbs.db")
+    assert not is_junk_name("Show.S01E01.mkv")
+    assert is_junk_dir("@eaDir") and not is_junk_dir("Season 1")
+    # A junk sidecar has a video suffix but is not media.
+    assert not is_media_file("._Show.S01E01.mkv")
+    assert is_media_file("Show.S01E01.mkv")

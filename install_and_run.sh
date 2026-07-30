@@ -23,11 +23,11 @@ fi
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 cd "$SCRIPT_DIR"
 
-# Ensure run.py is executable
-chmod +x run.py
-# Clean up unused Windows and Docker files to save space
-rm -f install_and_run.bat Dockerfile docker-compose.yml
-    
+# NOTE: this launcher deliberately does not delete anything. It used to run
+# `rm -f install_and_run.bat Dockerfile docker-compose.yml` and `chmod +x
+# run.py`, which dirtied a fresh `git clone` on the very first run, broke
+# `git pull`, and destroyed the other platforms' launchers to save a few KB.
+
 # Run the universal Python launcher
 python3 run.py
 if [ $? -ne 0 ]; then

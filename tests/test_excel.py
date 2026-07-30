@@ -3,6 +3,7 @@ from pathlib import Path
 import openpyxl
 import pandas as pd
 
+from mediaorg import excel, scan
 from mediaorg.excel import append_changes, plan_renames, read_library, write_library
 from mediaorg.plan import NamingScheme
 from mediaorg.scan import scan_movies, scan_tv
@@ -180,3 +181,133 @@ def test_root_show_rows_use_selected_folder_name(tmp_path):
     assert names["The.Office.S01E01.720p.mkv"] == "The Office S01E01 [720p].mkv"
     # The selected root folder itself is never a rename target.
     assert all(o.src != root for o in plan.ops)
+
+
+# --- Routing / naming regressions -------------------------------------------
+
+import unicodedata
+
+
+def test_unclassifiable_files_are_not_renamed_to_s00e00(tmp_path):
+    """Extras and misplaced movies used to become 'Show S00E00.mkv'."""
+    show = tmp_path / "Show"
+    (show / "Extras").mkdir(parents=True)
+    (show / "Season 1").mkdir(parents=True)
+    (show / "Season 1" / "Show.S01E01.mkv").write_text("x")
+    (show / "Extras" / "Behind The Scenes.mkv").write_text("x")
+
+    rows = scan.scan_recursive_tv(tmp_path)
+    unclassified = [r for r in rows if r['Season'] == '']
+    assert unclassified, "expected the extra to be recorded as unclassified"
+
+    df_tv = pd.DataFrame(rows)
+    plan = excel.plan_renames(None, None, df_tv, tmp_path, NamingScheme())
+    touched = {str(o.src) for o in plan.ops}
+    assert not any("Behind The Scenes" in t for t in touched)
+
+
+def test_appledouble_does_not_block_the_real_rename(tmp_path):
+    """The sidecar collided with its episode and both got skipped."""
+    season = tmp_path / "Show" / "Season 1"
+    season.mkdir(parents=True)
+    (season / "Show.S01E01.1080p.mkv").write_text("real")
+    (season / "._Show.S01E01.1080p.mkv").write_text("junk")
+
+    rows = scan.scan_tv(tmp_path)
+    assert len(rows) == 1, rows
+    df_tv = pd.DataFrame(rows)
+    plan = excel.plan_renames(None, None, df_tv, tmp_path, NamingScheme())
+    assert any(o.dst.name == "Show S01E01 [1080p].mkv" for o in plan.ops)
+    assert plan.skipped == []
+
+
+def test_zero_padded_season_folder_gets_normalized(tmp_path):
+    show = tmp_path / "Show"
+    (show / "Season 01").mkdir(parents=True)
+    (show / "Season 01" / "Show.S01E01.mkv").write_text("x")
+
+    rows = scan.scan_tv(tmp_path)
+    df_tv = pd.DataFrame(rows)
+    scheme = NamingScheme()
+    scheme.tv_season_include_year = False
+    plan = excel.plan_renames(None, None, df_tv, tmp_path, scheme)
+    assert any(o.src.name == "Season 01" and o.dst.name == "Season 1"
+               for o in plan.ops), [str(o.dst) for o in plan.ops]
+
+
+def test_seasoning_show_is_not_a_season_folder(tmp_path):
+    """_SEASONISH_DIR was an unanchored substring search."""
+    show = tmp_path / "Seasoning Show"
+    show.mkdir()
+    (show / "Seasoning.Show.S01E01.mkv").write_text("x")
+    rows = scan.scan_tv(tmp_path)
+    assert [r['Show Folder'] for r in rows] == ["Seasoning Show"]
+    assert rows[0]['Season'] == 1
+
+
+def test_accented_titles_converge_after_one_pass(tmp_path):
+    """NFD from the filesystem vs NFC from the builders re-renamed forever."""
+    folder = tmp_path / unicodedata.normalize("NFD", "Amélie (2001) [1080p]")
+    folder.mkdir()
+    (folder / unicodedata.normalize("NFD", "Amélie (2001) [1080p].mkv")).write_text("x")
+
+    rows = scan.scan_movies(tmp_path)
+    df = pd.DataFrame(rows)
+    plan = excel.plan_renames(df, tmp_path, None, None, NamingScheme())
+    assert plan.ops == [], [f"{o.src} -> {o.dst}" for o in plan.ops]
+
+
+def test_spreadsheet_overrides_are_sanitized(tmp_path):
+    """'Folder Fixed' was taken verbatim, so a raw ':' reached the destination."""
+    folder = tmp_path / "Movie.2020"
+    folder.mkdir()
+    (folder / "Movie.2020.mkv").write_text("x")
+    rows = scan.scan_movies(tmp_path)
+    df = pd.DataFrame(rows)
+    df.loc[0, 'Folder Fixed'] = 'Movie: Part 2'
+    plan = excel.plan_renames(df, tmp_path, None, None, NamingScheme())
+    folder_ops = [o for o in plan.ops if o.src == folder]
+    assert folder_ops and ':' not in folder_ops[0].dst.name
+    assert folder_ops[0].dst.name == "Movie Part 2"
+
+
+def test_date_based_show_is_visible_to_the_structured_scan(tmp_path):
+    """These were dropped entirely, then resurfaced as S00E00."""
+    show = tmp_path / "The Daily Show"
+    (show / "Season 2024").mkdir(parents=True)
+    (show / "Season 2024" / "The.Daily.Show.2024.01.15.Guest.mkv").write_text("x")
+    rows = scan.scan_tv(tmp_path)
+    assert rows and rows[0]['Episode File'], rows
+    assert rows[0]['Season'] == 2024
+
+
+def test_specials_folder_is_scanned_as_season_zero(tmp_path):
+    show = tmp_path / "Show"
+    (show / "Specials").mkdir(parents=True)
+    (show / "Specials" / "Christmas Special.mkv").write_text("x")
+    rows = scan.scan_tv(tmp_path)
+    assert [r['Season'] for r in rows] == [0]
+
+
+def test_sheet_relative_paths_use_forward_slashes(tmp_path):
+    show = tmp_path / "Show"
+    (show / "Season 1").mkdir(parents=True)
+    (show / "Season 1" / "Show.S01E01.mkv").write_text("x")
+    rows = scan.scan_tv(tmp_path)
+    assert rows[0]['Episode File'] == "Season 1/Show.S01E01.mkv"
+    assert "\\" not in rows[0]['Episode File']
+
+
+def test_specials_are_not_given_an_invented_name(tmp_path):
+    """A file with no episode number would become 'Show S00.mkv' — and two of
+    them would collide and both be skipped."""
+    show = tmp_path / "Show"
+    (show / "Specials").mkdir(parents=True)
+    (show / "Specials" / "Christmas Special.mkv").write_text("x")
+    (show / "Specials" / "Behind The Scenes.mkv").write_text("x")
+
+    rows = scan.scan_tv(tmp_path)
+    assert len(rows) == 2 and all(r['Season'] == 0 for r in rows)
+    plan = excel.plan_renames(None, None, pd.DataFrame(rows), tmp_path,
+                              NamingScheme())
+    assert plan.ops == [] and plan.skipped == []

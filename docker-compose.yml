@@ -9,12 +9,15 @@ services:
     tty: true
     stdin_open: true
     volumes:
-      # Mount the current directory so configs and the excel sheet persist
+      # Mount the current directory so configs, the undo journal and the excel
+      # sheet persist
       - .:/app
       # ⚠️ IMPORTANT: Mount your actual media folders here!
       # We recommend mapping them to /media/Movies and /media/TV_Shows
-      - /mnt/nas-media/Movies:/media/Movies:ro
-      - /mnt/nas-media/TV Shows:/media/TV_Shows:ro
+      # These are READ-WRITE on purpose: organizing and renaming are the point
+      # of this service, and a :ro mount fails every single operation.
+      - /mnt/nas-media/Movies:/media/Movies
+      - /mnt/nas-media/TV Shows:/media/TV_Shows
     environment:
       - TZ=${TZ:-America/New_York}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
@@ -36,7 +39,6 @@ services:
       - TZ=${TZ:-America/New_York}
     command: ["python", "run.py", "--action", "scan", "--movies", "/media/Movies", "--tv", "/media/TV_Shows", "--output", "automated_scan.xlsx"]
 
-networks:
-  default:
-    name: pangolin
-    external: true
+# No custom network: scanning and renaming are local filesystem work. (This
+# file previously pinned an `external: true` network named "pangolin", which
+# made `docker compose run` fail outright unless you happened to have it.)
