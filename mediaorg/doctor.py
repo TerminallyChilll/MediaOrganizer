@@ -112,11 +112,17 @@ def check_configs() -> list[tuple[str, str, str]]:
     return results
 
 
+def _journal() -> Path:
+    """The journal, via the shared resolver (never cwd-relative)."""
+    from .execute import journal_path
+    return journal_path()
+
+
 def check_journal() -> tuple[str, str]:
     """Does the journal have torn (unfinished) runs?"""
-    jp = Path("mediaorg_journal.jsonl")
+    jp = _journal()
     if not jp.exists():
-        return _ok("No journal file — nothing to check")
+        return _ok(f"No journal file at {jp} — nothing to check")
     entries = []
     with open(jp, encoding="utf-8") as f:
         for line in f:
@@ -139,7 +145,42 @@ def check_journal() -> tuple[str, str]:
         return _warn(f"Journal has {depth} unfinished run(s) — may hide older undo-able runs")
     elif depth < 0:
         return _warn("Journal has unmatched end_run(s) — may be harmless")
-    return _ok("Journal runs are balanced (no torn runs)")
+    return _ok(f"Journal runs are balanced (no torn runs) — {jp}")
+
+
+def check_interrupted() -> tuple[str, str]:
+    """Are there mutations that started but never completed?
+
+    These are the crash scars intent-journaling exists to expose: a partial
+    cross-device copy, or a stranded ``.mediaorg_tmp`` from a case-only rename.
+    """
+    from .execute import recover
+    jp = _journal()
+    if not jp.exists():
+        return _ok("No journal file")
+    try:
+        notes = recover(jp, dry_run=True)
+    except OSError as e:
+        return _warn(f"Could not inspect the journal: {e}")
+    if not notes:
+        return _ok("No interrupted changes")
+    return _warn(f"{len(notes)} interrupted change(s):\n  "
+                 + "\n  ".join(notes))
+
+
+def fix_interrupted() -> tuple[str, str]:
+    """Clean up partial copies and stranded temp files."""
+    from .execute import recover
+    jp = _journal()
+    if not jp.exists():
+        return _ok("No journal file")
+    try:
+        notes = recover(jp)
+    except OSError as e:
+        return _err(f"Recovery failed: {e}")
+    if not notes:
+        return _ok("Nothing to recover")
+    return _ok(f"Recovered {len(notes)} interrupted change(s)")
 
 
 def check_stdout() -> tuple[str, str]:
@@ -210,7 +251,7 @@ def fix_corrupted_config(path: Path) -> tuple[str, str]:
 def fix_journal_torn() -> tuple[str, str]:
     """Close any open begin_run with a synthetic end_run so older runs are
     reachable via Undo."""
-    jp = Path("mediaorg_journal.jsonl")
+    jp = _journal()
     if not jp.exists():
         return _ok("No journal file")
     entries = []
@@ -318,7 +359,16 @@ def run_doctor(*, auto_fix: bool = False) -> int:
         if sf == "OK":
             fixed += 1
 
-    # 7. Unicode output
+    # 7. Interrupted changes (partial copies, stranded temp files)
+    s, msg = check_interrupted()
+    report(s, "Interrupted changes", msg)
+    if s == "WARN" and auto_fix:
+        sf, mf = fix_interrupted()
+        report(sf, "Interrupted changes (fix)", mf)
+        if sf == "OK":
+            fixed += 1
+
+    # 8. Unicode output
     s, msg = check_stdout()
     report(s, "Terminal Unicode", msg)
 

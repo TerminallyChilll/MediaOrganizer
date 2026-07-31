@@ -1,0 +1,64 @@
+name: CI
+
+# Trigger policy: `pull_request` covers PR branches, `push` covers only the
+# default branch. Listening to both events on every branch ran the whole
+# matrix TWICE for a single commit on a PR branch.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'LICENSE', '.gitignore']
+  pull_request:
+    paths-ignore: ['**.md', 'LICENSE', '.gitignore']
+  workflow_dispatch:
+    inputs:
+      full_matrix:
+        description: 'Run every supported Python version, not just the minimum'
+        type: boolean
+        default: true
+
+# A newer push supersedes an in-flight run for the same ref.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Routine runs: all three operating systems, minimum supported Python only.
+  # The OS axis is what earns its keep here — it caught 8 real bugs that were
+  # invisible on Linux (case-only renames, path separators, a hang on an
+  # unavailable drive root). The Python axis has never caught anything, so it
+  # runs on demand instead of on every push.
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.11']
+        # Widen to every supported Python only for a manual pre-release check:
+        #   gh workflow run ci.yml    (or the "Run workflow" button)
+        include: >-
+          ${{ (github.event_name == 'workflow_dispatch' && inputs.full_matrix)
+              && fromJSON('[{"os":"ubuntu-latest","python-version":"3.12"},
+                            {"os":"ubuntu-latest","python-version":"3.13"},
+                            {"os":"windows-latest","python-version":"3.12"},
+                            {"os":"windows-latest","python-version":"3.13"},
+                            {"os":"macos-latest","python-version":"3.12"},
+                            {"os":"macos-latest","python-version":"3.13"}]')
+              || fromJSON('[]') }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest -q

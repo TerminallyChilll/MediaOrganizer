@@ -17,10 +17,54 @@ VIDEO_EXTS = {'.mp4', '.mkv', '.avi', '.ts', '.m4v', '.wmv', '.mov', '.flv',
 COMPANION_EXTS = {'.srt', '.sub', '.idx', '.ass', '.ssa', '.nfo', '.jpg',
                   '.jpeg', '.png', '.txt', '.vtt'}
 
+# OS-generated metadata that carries no user data. These must never be treated
+# as media: macOS AppleDouble sidecars ("._Show.S01E01.mkv") otherwise pass
+# every video filter, collide with the real episode, and get BOTH skipped.
+# They also block rmdir, which is what breaks undo on any volume Finder or
+# Explorer has browsed.
+JUNK_NAMES = {'.ds_store', 'thumbs.db', 'desktop.ini', '.localized',
+              '.apdisk', '.spotlight-v100', '.trashes', '.fseventsd'}
+JUNK_PREFIXES = ('._',)
+JUNK_DIRS = {'@eadir', '.@__thumb', '.spotlight-v100', '.trashes',
+             '.fseventsd', '$recycle.bin', 'system volume information'}
+
+
+def is_junk_name(name: str) -> bool:
+    """Is this an OS metadata file rather than media?"""
+    lowered = name.lower()
+    return lowered in JUNK_NAMES or lowered.startswith(JUNK_PREFIXES)
+
+
+def is_junk_dir(name: str) -> bool:
+    """Is this an OS/NAS bookkeeping directory that should never be scanned?"""
+    return name.lower() in JUNK_DIRS
+
+
+def is_media_file(name: str, exts=None) -> bool:
+    """Does `name` look like a media file we should act on?
+
+    Single gate used by every scanner and planner so junk filtering can never
+    drift between them.
+    """
+    if is_junk_name(name):
+        return False
+    suffix = Path(name).suffix.lower()
+    return suffix in (VIDEO_EXTS if exts is None else exts)
+
 CUSTOM_PATTERNS_FILE = "custom_strip_patterns.json"
 
+# Suffix of the scratch file a case-only rename passes through. Defined here,
+# with the other file-classification constants, so both the executor (which
+# creates it) and extfix (which must never treat it as media) share one source
+# of truth — and so planners never have to import the executor.
+TMP_SUFFIX = ".mediaorg_tmp"
+
 # Only what guessit can't know: site prefixes, HTML entities, user patterns.
-_WEBSITE_PREFIX = re.compile(r'^\s*(?:www\.\S+|https?://\S+)\s*[-–—]?\s*', re.IGNORECASE)
+# A trailing delimiter is REQUIRED. The old pattern ended in `\S+` with an
+# optional dash, so with no whitespace in the name it swallowed the whole
+# thing: 'http://x.com/The.Matrix.1999.mkv' became ''.
+_WEBSITE_PREFIX = re.compile(
+    r'^\s*(?:www\.|https?://)[^\s/\\]+(?:/[^\s]*?)?\s*[-–—_]\s*', re.IGNORECASE)
 _HTML_ENTITY = re.compile(r'&#?\w+;')
 _EXT_RE = re.compile(r'\.(' + '|'.join(e.lstrip('.') for e in VIDEO_EXTS) + r')$', re.IGNORECASE)
 
@@ -36,6 +80,12 @@ class ParsedName:
     episode_title: str | None = None
     kind: str = "unknown"      # "movie" | "episode" | "unknown"
     source: str = "guessit"    # "guessit" | "llm" | "raw"
+    # guessit parses these and they used to be discarded, which guaranteed a
+    # collision between e.g. "Movie.1999.EXTENDED.mkv" and "Movie.1999.mkv":
+    # both built the same target name, so check_collisions skipped BOTH and
+    # neither ever got renamed.
+    edition: str | None = None
+    part: int | None = None
 
 
 def load_custom_patterns(folder: Path | str = ".") -> list[str]:
@@ -54,16 +104,29 @@ def save_custom_patterns(patterns: list[str], folder: Path | str = ".") -> None:
         json.dumps(patterns, indent=2), encoding="utf-8")
 
 
+def _strip_keeping_content(pattern, s: str, flags: int = 0) -> str:
+    """Apply a substitution, but never let it empty the name.
+
+    Belt and braces for over-greedy strip patterns (ours or a user's): a
+    pattern that consumes everything leaves nothing for guessit to parse, and
+    an empty title used to propagate all the way to a bare ".mkv" filename.
+    """
+    try:
+        out = (pattern.sub('', s) if hasattr(pattern, 'sub')
+               else re.sub(pattern, '', s, flags=flags))
+    except re.error:
+        return s
+    return out if out.strip() else s
+
+
 def pre_clean(name: str, custom_patterns: list[str] = ()) -> str:
     """Strip things guessit can't be expected to understand."""
-    s = _WEBSITE_PREFIX.sub('', name)
+    s = _strip_keeping_content(_WEBSITE_PREFIX, name)
     s = s.replace('&amp;', '&').replace('&quot;', '"').replace('&#039;', "'")
-    s = _HTML_ENTITY.sub('', s)
+    s = s.replace('&#8217;', "'").replace('&rsquo;', "'").replace('&apos;', "'")
+    s = _strip_keeping_content(_HTML_ENTITY, s)
     for pat in custom_patterns:
-        try:
-            s = re.sub(pat, '', s, flags=re.IGNORECASE)
-        except re.error:
-            continue
+        s = _strip_keeping_content(pat, s, re.IGNORECASE)
     return re.sub(r'\s{2,}', ' ', s).strip()
 
 
@@ -114,6 +177,20 @@ def parse_name(name: str, kind_hint: str | None = None,
             title = _strip_video_ext(cleaned).strip()
             source = "raw"
 
+    def _first(key):
+        val = g.get(key)
+        return val[0] if isinstance(val, list) and val else val
+
+    edition = _first('edition')
+    # Explicit None check: `part or cd` would discard a legitimate part 0.
+    part = _first('part')
+    if part is None:
+        part = _first('cd')
+    try:
+        part = int(part) if part is not None else None
+    except (TypeError, ValueError):
+        part = None
+
     return ParsedName(
         title=title,
         year=year,
@@ -124,4 +201,6 @@ def parse_name(name: str, kind_hint: str | None = None,
         episode_title=g.get('episode_title'),
         kind=g.get('type', 'unknown'),
         source=source,
+        edition=str(edition) if edition else None,
+        part=part,
     )

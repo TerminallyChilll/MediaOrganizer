@@ -12,14 +12,46 @@ from pathlib import Path
 
 import pandas as pd
 
-from .parse import COMPANION_EXTS, ParsedName, parse_name
-from .plan import (EPISODE_PATTERN, NamingScheme, Op, Plan,
-                   build_episode_file_name, build_movie_file_name,
+from .parse import (COMPANION_EXTS, VIDEO_EXTS, ParsedName, is_junk_name,
+                    parse_name)
+from .plan import (EPISODE_PATTERN, SEASON_FOLDER_PATTERN, NamingScheme, Op,
+                   Plan, build_episode_file_name, build_movie_file_name,
                    build_movie_folder_name, build_season_folder_name,
                    build_tv_show_folder_name, check_collisions,
-                   extract_season_episode)
+                   extract_season_episode, norm, sanitize)
 
 _SEASON_FOLDER_RE = re.compile(r'^Season\s+\d+$', re.IGNORECASE)
+
+
+def _differs(new: str, old: str) -> bool:
+    """Does `new` actually differ from `old`?
+
+    Unicode-normalising both sides is what makes renames converge: macOS hands
+    back NFD from the filesystem while our builders emit NFC, so a raw compare
+    flagged every accented title as needing a rename on every single run.
+    """
+    return norm(new) != norm(old)
+
+
+def _existing_season_dir(show_path: Path, season_num: int) -> str | None:
+    """The season folder on disk for this season, whatever it is called.
+
+    Looking for the literal "Season 1" meant a zero-padded "Season 01" could
+    never be normalised — organize skipped it and the renamer never found it.
+    """
+    target = f"Season {season_num}"
+    try:
+        names = sorted(e.name for e in os.scandir(show_path)
+                       if e.is_dir(follow_symlinks=False))
+    except OSError:
+        return None
+    if target in names:
+        return target
+    for name in names:
+        m = SEASON_FOLDER_PATTERN.match(name.strip())
+        if m and int(m.group(1)) == season_num:
+            return name
+    return None
 
 
 def _clean(val) -> str:
@@ -126,13 +158,16 @@ def _companion_ops(video_path: Path, old_base: str, new_base: str) -> list[Op]:
     except OSError:
         return ops
     for e in entries:
-        if not e.is_file(follow_symlinks=False):
+        if not e.is_file(follow_symlinks=False) or is_junk_name(e.name):
             continue
         p = Path(e.path)
         if p.suffix.lower() not in COMPANION_EXTS:
             continue
-        if p.stem.startswith(old_stem):
-            tail = p.stem[len(old_stem):]
+        # Normalise before the prefix test, or a subtitle stored NFD next to an
+        # NFC video is orphaned instead of being renamed alongside it.
+        normed_stem, normed_old = norm(p.stem), norm(old_stem)
+        if normed_stem.startswith(normed_old):
+            tail = normed_stem[len(normed_old):]
         elif code != (None, None) and extract_season_episode(p.name) == code:
             # Keep whatever follows the episode code (e.g. ".en" language tag).
             m = EPISODE_PATTERN.search(p.stem)
@@ -140,7 +175,7 @@ def _companion_ops(video_path: Path, old_base: str, new_base: str) -> list[Op]:
         else:
             continue
         new_name = new_stem + tail + p.suffix
-        if new_name != p.name:
+        if _differs(new_name, p.name):
             ops.append(Op("move", p, p.with_name(new_name)))
     return ops
 
@@ -222,14 +257,24 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
                     pf.quality = get_val(row, 'Quality Fixed', 'Quality')
                 pf.year = pf.year or p.year
                 pf.quality = pf.quality or p.quality
-                new_file = build_movie_file_name(pf, ext, _clean(row.get('Size (GB)')) if scheme.movie_file_include_size else None, scheme)
-                if new_file != vf:
+                new_file = build_movie_file_name(
+                    pf, ext,
+                    _clean(row.get('Size (GB)')) if scheme.movie_file_include_size else None,
+                    scheme)
+                # Guard against a stem-less name (".mkv"): sanitize now always
+                # returns a fallback, but the check keeps the invariant local.
+                if Path(new_file).stem and _differs(new_file, vf):
                     ops.extend(_companion_ops(folder_path / vf, vf, new_file))
                     ops.append(Op("move", folder_path / vf, folder_path / new_file))
 
-            new_folder = _clean(row.get('Folder Fixed')) or build_movie_folder_name(
-                p, _clean(row.get('Size (GB)')) if scheme.movie_folder_include_size else None, scheme)
-            if new_folder and new_folder != Path(old_folder).name:
+            folder_fixed = _clean(row.get('Folder Fixed'))
+            # Spreadsheet overrides were previously taken verbatim, so a user
+            # typing "Movie: Part 2" produced a destination with a raw colon.
+            new_folder = sanitize(folder_fixed) if folder_fixed else \
+                build_movie_folder_name(
+                    p, _clean(row.get('Size (GB)')) if scheme.movie_folder_include_size else None,
+                    scheme)
+            if new_folder and _differs(new_folder, Path(old_folder).name):
                 # Preserve the parent directory when Folder Name contains a
                 # nested path (e.g. "Collection/Movie.2020" from a recursive
                 # scan) so the rename stays in-place.
@@ -267,10 +312,16 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
                 p_show.year = _safe_int_year(s1_year)
 
             season_ops: list[Op] = []
-            for season_num, season_eps in show_eps.groupby('Season'):
+            for season_num, season_eps in show_eps.groupby('Season', dropna=False):
                 if _clean(season_num) == '':
+                    # No detectable season: an extra, a trailer, or a movie
+                    # filed under TV. Leave it alone rather than inventing a
+                    # name for it.
                     continue
-                season_num = int(float(season_num))
+                try:
+                    season_num = int(float(season_num))
+                except (TypeError, ValueError):
+                    continue
                 season_year = _clean(season_eps.iloc[0].get('Season Year'))
 
                 for _, episode in season_eps.iterrows():
@@ -290,33 +341,51 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
                     pe.season = s if s is not None else season_num
                     if not pe.episodes and e is not None:
                         pe.episodes = [e]
+                    if not pe.episodes and pe.date is None:
+                        # No episode number and no air date (a special, an
+                        # extra). Naming it "Show S00" would be invented, and
+                        # two such files would collide and both be skipped —
+                        # leave it as the user has it.
+                        continue
                     if get_val(episode, 'Quality Fixed', ''):
                         pe.quality = get_val(episode, 'Quality Fixed', '')
                     pe.year = _safe_int_year(season_year) if season_year else pe.year
 
-                    new_base = _clean(episode.get('File Fixed')) or build_episode_file_name(
-                        pe, ext,
-                        _clean(episode.get('Size (GB)')) if scheme.tv_episode_include_size else None,
-                        scheme)
+                    file_fixed = _clean(episode.get('File Fixed'))
+                    if file_fixed:
+                        # Route the override through sanitize too. Only strip a
+                        # RECOGNISED media extension: Path.suffix on
+                        # "Show S01E01 - Mr. Robot" is ". Robot", so a blanket
+                        # strip truncated dotted titles to "Show S01E01 - Mr".
+                        suffix = Path(file_fixed).suffix.lower()
+                        known_ext = suffix in VIDEO_EXTS or suffix in COMPANION_EXTS
+                        stem = Path(file_fixed).stem if known_ext else file_fixed
+                        new_base = sanitize(stem)
+                    else:
+                        new_base = build_episode_file_name(
+                            pe, ext,
+                            _clean(episode.get('Size (GB)')) if scheme.tv_episode_include_size else None,
+                            scheme)
                     if not new_base.lower().endswith(ext.lower()):
                         new_base += ext
-                    if new_base != base:
+                    if Path(new_base).stem and _differs(new_base, base):
                         ops.extend(_companion_ops(old_path, base, new_base))
                         ops.append(Op("move", old_path, old_path.parent / new_base))
 
                 if not show_is_season:
-                    old_season = f"Season {season_num}"
+                    old_season = _existing_season_dir(show_path, season_num)
                     new_season = build_season_folder_name(season_num, season_year, scheme)
-                    if new_season != old_season and (show_path / old_season).is_dir():
+                    if old_season and _differs(new_season, old_season):
                         season_ops.append(Op("move", show_path / old_season,
                                              show_path / new_season))
 
             ops.extend(season_ops)
 
             if not show_is_season and not show_is_root:
-                new_show = _clean(first.get('Folder Fixed')) or \
+                show_fixed = _clean(first.get('Folder Fixed'))
+                new_show = sanitize(show_fixed) if show_fixed else \
                     build_tv_show_folder_name(p_show, scheme)
-                if new_show and new_show != Path(show_folder).name:
+                if new_show and _differs(new_show, Path(show_folder).name):
                     # Preserve parent dir for nested show folders from
                     # recursive TV scans (e.g. "Parent/ShowName").
                     show_parent = Path(show_folder).parent

@@ -2,6 +2,10 @@
 chcp 65001 >nul
 title Unified Media Organizer
 
+:: Work from the folder this script lives in. Double-clicking (or launching via
+:: a shortcut) otherwise leaves the working directory somewhere unrelated.
+cd /d "%~dp0"
+
 echo ========================================
 echo Media Organizer (Windows Launcher)
 echo ========================================
@@ -23,10 +27,9 @@ if %ERRORLEVEL% NEQ 0 (
     pause
     exit /b 1
 )
-:: Clean up unused Mac/Linux and Docker files to save space
-if exist install_and_run.sh del install_and_run.sh
-if exist Dockerfile del Dockerfile
-if exist docker-compose.yml del docker-compose.yml
+:: NOTE: this launcher deliberately does not delete anything. It used to delete
+:: install_and_run.sh, Dockerfile and docker-compose.yml, which dirtied a fresh
+:: `git clone` on the very first run and broke `git pull`.
 
 :: Run the universal Python launcher
 python run.py

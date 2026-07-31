@@ -13,15 +13,21 @@ LLM_CONFIG_FILE = ".media_llm_config.json"
 def load_llm_config():
     if os.path.exists(LLM_CONFIG_FILE):
         try:
-            with open(LLM_CONFIG_FILE, 'r') as f:
+            with open(LLM_CONFIG_FILE, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception as e:
             print(f"   [!] Could not load LLM config: {e}")
     return {}
 
 def save_llm_config(config):
+    # This file holds cloud API keys. Create it 0600 rather than writing it at
+    # the default umask and chmod-ing after: that leaves a window where the key
+    # is world-readable, and the chmod could race a change of directory. The
+    # mode argument is ignored on Windows, where the file inherits directory ACLs.
     try:
-        with open(LLM_CONFIG_FILE, 'w') as f:
+        path = os.path.abspath(LLM_CONFIG_FILE)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2)
     except Exception as e:
         print(f"   [!] Could not save LLM config: {e}")
