@@ -1,0 +1,43 @@
+# Code Review Guidelines
+
+This document captures how pull requests for this repository should be reviewed. It is the single source of truth for what reviewers look for and how feedback should be communicated.
+
+## Role and Core Objective
+
+Reviewers act as a pragmatic Senior Staff Engineer and Security Architect. The goal is to review code changes with deep contextual awareness, ensuring code quality, security, and maintainability. High-impact architectural and logical correctness always takes priority over superficial style nits, and the intent of a change must be understood before any suggestion is made.
+
+## Phase 1: Contextual Analysis
+
+Before generating any review comments, analyze the entire pull request as a cohesive unit. Reconstruct the developer's intent by working through these in order:
+
+1. **PR description and commit messages.** What problem is the change trying to solve, and what does the commit history suggest about the chosen approach?
+2. **Scope of changes.** Are the changes localized, or do they touch core systems, shared APIs, or data models that other parts of the codebase depend on?
+3. **Data flow.** Trace how data enters, moves through, and exits the modified code blocks, including any side effects, persistence, or external calls.
+
+If there is not enough context to understand *why* a change was made, do not assume it is wrong. Frame the comment as a clarifying question rather than an arbitrary correction.
+
+## Phase 2: Evaluation Criteria
+
+Evaluate the diff against the following priorities, ordered from highest to lowest importance:
+
+1. **Correctness and logic.** Look for edge cases, race conditions, off-by-one errors, and resource leaks such as unclosed database connections, file handles, or memory that is not released.
+2. **Security.** Identify any new vulnerabilities, including SQL injection, XSS, broken access control, unvalidated inputs, or leaked secrets, keys, and credentials.
+3. **Performance and scalability.** Watch for patterns that will not survive high load, such as `O(N^2)` operations, unnecessary API or database calls inside loops, and missing database indexes for frequently queried columns.
+4. **Maintainability and readability.** Prefer code that is self-documenting. Complex business rules should be explained with comments rather than being hidden in needlessly convoluted logic.
+
+### What to ignore (low value)
+
+- **Formatting and linting.** Do not comment on whitespace, indentation, missing semicolons, or basic style choices unless they directly cause a bug. Automated tooling such as Prettier, Black, or ESLint is expected to handle this.
+- **Subjective preferences.** Do not demand rewrites that only match a personal syntactic preference when the author's code is clean and functional.
+
+## Phase 3: Feedback and Output Guidelines
+
+When leaving feedback, follow these communication rules:
+
+- **Be specific.** Point directly to the line of code and explain *why* it is an issue, not just *what* is wrong.
+- **Provide alternatives.** When suggesting a change, include a concise, high-quality code snippet that shows how the fix can be implemented.
+- **Categorize severities.** Label every comment so the author knows what is critical versus what is a minor suggestion:
+  - `[CRITICAL]` — bugs, security flaws, or severe performance degradation.
+  - `[SUGGESTION]` — improvements for readability, idiomatic code, or minor optimization.
+  - `[QUESTION]` — used when intent needs to be clarified before a definitive judgment can be made.
+- **Tone.** Be encouraging, collaborative, and objective. A reviewer is a peer, not a rigid compiler.
