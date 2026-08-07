@@ -13,7 +13,8 @@ from tqdm import tqdm
 
 from .parse import (VIDEO_EXTS, is_junk_dir, is_junk_name, is_media_file,
                     parse_name)
-from .plan import extract_season_episode
+from .plan import (SPECIALS_FOLDER_PATTERN, extract_season_episode,
+                   find_show_roots)
 
 # Anchored. The old unanchored substring search matched "Seasoning Show",
 # "S1" and "s0", and since this pattern also drives show-folder re-parenting a
@@ -23,9 +24,9 @@ _SEASONISH_DIR = re.compile(
     r'^(?:season|series|saison|staffel)\s*\d{1,4}(?:\s*\(\d{4}\))?$'
     r'|^s\d{1,4}(?:\s*\(\d{4}\))?$', re.IGNORECASE)
 # Specials live outside the numbered seasons but are still episodes; without
-# this they were dropped from the scan entirely.
-_SPECIALS_DIR = re.compile(r'^(?:specials?|extras?|featurettes?|bonus)$',
-                           re.IGNORECASE)
+# this they were dropped from the scan entirely. Shared with the organizer's
+# show detection so the two can never disagree about what marks a show.
+_SPECIALS_DIR = SPECIALS_FOLDER_PATTERN
 
 
 def _is_seasonish(name: str) -> bool:
@@ -156,12 +157,24 @@ def scan_tv(tv_root: Path, custom_patterns: list[str] = ()) -> list[dict]:
     tv_root = Path(tv_root)
     if not tv_root.is_dir():
         return []
-    folders = sorted(e.name for e in os.scandir(tv_root)
-                     if e.is_dir(follow_symlinks=False) and not is_junk_dir(e.name))
+
+    # Find shows however deeply they are nested, using the same rule the
+    # organizer uses. Scanning only the top level meant a "Genre/Show"
+    # library recorded the *genre* as the show — wrong title, and the
+    # episodes underneath were invisible.
+    show_roots = find_show_roots(tv_root)
+    covered_top: set[str] = set()
+    for show_path in show_roots:
+        if show_path == tv_root:
+            covered_top.add('.')
+        else:
+            covered_top.add(show_path.relative_to(tv_root).parts[0])
+
     rows = []
-    for folder_name in tqdm(folders, desc="Scanning TV Shows", unit="show"):
-        show_path = tv_root / folder_name
-        p = parse_name(folder_name, custom_patterns=custom_patterns)
+    for show_path in tqdm(show_roots, desc="Scanning TV Shows", unit="show"):
+        folder_name = '.' if show_path == tv_root else _rel(show_path, tv_root)
+        # Parse the show's own directory name, never the path leading to it.
+        p = parse_name(show_path.name, custom_patterns=custom_patterns)
         episodes = _scan_show_episodes(show_path, custom_patterns)
         if not episodes:
             rows.append({
@@ -185,6 +198,30 @@ def scan_tv(tv_root: Path, custom_patterns: list[str] = ()) -> list[dict]:
                 'Episode File': ep['rel_path'], 'File Fixed': '',
                 'Quality': pf.quality or '', 'Quality Fixed': '',
                 'Size (GB)': ep['size'],
+            })
+
+    # Top-level folders the show search found nothing in still get a
+    # placeholder row: that is what tells run_scan to fall back to a full
+    # recursive walk for them, and what makes them visible in the sheet
+    # instead of silently absent.
+    if tv_root not in show_roots:
+        try:
+            top_level = sorted(e.name for e in os.scandir(tv_root)
+                               if e.is_dir(follow_symlinks=False)
+                               and not is_junk_dir(e.name))
+        except OSError:
+            top_level = []
+        for name in top_level:
+            if name in covered_top:
+                continue
+            p = parse_name(name, custom_patterns=custom_patterns)
+            rows.append({
+                'Show Folder': name, 'Folder Fixed': '',
+                'Title': p.title, 'Title Fixed': '',
+                'Season': '', 'Season Year': '', 'Episode': '',
+                'Episode File': '', 'File Fixed': '',
+                'Quality': '', 'Quality Fixed': '',
+                'Size (GB)': folder_size_gb(tv_root / name),
             })
     return rows
 

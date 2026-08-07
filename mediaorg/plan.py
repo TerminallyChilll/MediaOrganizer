@@ -125,6 +125,13 @@ SEASON_FOLDER_PATTERN = re.compile(r'^(?:season\s*|s)(\d{1,4})(?:\s*\(\d{4}\))?$
 _CANONICAL_SEASON = re.compile(r'^Season (0|[1-9]\d{0,3})( \(\d{4}\))?$')
 # Abbreviated "ShowTitle S02" form only — no dashes/pipes/dots, optional year.
 SEASON_LIKE_PATTERN = re.compile(r'^([^\-\|.]+?)\s+[Ss](\d{1,4})(?:\s*\(?\d{4}\)?)?\s*$')
+# Specials live outside the numbered seasons but still mark their parent as a
+# show: a show whose only content is a "Specials" folder is still a show, and
+# without this the show search walks straight past it. Defined here, with the
+# other name-classification patterns, so the scanner and the organizer cannot
+# disagree about what counts as a show.
+SPECIALS_FOLDER_PATTERN = re.compile(
+    r'^(?:specials?|extras?|featurettes?|bonus)$', re.IGNORECASE)
 
 _SXXEYY = re.compile(_SE_CORE)
 _NXN = re.compile(r'(?<!\d)(\d{1,2})[xX](\d{1,2})(?!\d)')
@@ -137,13 +144,36 @@ def extract_season_episode(name: str) -> tuple[int | None, int | None]:
     return None, None
 
 
-def folder_has_episodes_or_seasons(path: Path) -> bool:
-    """Is this folder a TV-show root (contains episodes/seasons)?
+def _is_show_marker_dir(name: str) -> bool:
+    """Does a subdirectory with this name mark its parent as a show folder?
 
     Folder names only count with a strict SxxEyy marker — bare NxN like
     "9x9" appears in junk names ("WATCH - Show 9x9 - FREE") and must not
     classify. NxN still counts for files and inside season folders.
     """
+    return bool(_SXXEYY.search(name)
+                or SEASON_FOLDER_PATTERN.match(name.strip())
+                or SPECIALS_FOLDER_PATTERN.match(name.strip())
+                or SEASON_LIKE_PATTERN.match(name))
+
+
+def has_season_structure(path: Path) -> bool:
+    """Does this folder hold season/specials/episode *subfolders*?
+
+    The distinction from :func:`folder_has_episodes_or_seasons` matters when
+    deciding how deep a show lives: a folder with real season folders is a
+    show, whereas one holding only loose episode files might instead be a dump
+    folder sitting inside the show.
+    """
+    try:
+        return any(e.is_dir(follow_symlinks=False) and _is_show_marker_dir(e.name)
+                   for e in os.scandir(path))
+    except OSError:
+        return False
+
+
+def folder_has_episodes_or_seasons(path: Path) -> bool:
+    """Is this folder a TV-show root (contains episodes/seasons)?"""
     try:
         items = list(os.scandir(path))
     except OSError:
@@ -151,14 +181,67 @@ def folder_has_episodes_or_seasons(path: Path) -> bool:
     for entry in items:
         name = entry.name
         if entry.is_dir(follow_symlinks=False):
-            if (_SXXEYY.search(name)
-                    or SEASON_FOLDER_PATTERN.match(name.strip())
-                    or SEASON_LIKE_PATTERN.match(name)):
+            if _is_show_marker_dir(name):
                 return True
         elif entry.is_file(follow_symlinks=False):
             if is_media_file(name) and EPISODE_PATTERN.search(name):
                 return True
     return False
+
+
+# How far below the library root the show search will descend. Wrapper
+# layouts in the wild go about as deep as "Genre/SubGenre/Show"; four levels
+# covers those without walking an entire NAS looking for TV that isn't there.
+SHOW_SEARCH_MAX_DEPTH = 4
+
+
+def find_show_roots(library_root: Path,
+                    max_depth: int = SHOW_SEARCH_MAX_DEPTH) -> list[Path]:
+    """Every show folder under `library_root`, however deeply it is nested.
+
+    A show root is the *shallowest* directory that directly contains season
+    folders or SxxEyy episode files. The search stops descending as soon as it
+    finds one, so a "Season 1" folder — which also looks episode-bearing — can
+    never be mistaken for a show of its own.
+
+    This replaces a hard-coded two-level descent that silently did nothing for
+    anything deeper (``Genre/SubGenre/Show/Season 1``) and that left the
+    scanner and the organizer disagreeing about where the shows were.
+    """
+    library_root = Path(library_root)
+    if folder_has_episodes_or_seasons(library_root):
+        return [library_root]
+
+    found: list[Path] = []
+
+    def descend(directory: Path, depth: int) -> None:
+        if depth > max_depth:
+            return
+        try:
+            children = sorted(
+                (Path(e.path) for e in os.scandir(directory)
+                 if e.is_dir(follow_symlinks=False) and not is_junk_dir(e.name)),
+                key=lambda p: p.name)
+        except OSError:
+            return
+        for child in children:
+            if not folder_has_episodes_or_seasons(child):
+                descend(child, depth + 1)
+                continue
+            # A folder qualifying only because it holds loose episode files is
+            # the show itself when it sits at the top of the library, but two
+            # levels down it is far more likely a dump folder *inside* the
+            # show ("Show/Downloads/Show.S01E01.mkv"). Credit the parent, and
+            # let plan_season_structure lift the episodes up into it —
+            # otherwise the dump folder's name becomes the show's title.
+            if depth > 1 and not has_season_structure(child):
+                if directory not in found:
+                    found.append(directory)
+            else:
+                found.append(child)
+
+    descend(library_root, 1)
+    return found
 
 
 def companion_files(video: Path) -> list[Path]:
@@ -232,6 +315,55 @@ def check_collisions(ops: list[Op]) -> Plan:
 
 # --- TV season structure planner --------------------------------------------
 
+def _lift_media(source_dir: Path, dest_for, *, include_root: bool) -> list[Op]:
+    """Move media files nested below `source_dir` to where `dest_for` says.
+
+    ``dest_for(filename)`` returns the directory a file belongs in, or None to
+    leave it alone — so a dump folder holding two seasons routes each file to
+    its own season folder in a single pass.
+
+    Walked bottom-up, so a directory is only removed after the files inside it
+    have been planned out of it, and an emptied child counts as gone when its
+    parent is considered. `include_root` also empties (and removes)
+    `source_dir` itself rather than only what is nested below it.
+
+    A directory is only rmdir'd when nothing will be left in it: ``rmdir`` is
+    empty-only, so emitting one for a directory that still holds, say, a stray
+    .exe would just produce a failed op and a confusing report. OS junk
+    (.DS_Store, Thumbs.db) does not count as a leftover — the executor
+    quarantines that on its own.
+    """
+    ops: list[Op] = []
+    media_exts = VIDEO_EXTS | COMPANION_EXTS
+    emptied: set[Path] = set()
+    try:
+        walked = list(os.walk(source_dir, topdown=False))
+    except OSError:
+        return ops
+
+    for dirpath, dirnames, filenames in walked:
+        current = Path(dirpath)
+        if is_junk_dir(current.name):
+            continue
+        if current == source_dir and not include_root:
+            continue
+
+        staying = []
+        for name in sorted(filenames):
+            dest = dest_for(name) if is_media_file(name, media_exts) else None
+            if dest is not None and dest != current:
+                ops.append(Op("move", current / name, dest / name))
+            elif not is_junk_name(name):
+                staying.append(name)
+
+        leftover_dirs = [d for d in dirnames
+                         if not is_junk_dir(d) and current / d not in emptied]
+        if not staying and not leftover_dirs:
+            ops.append(Op("rmdir", None, current))
+            emptied.add(current)
+    return ops
+
+
 def plan_season_structure(show_path: Path) -> Plan:
     """Plan grouping loose SxxEyy items into Season N folders, flattening
     episode subfolders, normalizing season folder names, and merging
@@ -294,8 +426,6 @@ def plan_season_structure(show_path: Path) -> Plan:
                 return name
         return existing[0] if existing else target
 
-    media_exts = VIDEO_EXTS | COMPANION_EXTS
-
     # 1. Merge duplicate season folders into the canonical one FIRST — so
     #    that the flatten step below sees the merged content.
     for snum, names in sorted(season_dirs.items()):
@@ -313,38 +443,59 @@ def plan_season_structure(show_path: Path) -> Plan:
                               show_path / canon / child))
             ops.append(Op("rmdir", None, extra_path))
 
-    # 2. Flatten episode-named subfolders inside season folders; rmdir after.
+    # 2. Flatten everything nested inside season folders, at any depth. A
+    #    season folder should hold episodes, not a directory tree: per-episode
+    #    folders, "Disc 1", and a "Subs" folder inside one of those all get
+    #    lifted out. Previously only episode-named folders exactly one level
+    #    down were flattened, so "Season 1/Disc 1/ep.mkv" stayed buried.
     for snum, names in sorted(season_dirs.items()):
         for season_name in names:
             season_path = show_path / season_name
-            try:
-                subdirs = sorted(e.name for e in os.scandir(season_path)
-                                 if e.is_dir(follow_symlinks=False)
-                                 and not is_junk_dir(e.name))
-            except OSError:
-                continue
-            for ep_dir in subdirs:
-                if not EPISODE_PATTERN.search(ep_dir):
-                    continue
-                ep_path = season_path / ep_dir
-                try:
-                    ep_files = sorted(e.name for e in os.scandir(ep_path)
-                                      if e.is_file(follow_symlinks=False))
-                except OSError:
-                    continue
-                moved_any = False
-                for mf in ep_files:
-                    if is_media_file(mf, media_exts):
-                        ops.append(Op("move", ep_path / mf, season_path / mf))
-                        moved_any = True
-                if moved_any:
-                    ops.append(Op("rmdir", None, ep_path))
+            ops.extend(_lift_media(season_path, lambda _n, t=season_path: t,
+                                   include_root=False))
 
-    # 3. Move loose episode folders into the season folder (existing name).
+    # 3. Deal with loose episode folders. When one actually holds the episode,
+    #    put the FILES into the season folder rather than nesting the folder
+    #    inside it — otherwise the episode ends up at
+    #    "Season 1/Show.S01E01.1080p/Show.S01E01.1080p.mkv", which step 2
+    #    cannot fix because it planned against the pre-move layout.
+    #    A folder with nothing recognisable inside is moved wholesale instead,
+    #    so we never discard something we did not understand.
     for snum, ep_folders in sorted(loose_ep_folders.items()):
         target = show_path / canonical(snum)
         for ep_folder in sorted(ep_folders):
-            ops.append(Op("move", show_path / ep_folder, target / ep_folder))
+            ep_path = show_path / ep_folder
+            lifted = _lift_media(ep_path, lambda _n, t=target: t,
+                                 include_root=True)
+            if any(o.kind == "move" for o in lifted):
+                ops.extend(lifted)
+            else:
+                ops.append(Op("move", ep_path, target / ep_folder))
+
+    # 3b. Any other subfolder that turns out to hold episodes — a "Downloads"
+    #     dump, a "Complete Series" wrapper, a disc rip — gets its episodes
+    #     routed into the right season folder, per file, since one folder can
+    #     hold several seasons. Nothing else sees these: they are not inside a
+    #     season folder (so step 2 misses them) and their name carries no
+    #     SxxEyy (so step 3 misses them). Files with no episode code are left
+    #     exactly where they are rather than guessed at.
+    handled = {name for names in season_dirs.values() for name in names}
+    handled |= {name for names in loose_ep_folders.values() for name in names}
+
+    def route_by_season(filename: str):
+        snum, _ep = extract_season_episode(filename)
+        return None if snum is None else show_path / canonical(snum)
+
+    for folder in folders:
+        if folder in handled or SPECIALS_FOLDER_PATTERN.match(folder.strip()):
+            continue
+        lifted = _lift_media(show_path / folder, route_by_season,
+                             include_root=True)
+        # Only act when there is an episode to lift. Otherwise this is a
+        # folder we have no business touching, and the trailing rmdirs would
+        # be us tidying away empty directories nobody asked us to remove.
+        if any(o.kind == "move" for o in lifted):
+            ops.extend(lifted)
 
     # 4. Move loose episode files (videos + same-code companions) into the
     #    season folder.

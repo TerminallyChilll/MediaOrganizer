@@ -337,3 +337,61 @@ def test_file_fixed_still_strips_a_real_media_extension(tmp_path):
     df_tv.loc[0, 'File Fixed'] = 'Renamed Episode.mkv'
     plan = excel.plan_renames(None, None, df_tv, tmp_path, NamingScheme())
     assert [o.dst.name for o in plan.ops] == ['Renamed Episode.mkv']
+
+
+# --- Nested show layouts -----------------------------------------------------
+
+def test_scan_tv_finds_a_show_behind_a_wrapper_folder(tmp_path):
+    """Scanning only the top level recorded the *genre* as the show, with no
+    episodes and the genre's name as the title."""
+    tv = tmp_path / "TV"
+    (tv / "Genre" / "Show" / "Season 1").mkdir(parents=True)
+    (tv / "Genre" / "Show" / "Season 1" / "Show.S01E01.mkv").write_text("x")
+
+    rows = scan_tv(tv)
+    assert len(rows) == 1
+    assert rows[0]["Show Folder"] == "Genre/Show"
+    assert rows[0]["Title"] == "Show"
+    assert rows[0]["Season"] == 1
+    assert rows[0]["Episode File"] == "Season 1/Show.S01E01.mkv"
+
+
+def test_nested_show_title_comes_from_the_show_not_the_path(tmp_path):
+    """plan_renames parsed the whole relative path, so the wrapper folders
+    leading to a show could end up supplying its title."""
+    tv = tmp_path / "TV"
+    season = tv / "Genre" / "Sub" / "Show" / "Season 1"
+    season.mkdir(parents=True)
+    (season / "Show.S01E01.1080p.mkv").write_text("x")
+
+    rows = scan_tv(tv)
+    plan = plan_renames(None, None, pd.DataFrame(rows), str(tv), NamingScheme())
+    dsts = [op.dst.name for op in plan.ops]
+    assert "Show S01E01 [1080p].mkv" in dsts
+
+
+def test_nested_show_rename_stays_in_place(tmp_path):
+    """A renamed nested show must keep its parent directories."""
+    tv = tmp_path / "TV"
+    season = tv / "Genre" / "Show.Name.2019" / "Season 1"
+    season.mkdir(parents=True)
+    (season / "Show.Name.S01E01.mkv").write_text("x")
+
+    rows = scan_tv(tv)
+    plan = plan_renames(None, None, pd.DataFrame(rows), str(tv), NamingScheme())
+    show_ops = [op for op in plan.ops if op.src == tv / "Genre" / "Show.Name.2019"]
+    assert len(show_ops) == 1
+    assert show_ops[0].dst.parent == tv / "Genre"
+
+
+def test_scan_tv_still_reports_folders_with_no_episodes(tmp_path):
+    """Placeholder rows are what trigger the recursive fallback in run_scan."""
+    tv = tmp_path / "TV"
+    (tv / "Empty Show").mkdir(parents=True)
+    (tv / "Real Show" / "Season 1").mkdir(parents=True)
+    (tv / "Real Show" / "Season 1" / "Real.S01E01.mkv").write_text("x")
+
+    rows = scan_tv(tv)
+    by_folder = {r["Show Folder"]: r for r in rows}
+    assert by_folder["Empty Show"]["Episode File"] == ""
+    assert by_folder["Real Show"]["Episode File"] == "Season 1/Real.S01E01.mkv"

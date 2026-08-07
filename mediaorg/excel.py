@@ -290,14 +290,20 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
         for show_folder, show_eps in df_tv.groupby('Show Folder'):
             show_folder = str(show_folder)
             first = show_eps.iloc[0]
+            # A nested show is recorded as a relative path ("Genre/Show"), so
+            # every name-level decision below has to look at the last
+            # component. Matching against the whole path meant a nested show
+            # was never recognised as a season-only scan, and its title was
+            # parsed out of the wrapper directories leading to it.
+            show_name = Path(show_folder).name
             # Scanner run on a single show root: "show folders" are seasons.
-            show_is_season = bool(_SEASON_FOLDER_RE.match(show_folder))
+            show_is_season = bool(_SEASON_FOLDER_RE.match(show_name))
             # Recursive scans record root-level episodes as '.': the show is
             # the selected tv_path itself.
             show_is_root = show_folder == '.'
             show_path = tv_path if show_is_root else tv_path / show_folder
 
-            p_show = parse_name(Path(tv_path).name if show_is_root else show_folder,
+            p_show = parse_name(Path(tv_path).name if show_is_root else show_name,
                                 custom_patterns=custom_patterns)
             if show_folder in llm_results:
                 p_show = _parsed_from_llm(llm_results[show_folder], p_show)
