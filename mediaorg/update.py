@@ -55,6 +55,11 @@ VALID_STATES = frozenset({CURRENT, BEHIND, AHEAD, DIVERGED, UNKNOWN})
 # age that looks fresh — silently retiring the update check for good.
 MAX_TIMESTAMP = 1e15
 
+#: Most commit subjects kept in a status, live or cached.
+MAX_COMMITS = 20
+#: Most lines of git output echoed in one go.
+MAX_OUTPUT_LINES = 200
+
 
 def app_dir() -> Path:
     """The directory holding run.py — the clone we update."""
@@ -143,7 +148,10 @@ class UpdateStatus:
             elif expected.startswith('list'):
                 ok = isinstance(value, list) and all(isinstance(v, str) for v in value)
                 if ok:
-                    value = [_printable(v) for v in value]
+                    # Bounded like the live path: describe() prints every
+                    # entry, and a cache file with 100k of them is the same
+                    # "anything can write this" threat these checks exist for.
+                    value = [_printable(v) for v in value[:MAX_COMMITS]]
             else:
                 # An annotation nobody taught this loop about. Refusing the
                 # file is the safe direction; trusting it is not.
@@ -175,6 +183,22 @@ def _printable(text: str, limit: int = 200) -> str:
     # truncation marker that raises UnicodeEncodeError would take down the very
     # report that was defending against a hostile subject.
     return cleaned if len(cleaned) <= limit else cleaned[:limit - 3] + '...'
+
+
+def _printable_block(text: str, limit: int = 200,
+                     max_lines: int = MAX_OUTPUT_LINES) -> str:
+    """Sanitise multi-line output without flattening or unbounding it.
+
+    Per line, because :func:`_printable` maps every control character to a
+    space and that includes the newlines holding git's diffstat together —
+    and capped, because sanitising line by line otherwise removes the only
+    bound on how much a pull (or a remote's stderr) can print.
+    """
+    lines = text.splitlines()
+    shown = [_printable(line, limit=limit) for line in lines[:max_lines]]
+    if len(lines) > max_lines:
+        shown.append(f"    ... and {len(lines) - max_lines} more lines")
+    return "\n".join(shown)
 
 
 # ── git plumbing ─────────────────────────────────────────────────────────
@@ -352,7 +376,7 @@ def local_commits_behind(upstream: str) -> tuple[int, int] | None:
         return None
 
 
-def incoming_commits(upstream: str, limit: int = 20) -> list[str]:
+def incoming_commits(upstream: str, limit: int = MAX_COMMITS) -> list[str]:
     """Subjects of the commits we do not have yet, newest first."""
     rc, out, _ = _git("log", f"--max-count={limit}", "--pretty=format:%h %s",
                       f"HEAD..{upstream}")
@@ -548,12 +572,17 @@ def check_and_cache(*, fetch: bool = True) -> UpdateStatus:
 
     Used by the explicit commands (``--check-update``, the doctor) so that
     asking once means the next launch can answer without the network.
+
+    Bumping the generation retires any background check already running: it
+    started earlier, so its answer is older, and letting it publish over this
+    one is the same race the generation counter exists to settle.
     """
+    global _generation, _status
     st = check(fetch=fetch)
     if st.state != UNKNOWN:
         save_cache(st)
         with _lock:
-            global _status
+            _generation += 1
             _status = st
     return st
 
@@ -576,6 +605,7 @@ def begin_background_check(*, force: bool = False) -> None:
             return                      # one check in flight is enough
         if _started and not force:
             return
+        previous_thread, previous_published = _thread, _published
         _started = True
         _generation += 1
         generation = _generation
@@ -583,10 +613,27 @@ def begin_background_check(*, force: bool = False) -> None:
         thread = threading.Thread(target=_refresh, args=(force, generation, published),
                                   name="mediaorg-update-check", daemon=True)
         _thread = thread
+        # Drop handles for checks that have already finished: without this a
+        # forced re-check leaks a Thread object per call for the life of the
+        # process, and join_background walks every one of them.
+        _threads[:] = [t for t in _threads if t.is_alive()]
         _threads.append(thread)
     # Started outside the lock: a thread that finishes instantly would
     # otherwise block on a lock its own starter is still holding.
-    thread.start()
+    try:
+        thread.start()
+    except RuntimeError:
+        # Out of threads. Roll back rather than leave the module wedged: a
+        # dead _thread passes the alive check, _started blocks the retry, and
+        # an Event nobody will ever set makes every wait_for_cache pay its
+        # full timeout for an answer that is not coming.
+        with _lock:
+            _generation -= 1
+            _started = False
+            _thread, _published = previous_thread, previous_published
+            if _threads and _threads[-1] is thread:
+                _threads.pop()
+        published.set()         # release anyone already waiting on it
 
 
 def _publish(status: UpdateStatus | None, generation: int) -> bool:
@@ -851,7 +898,10 @@ def _pip_install(req: Path, timeout: int = PIP_TIMEOUT) -> bool:
             )
             return True
         except subprocess.TimeoutExpired:
-            print(f"[!] pip install exceeded {timeout}s and was stopped.")
+            # "budget", not "took": the retry runs on whatever is left of the
+            # deadline, so it can be stopped well before `timeout` seconds.
+            print(f"[!] pip install ran out of its {timeout}s budget "
+                  f"and was stopped.")
             return False
         except (subprocess.CalledProcessError, OSError):
             continue
@@ -959,14 +1009,12 @@ def run_update(*, assume_yes: bool = False, dry_run: bool = False) -> int:
     rc, out, err = _git("pull", "--ff-only", remote, branch,
                         timeout=FETCH_TIMEOUT * 3)
     if out:
-        # Per line: _printable maps every control character to a space, and
-        # that includes the newlines holding git's diffstat together.
-        print("\n".join(_printable(line) for line in out.splitlines()))
+        print(_printable_block(out))
     if rc != 0:
-        # Generous limit: a pull failure lists the files involved, and this is
-        # the one message the user most needs in full.
-        detail = "\n".join(_printable(line, limit=2000)
-                           for line in err.splitlines()) if err else ''
+        # Generous per line: a pull failure lists the files involved, and this
+        # is the message the user most needs in full. Still bounded — git's
+        # stderr carries `remote:` lines the server chooses.
+        detail = _printable_block(err, limit=2000) if err else ''
         print(f"\n[!] Update failed: {detail or 'git pull returned ' + str(rc)}")
         print("    Try manually, from the MediaOrganizer folder:")
         print(f"        cd \"{app_dir()}\"")

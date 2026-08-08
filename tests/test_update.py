@@ -679,7 +679,7 @@ def test_pip_timeout_is_reported_not_retried(repos, monkeypatch, capsys):
     monkeypatch.setattr(update, "_in_virtualenv", lambda: False)
     assert update._pip_install(Path("requirements.txt")) is False
     assert len(calls) == 1                          # no --user retry after a hang
-    assert "exceeded" in capsys.readouterr().out
+    assert "ran out of its" in capsys.readouterr().out
 
 
 def test_no_user_retry_inside_a_virtualenv(repos, monkeypatch):
@@ -1074,21 +1074,33 @@ def test_the_pip_bound_covers_the_whole_call_not_each_attempt(repos, monkeypatch
 
 # --- a requirements.txt that is not UTF-8 -------------------------------------
 
-def test_a_non_utf8_requirements_file_does_not_kill_the_update(repos):
+def test_a_non_utf8_requirements_file_does_not_kill_the_update(repos, monkeypatch):
     """The fingerprint is taken after the pull has already succeeded. An
     exception there loses the report, the cache write and — from the wizard —
-    the whole session."""
-    seed, clone = repos
-    _push_commit(seed, "the fix", body="print('v2')\n")
-    (clone / "requirements.txt").write_bytes(
-        "pandas>=2.2\n".encode("utf-16-le"))     # what PowerShell 5.1 writes
-    _git(clone, "add", "-A")
-    _git(clone, "commit", "-m", "local encoding")
-    _git(clone, "reset", "--hard", "HEAD~1")     # keep the tree clean
+    the whole session.
 
-    assert update._requirements_fingerprint() is not None    # must not raise
+    The bad bytes have to arrive *through the pull*: writing them into the
+    clone and resetting would just restore the tracked UTF-8 file, and the
+    test would pass with the bug still in place.
+    """
+    seed, clone = repos
+    installs = []
+    monkeypatch.setattr(update, "_pip_install",
+                        lambda req, **kw: installs.append(req) or True)
+    (seed / "run.py").write_text("print('v2')\n")
+    # UTF-16 with a BOM is what PowerShell 5.1's `pip freeze >` produces. The
+    # BOM is the part that matters: bare UTF-16LE of ASCII happens to be valid
+    # UTF-8 (the NUL bytes decode), so it would not prove anything.
+    (seed / "requirements.txt").write_bytes("pandas>=2.2\n".encode("utf-16"))
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-m", "utf-16 requirements")
+    _git(seed, "push", "origin", "main")
+
     assert update.run_update(assume_yes=True) == 0
     assert (clone / "run.py").read_text() == "print('v2')\n"
+    # The fingerprint changed, so the reinstall branch ran rather than
+    # exploding on the way to it.
+    assert len(installs) == 1
 
 
 def test_a_missing_requirements_file_is_not_an_error(repos):
@@ -1105,9 +1117,10 @@ def test_the_pull_summary_keeps_its_lines(repos, capsys):
     update.run_update(assume_yes=True)
     out = capsys.readouterr().out
     assert "Fast-forward" in out
-    # The diffstat is several lines; flattening it into one run-on line is
-    # what sanitising the whole blob at once used to do.
-    assert "Updating" in out and out.count("\n") > 10
+    # Sanitising the whole blob at once turned the diffstat into a single
+    # run-on line beginning "Updating", so no line started with the file name.
+    assert "Updating" in out
+    assert any(line.strip().startswith("run.py") for line in out.splitlines())
 
 
 def test_a_failed_pull_reports_the_whole_error(repos, monkeypatch, capsys):
@@ -1168,3 +1181,97 @@ def test_update_module_pulls_in_no_third_party_packages():
         cwd=str(Path(__file__).resolve().parent.parent),
         capture_output=True, text=True, check=True)
     assert probe.stdout.strip() == "[]"
+
+
+# --- the cache contract with its own future -----------------------------------
+
+def test_a_saved_status_can_be_loaded_back():
+    """Fail-closed on unknown annotations is right, but it couples every
+    future field to that loop: add one the loop cannot classify and every
+    cache this version writes becomes unreadable, silently and with no error
+    printed anywhere. This round-trip is what makes that fail in CI instead."""
+    st = update.UpdateStatus(
+        state=update.BEHIND, behind=1, ahead=0, branch="main",
+        upstream="origin/main", local="aaaaaaa", remote="bbbbbbb",
+        version="1.0", commits=["aaaaaaa subject"], reason="", hint="",
+        checked_at=time.time())
+    assert update.UpdateStatus.from_dict(st.to_dict()) == st
+
+
+def test_a_cache_cannot_smuggle_in_unbounded_output(repos):
+    _, clone = repos
+    (clone / update.CACHE_NAME).write_text(json.dumps({
+        "state": "behind", "behind": 1, "upstream": "origin/main",
+        "commits": [f"sha subject {i}" for i in range(100_000)],
+        "checked_at": time.time()}))
+    loaded = update.load_cache()
+    assert loaded is not None
+    assert len(loaded.commits) == update.MAX_COMMITS
+
+
+# --- output stays bounded as well as structured -------------------------------
+
+def test_output_is_capped_by_lines_not_just_by_line_length():
+    """Sanitising per line fixed the diffstat but removed the only bound on
+    how much gets printed; a pull touching 50k files should not print 50k
+    lines, and git's stderr is partly chosen by the remote."""
+    block = update._printable_block("\n".join(f"line {i}" for i in range(5000)))
+    lines = block.splitlines()
+    assert len(lines) == update.MAX_OUTPUT_LINES + 1
+    assert lines[-1].strip() == f"... and {5000 - update.MAX_OUTPUT_LINES} more lines"
+
+
+def test_a_short_block_is_passed_through_whole():
+    block = update._printable_block("Updating a1b2c3d..e4f5g6h\nFast-forward\n")
+    assert block.splitlines() == ["Updating a1b2c3d..e4f5g6h", "Fast-forward"]
+
+
+# --- thread registration edges ------------------------------------------------
+
+def test_finished_threads_do_not_accumulate(repos):
+    for _ in range(4):
+        update.begin_background_check(force=True)
+        _quiesce()
+    update.begin_background_check(force=True)
+    with update._lock:
+        assert len(update._threads) <= 2      # the live one, not every one ever
+    _quiesce()
+
+
+def test_a_thread_that_cannot_start_leaves_the_module_usable(repos, monkeypatch):
+    """RuntimeError from start() used to wedge things: a dead handle passed
+    the alive check, _started blocked the retry, and an Event nobody would
+    ever set made every wait_for_cache pay its full timeout."""
+    def refuse(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", refuse)
+    update.begin_background_check()
+
+    started = time.monotonic()
+    assert update.wait_for_cache(5) is None
+    assert time.monotonic() - started < 1      # not the full timeout
+    monkeypatch.undo()
+
+    update.begin_background_check()            # and a later attempt still works
+    assert update.wait_for_check(30) is not None
+
+
+# --- the foreground answer wins ----------------------------------------------
+
+def test_an_explicit_check_retires_a_running_background_one(repos):
+    """--check-update is newer than a check already in flight; letting the
+    older one land on top is the race generations exist to settle."""
+    seed, _ = repos
+    _push_commit(seed, "the fix")
+    stale = update.check(fetch=True)
+    assert stale.state == update.BEHIND
+
+    update.begin_background_check()
+    _quiesce()
+    with update._lock:
+        generation = update._generation
+    update.check_and_cache(fetch=False)
+    with update._lock:
+        assert update._generation > generation
+    assert update._publish(stale, generation) is False

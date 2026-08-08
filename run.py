@@ -109,7 +109,11 @@ def main():
     # to be friendly about exactly that.
     try:
         from mediaorg import update
-    except ImportError as e:
+    except Exception as e:
+        # Not just ImportError: a half-copied update.py raises SyntaxError, a
+        # shadowing 'mediaorg' on sys.path raises whatever its module body
+        # raises, and an unreadable file raises OSError. The friendly message
+        # is right for all of them. (KeyboardInterrupt/SystemExit still pass.)
         print(f"❌ Critical Error: Could not load the mediaorg package. Make sure it's in the same directory. ({e})")
         print("Try running: python run.py --doctor")
         sys.exit(1)
