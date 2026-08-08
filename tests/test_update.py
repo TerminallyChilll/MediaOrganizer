@@ -155,6 +155,25 @@ def test_non_git_install_explains_how_to_get_one(tmp_path, monkeypatch):
     assert "[!] Could not check for updates" in update.describe(st)
 
 
+def test_re_clone_advice_names_the_files_that_do_not_come_with_it(
+        tmp_path, monkeypatch):
+    """This hint used to end "so nothing is lost", which was false.
+
+    Every one of these resolves to the app directory — the folder being
+    replaced — so a re-clone into a fresh folder silently leaves the undo
+    history and the word list behind unless the user is told to bring them.
+    """
+    plain = tmp_path / "downloaded-zip"
+    plain.mkdir()
+    monkeypatch.setattr(update, "app_dir", lambda: plain)
+    hint = update.check(fetch=True).hint
+
+    for untracked in ("mediaorg_journal", "custom_strip_patterns.json",
+                      ".media_llm_config.json", ".media_renamer_config.json"):
+        assert untracked in hint
+    assert "nothing is lost" not in hint
+
+
 def test_detached_head_says_which_branch_to_return_to(repos):
     _, clone = repos
     _git(clone, "checkout", "--detach", "HEAD")

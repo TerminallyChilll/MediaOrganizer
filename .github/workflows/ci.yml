@@ -3,12 +3,17 @@ name: CI
 # Trigger policy: `pull_request` covers PR branches, `push` covers only the
 # default branch. Listening to both events on every branch ran the whole
 # matrix TWICE for a single commit on a PR branch.
+#
+# Markdown is deliberately NOT ignored here any more. Each root .md file has a
+# generated .txt twin (tools/md_to_txt.py) and tests/test_docs.py fails when
+# the two disagree — with '**.md' in paths-ignore, the docs-only commit that
+# causes exactly that would skip the workflow and land the drift unnoticed.
 on:
   push:
     branches: [main]
-    paths-ignore: ['**.md', 'LICENSE', '.gitignore']
+    paths-ignore: ['LICENSE', '.gitignore']
   pull_request:
-    paths-ignore: ['**.md', 'LICENSE', '.gitignore']
+    paths-ignore: ['LICENSE', '.gitignore']
   workflow_dispatch:
     inputs:
       full_matrix:

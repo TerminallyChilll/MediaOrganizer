@@ -420,8 +420,12 @@ def check(*, fetch: bool = True) -> UpdateStatus:
             reason,
             "Automatic updates need a git clone. Re-download with:\n"
             f"    git clone {REPO_URL}.git\n"
-            "Your journal, spreadsheets and settings live outside the repo, "
-            "so nothing is lost.")
+            "Then copy these across from this folder, if you have them --\n"
+            "they are untracked, so a fresh clone does not include them:\n"
+            "    mediaorg_journal*.jsonl      (undo history)\n"
+            "    custom_strip_patterns.json   (your word list)\n"
+            "    .media_llm_config.json       (saved API key)\n"
+            "    .media_renamer_config.json   (remembered folders)")
 
     branch = _current_branch()
     upstream, reason = _resolve_upstream(branch)

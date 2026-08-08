@@ -17,5 +17,8 @@ __pycache__
 Dockerfile
 docker-compose.yml
 README.md
+# ...and its generated plain-text twin, for the same reason.
+README.txt
+REVIEW.txt
 .venv
 mediaorg_journal*.jsonl
