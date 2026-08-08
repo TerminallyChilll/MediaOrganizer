@@ -395,3 +395,32 @@ def test_scan_tv_still_reports_folders_with_no_episodes(tmp_path):
     by_folder = {r["Show Folder"]: r for r in rows}
     assert by_folder["Empty Show"]["Episode File"] == ""
     assert by_folder["Real Show"]["Episode File"] == "Season 1/Real.S01E01.mkv"
+
+
+def test_unexplained_subtree_under_a_wrapper_still_gets_a_row(tmp_path):
+    """Coverage is per subtree, not per top-level branch.
+
+    Marking the whole of "Genre" covered as soon as one show was found there
+    left any other unrecognised subtree under it with no row and no recursive
+    fallback — silently invisible in the spreadsheet.
+    """
+    tv = tmp_path / "TV"
+    (tv / "Genre" / "Real Show" / "Season 1").mkdir(parents=True)
+    (tv / "Genre" / "Real Show" / "Season 1" / "RS.S01E01.mkv").write_text("x")
+    (tv / "Genre" / "Odd Layout" / "disc").mkdir(parents=True)
+    (tv / "Genre" / "Odd Layout" / "disc" / "whatever.mkv").write_text("x")
+
+    rows = scan_tv(tv)
+    by_folder = {r["Show Folder"]: r for r in rows}
+    assert by_folder["Genre/Real Show"]["Episode File"] == "Season 1/RS.S01E01.mkv"
+    assert by_folder["Genre/Odd Layout"]["Episode File"] == ""
+
+
+def test_wrapper_dirs_on_the_way_to_a_show_are_not_reported_as_gaps(tmp_path):
+    """"Genre" itself leads to a show, so it is explained and needs no row."""
+    tv = tmp_path / "TV"
+    (tv / "Genre" / "Show" / "Season 1").mkdir(parents=True)
+    (tv / "Genre" / "Show" / "Season 1" / "S.S01E01.mkv").write_text("x")
+
+    rows = scan_tv(tv)
+    assert [r["Show Folder"] for r in rows] == ["Genre/Show"]

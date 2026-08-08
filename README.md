@@ -87,15 +87,33 @@ Show/Season 1/Show.S01E01/Subs/ep.mkv ->  Show/Season 1/ep.mkv
 Show/Downloads/Show.S02E03.mkv        ->  Show/Season 2/Show.S02E03.mkv
 ```
 
-A folder is only ever emptied when it actually holds episodes. A subfolder
-with no `SxxEyy` files in it — `Artwork`, `Specials`, an empty folder — is not
-touched at all, and files with no episode code are left where they are rather
-than being guessed into a season.
+A file is only ever moved when something says where it goes — its own episode
+code, or the code in the name of the folder holding it. Nothing is placed by
+position alone, so `Artwork/poster.jpg` stays put, and `Season 1/Extras/
+Show.S02E05.mkv` goes to `Season 2`, not to the season folder it happened to
+be sitting in. Aspect-ratio names are not read as episode codes:
+`banner-16x9.jpg` is artwork, not season 16.
 
-**One case the tool cannot resolve for you:** `Show/Complete Series/Season 1/`
-is structurally identical to `Genre/Show/Season 1/`, and nothing in the names
-says which of the two folders is the show. The inner one wins, so the show is
-recorded as `Complete Series`. Fix it by typing the real name in the
+These are left alone entirely, even when the files inside them carry episode
+codes: local-extras folders (`Specials`, `Extras`, `Trailers`, `Featurettes`,
+`Behind The Scenes`, `Deleted Scenes`, `Interviews`, `Bonus`, `Other`), and
+OS/NAS bookkeeping directories (`@eaDir`, `.trashes`, `$RECYCLE.BIN`, …). A
+folder is only removed once everything in it has been moved out.
+
+**Wrappers vs. shows.** A folder that contains a show is a wrapper and is left
+where it is. That is decided by what is on disk, not by the folder's name, so
+two flat shows under one bucket stay two shows:
+
+```
+Genre/ShowA/ShowA.S01E01.mkv   ->  Genre/ShowA/Season 1/…
+Genre/ShowB/ShowB.S01E01.mkv   ->  Genre/ShowB/Season 1/…
+```
+
+**One case the tool cannot resolve for you.** `Show/Downloads/Show.S01E01.mkv`
+and `Genre/Show/Show.S01E01.mkv` are the same shape on disk — nothing in the
+names says which folder is the show. The inner one always wins, so a show
+behind a wrapper is found correctly, and a dump folder is named as the show
+(`Downloads`, `Complete Series`). Fix those by typing the real name in the
 `Folder Fixed` column and re-running the rename.
 
 ### The Fixed-columns workflow

@@ -415,11 +415,19 @@ def run_scan(movies_path, tv_path, excel_path: Path, dry_run: bool = False) -> N
                 tv_rows.extend(added_rows)
                 # Drop placeholder show rows now covered by recursive finds
                 # (same stale-parent-rename hazard as the movies side).
-                covered = {Path(rr['Show Folder']).parts[0] for rr in added_rows
+                # A structured Show Folder can now be a nested path
+                # ("Genre/Show"), so this needs a real ancestor test — the old
+                # first-component comparison left the placeholder in place, and
+                # plan_renames then renamed that parent ahead of the child ops
+                # it had just stranded.
+                covered = {Path(rr['Show Folder']) for rr in added_rows
                            if rr['Show Folder'] != '.'}
+                def _is_covered(folder: str) -> bool:
+                    here = Path(folder)
+                    return any(c == here or here in c.parents for c in covered)
                 tv_rows[:] = [r for r in tv_rows
                               if r.get('Episode File')
-                              or r['Show Folder'] not in covered]
+                              or not _is_covered(r['Show Folder'])]
                 print(f"   [OK] Recursive scan added {len(added_rows)} episode(s) "
                       f"(total {len(tv_rows)}).")
             elif not tv_rows:
