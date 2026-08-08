@@ -139,14 +139,41 @@ def git_available() -> bool:
     return _git("--version")[0] == 0
 
 
-def is_git_checkout() -> bool:
-    """Is the app directory inside a git work tree?
+def _same_dir(a: Path, b: Path) -> bool:
+    """Path equality that survives Windows drive-letter case and symlinks."""
+    try:
+        a, b = a.resolve(), b.resolve()
+    except OSError:                             # pragma: no cover - defensive
+        pass
+    return os.path.normcase(str(a)) == os.path.normcase(str(b))
+
+
+def work_tree_root() -> Path | None:
+    """The root of the git work tree the app directory sits in, if any.
 
     Asks git rather than looking for a ``.git`` entry, so a worktree (where
     ``.git`` is a file) and a submodule both answer correctly.
     """
-    rc, out, _ = _git("rev-parse", "--is-inside-work-tree")
-    return rc == 0 and out == 'true'
+    rc, out, _ = _git("rev-parse", "--show-toplevel")
+    if rc != 0 or not out:
+        return None
+    try:
+        return Path(out)
+    except (OSError, ValueError):               # pragma: no cover - defensive
+        return None
+
+
+def is_git_checkout() -> bool:
+    """Is the app directory itself the root of a git clone?
+
+    Being *inside* a work tree is not enough: a ZIP copy unpacked into some
+    other project's checkout ("~/projects/thing/tools/MediaOrganizer") is
+    inside that project's repository, and updating there would fetch and
+    fast-forward the unrelated project while leaving Media Organizer exactly
+    as it was.
+    """
+    root = work_tree_root()
+    return root is not None and _same_dir(root, app_dir())
 
 
 def _current_branch() -> str:
@@ -157,8 +184,11 @@ def _current_branch() -> str:
 def _resolve_upstream(branch: str) -> tuple[str, str]:
     """The ref this clone should compare against, as (upstream, reason).
 
-    Prefers the branch's configured upstream; falls back to
-    ``origin/main`` for a clone whose tracking config was never set up.
+    Prefers the branch's configured upstream. The ``origin/main`` fallback
+    covers a clone whose tracking config was never set up, but only while
+    the user is actually on ``main`` — assuming any untracked branch follows
+    main would fast-forward somebody's work branch onto main and call it an
+    update.
 
     A detached HEAD is refused before either: we could still measure it
     against origin/main, but an update from there would fast-forward a
@@ -171,7 +201,8 @@ def _resolve_upstream(branch: str) -> tuple[str, str]:
     if rc == 0 and out and out != '@{upstream}':
         return out, ''
     fallback = f"{DEFAULT_REMOTE}/{DEFAULT_BRANCH}"
-    if _git("rev-parse", "--verify", "--quiet", fallback)[0] == 0:
+    if branch == DEFAULT_BRANCH and _git("rev-parse", "--verify", "--quiet",
+                                         fallback)[0] == 0:
         return fallback, ''
     return '', f"branch '{branch}' does not track a remote branch"
 
@@ -239,16 +270,27 @@ def check(*, fetch: bool = True) -> UpdateStatus:
             "Install git from https://git-scm.com/downloads, or re-download "
             f"the project from {REPO_URL}")
     if not is_git_checkout():
+        enclosing = work_tree_root()
+        reason = "this copy was not installed with 'git clone'"
+        if enclosing is not None:
+            # Inside someone else's repository. Say so explicitly — silently
+            # updating that repository instead is the one outcome nobody wants.
+            reason += f" (it sits inside another repository: {enclosing})"
         return _unknown(
-            "this copy was not installed with 'git clone'",
+            reason,
             "Automatic updates need a git clone. Re-download with:\n"
-            f"    git clone {REPO_URL}.git")
+            f"    git clone {REPO_URL}.git\n"
+            "Your journal, spreadsheets and settings live outside the repo, "
+            "so nothing is lost.")
 
     branch = _current_branch()
     upstream, reason = _resolve_upstream(branch)
     if not upstream:
-        return _unknown(reason,
-                        f"Switch to the tracked branch: git checkout {DEFAULT_BRANCH}")
+        hint = f"Switch to the tracked branch: git checkout {DEFAULT_BRANCH}"
+        if branch and branch != 'HEAD':
+            hint += ("\nor tell git what this branch follows:\n"
+                     f"    git branch --set-upstream-to={DEFAULT_REMOTE}/{branch}")
+        return _unknown(reason, hint)
 
     if fetch:
         remote = upstream.split('/')[0] if '/' in upstream else DEFAULT_REMOTE
@@ -307,6 +349,23 @@ def save_cache(status: UpdateStatus) -> None:
         pass
 
 
+def describes_current_checkout(status: UpdateStatus) -> bool:
+    """Is this cached answer about the commit and branch running right now?
+
+    Two cheap local git calls, no network. Without this, a manual
+    ``git pull`` leaves "3 commits behind" on screen for the rest of the
+    day — and, worse, a ``git checkout`` of an older commit is reported as
+    up to date.
+    """
+    if not status.local and not status.branch:
+        return True             # nothing recorded to contradict (old cache)
+    if status.local and status.local != head_revision():
+        return False
+    if status.branch and status.branch != _current_branch():
+        return False
+    return True
+
+
 def checks_disabled() -> bool:
     """MEDIAORG_NO_UPDATE_CHECK=1 turns the startup check off entirely."""
     return os.environ.get('MEDIAORG_NO_UPDATE_CHECK', '').strip().lower() \
@@ -359,6 +418,13 @@ def begin_background_check(*, force: bool = False) -> None:
             return
         _started = True
         cached = load_cache()
+    if cached is not None and not describes_current_checkout(cached):
+        # The checkout moved under us — a manual `git pull`, a `checkout`, a
+        # `reset`. The cached answer is about a commit that is no longer the
+        # one running, so it is not merely old, it is wrong: don't publish it
+        # even briefly, and re-measure regardless of its age.
+        cached = None
+    with _lock:
         _status = cached
     interval = check_interval_hours()
     fresh = (cached is not None and interval > 0
@@ -508,6 +574,14 @@ def describe(status: UpdateStatus) -> str:
 
 # ── updating ─────────────────────────────────────────────────────────────
 
+def _can_prompt() -> bool:
+    """Is there a terminal on the other end to answer a question?"""
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except (AttributeError, ValueError):        # closed or replaced stream
+        return False
+
+
 def _pip_install(req: Path) -> bool:
     """Install requirements, retrying with --user on a permissions failure."""
     for extra in ([], ["--user"]):
@@ -563,7 +637,19 @@ def run_update(*, assume_yes: bool = False, dry_run: bool = False) -> int:
               f"{st.upstream.replace('/', ' ', 1)}")
         return 0
 
-    if not assume_yes and sys.stdin is not None and sys.stdin.isatty():
+    if not assume_yes:
+        if not _can_prompt():
+            # Every other flow in this app confirms before it changes
+            # anything. Silently proceeding because nobody happens to be
+            # attached would make --yes decorative rather than the opt-in it
+            # is documented to be.
+            print("\n[!] Nothing is attached to answer the confirmation "
+                  "(stdin is not a terminal).")
+            print("    Re-run and opt in explicitly:")
+            print("        python run.py --update --yes")
+            print("    ...or see what it would do first:")
+            print("        python run.py --update --dry-run")
+            return 1
         answer = input("\nUpdate now? (y/n) [y]: ").strip().lower()
         if answer and answer not in ('y', 'yes'):
             print("Cancelled - nothing was changed.")

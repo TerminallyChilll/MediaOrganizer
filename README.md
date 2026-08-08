@@ -64,7 +64,8 @@ Other commands:
 python run.py --version        # which version and commit you are on
 python run.py --check-update   # how far behind you are, and what you're missing
 python run.py --update --dry-run   # show what would be pulled, change nothing
-python run.py --update --yes       # skip the confirmation
+python run.py --update --yes       # skip the confirmation (required when
+                                   #   run unattended - see below)
 ```
 
 **What the update does:** fetches, fast-forwards your clone to the latest
@@ -74,10 +75,19 @@ commits, it stops and prints the git command to resolve that first. Your
 library, journal, spreadsheets and word list are untracked files and are never
 touched.
 
+Like every other flow in this app, it asks before it changes anything. If there
+is no terminal to ask (a cron job, a script, `--update < /dev/null`) it stops
+and tells you to opt in with `--yes` rather than deciding for you.
+
 **Notes**
-- Updating needs `git` and an install made with `git clone`. If you downloaded
-  a ZIP instead, the app says so and prints the `git clone` command to switch
-  to one (your settings live outside the repo, so nothing is lost).
+- Updating needs `git` and an install made with `git clone`, in a folder that
+  is the clone itself. If you downloaded a ZIP instead — or dropped the folder
+  inside some other project's repository, where it would otherwise update
+  *that* project — the app says so and prints the `git clone` command to switch
+  to a real clone (your settings live outside the repo, so nothing is lost).
+- Updates follow the branch you are on. On `main` that is `origin/main`; on
+  your own branch it is whatever that branch tracks. A branch that tracks
+  nothing is reported as such rather than quietly fast-forwarded onto `main`.
 - **Launching the app contacts github.com.** The check is a `git fetch`, run in
   the background at most once a day (and on a first launch, before any cache
   exists) — no other data leaves the machine, and nothing is sent about your

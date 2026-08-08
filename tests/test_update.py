@@ -374,3 +374,148 @@ def test_waiting_when_no_check_is_running_returns_immediately(repos):
     started = time.monotonic()
     assert update.wait_for_check(30).state == update.CURRENT
     assert time.monotonic() - started < 1
+
+
+# --- what counts as "this install" -------------------------------------------
+
+def test_a_copy_inside_another_repo_is_not_treated_as_a_clone(tmp_path, monkeypatch):
+    """A ZIP unpacked into some other project's checkout is inside *that*
+    repository. Updating there would fetch and fast-forward the unrelated
+    project and leave Media Organizer untouched."""
+    outer = tmp_path / "someone-elses-project"
+    inner = outer / "tools" / "MediaOrganizer"
+    inner.mkdir(parents=True)
+    _git(tmp_path, "init", "--initial-branch=main", str(outer))
+    (outer / "their_code.py").write_text("theirs")
+    _git(outer, "add", "-A")
+    _git(outer, "commit", "-m", "their work")
+
+    monkeypatch.setattr(update, "app_dir", lambda: inner)
+    assert update.is_git_checkout() is False
+    st = update.check(fetch=True)
+    assert st.state == update.UNKNOWN
+    assert "sits inside another repository" in st.reason
+    assert "git clone" in st.hint
+
+
+def test_updating_a_copy_inside_another_repo_touches_nothing(tmp_path, monkeypatch):
+    outer = tmp_path / "someone-elses-project"
+    inner = outer / "tools" / "MediaOrganizer"
+    inner.mkdir(parents=True)
+    _git(tmp_path, "init", "--initial-branch=main", str(outer))
+    (outer / "their_code.py").write_text("theirs")
+    _git(outer, "add", "-A")
+    _git(outer, "commit", "-m", "their work")
+    before = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(outer),
+                            capture_output=True, text=True).stdout
+
+    monkeypatch.setattr(update, "app_dir", lambda: inner)
+    assert update.run_update(assume_yes=True) == 1
+    after = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(outer),
+                           capture_output=True, text=True).stdout
+    assert before == after
+    assert (outer / "their_code.py").read_text() == "theirs"
+
+
+def test_the_clone_root_itself_is_a_valid_install(repos):
+    assert update.is_git_checkout() is True
+
+
+# --- which branch we compare against -----------------------------------------
+
+def test_an_untracked_work_branch_is_not_assumed_to_follow_main(repos):
+    """Treating any untracked branch as tracking origin/main would let
+    --update fast-forward somebody's work branch onto main."""
+    seed, clone = repos
+    _push_commit(seed, "main moved on")
+    _git(clone, "checkout", "-b", "my-tweaks")
+
+    st = update.check(fetch=True)
+    assert st.state == update.UNKNOWN
+    assert "does not track a remote branch" in st.reason
+    assert "git branch --set-upstream-to=origin/my-tweaks" in st.hint
+
+
+def test_an_untracked_work_branch_is_never_pulled(repos):
+    seed, clone = repos
+    _push_commit(seed, "main moved on")
+    _git(clone, "checkout", "-b", "my-tweaks")
+    head = update.head_revision()
+
+    assert update.run_update(assume_yes=True) == 1
+    assert update.head_revision() == head          # their branch is untouched
+
+
+def test_main_without_tracking_config_still_falls_back(repos):
+    """A clone whose upstream config was lost is still updatable on main."""
+    seed, clone = repos
+    _push_commit(seed, "a fix")
+    _git(clone, "branch", "--unset-upstream")
+
+    st = update.check(fetch=True)
+    assert st.state == update.BEHIND
+    assert st.upstream == "origin/main"
+
+
+# --- the cache tracks the checkout, not just the clock ------------------------
+
+def test_a_cache_from_a_different_commit_is_not_shown(repos):
+    """After a manual `git pull` the cached 'you are behind' is not merely
+    old, it is about a commit that is no longer running."""
+    seed, _ = repos
+    _push_commit(seed, "work the user pulled by hand")
+    behind = update.check(fetch=True)
+    update.save_cache(behind)                      # fresh timestamp, stale sha
+    _git(repos[1], "pull", "--ff-only", "origin", "main")   # the manual pull
+
+    update.begin_background_check()
+    # Never published, not even briefly, on the way to the refreshed answer.
+    assert (update.latest_status() or update.UpdateStatus()).state != update.BEHIND
+    assert update.wait_for_check(30).state == update.CURRENT
+
+
+def test_a_cache_from_a_different_branch_is_not_shown(repos):
+    _, clone = repos
+    update.save_cache(update.check(fetch=True))
+    _git(clone, "checkout", "-b", "elsewhere")
+    assert update.describes_current_checkout(update.load_cache()) is False
+
+
+def test_a_cache_matching_the_checkout_is_still_used(repos):
+    update.save_cache(update.check(fetch=True))
+    assert update.describes_current_checkout(update.load_cache()) is True
+
+
+# --- confirmation -------------------------------------------------------------
+
+def test_no_terminal_and_no_yes_refuses_rather_than_assuming(repos, monkeypatch,
+                                                             capsys):
+    """`python run.py --update < /dev/null` must not change the checkout
+    without the confirmation --yes is documented to stand in for."""
+    seed, _ = repos
+    _push_commit(seed, "the fix", body="print('v2')\n")
+    monkeypatch.setattr(update, "_can_prompt", lambda: False)
+    head = update.head_revision()
+
+    assert update.run_update() == 1
+    assert update.head_revision() == head
+    assert "--update --yes" in capsys.readouterr().out
+
+
+def test_no_terminal_with_yes_proceeds(repos, monkeypatch):
+    seed, clone = repos
+    _push_commit(seed, "the fix", body="print('v2')\n")
+    monkeypatch.setattr(update, "_can_prompt", lambda: False)
+
+    assert update.run_update(assume_yes=True) == 0
+    assert (clone / "run.py").read_text() == "print('v2')\n"
+
+
+def test_declining_the_confirmation_changes_nothing(repos, monkeypatch):
+    seed, clone = repos
+    _push_commit(seed, "the fix", body="print('v2')\n")
+    monkeypatch.setattr(update, "_can_prompt", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *a: "n")
+
+    assert update.run_update() == 0
+    assert (clone / "run.py").read_text() == "print('v1')\n"
