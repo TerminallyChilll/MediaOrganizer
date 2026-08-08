@@ -101,21 +101,25 @@ def main():
     # ── Version / update ──
     # Handled before install_dependencies(): pulling a fix is exactly what you
     # want to do when the dependency install is what's broken, and none of
-    # these touch pandas/guessit.
-    if "--version" in sys.argv or "-V" in sys.argv:
+    # these touch pandas/guessit. The parsing lives in mediaorg.update so this
+    # and the wizard's parser cannot disagree about what was typed.
+    # Guarded like the wizard import below: this is now the first mediaorg
+    # import on an ordinary launch, and a half-copied or shadowed package here
+    # would otherwise print a raw traceback from the one script whose job is
+    # to be friendly about exactly that.
+    try:
         from mediaorg import update
-        update.print_version()
-        sys.exit(0)
-
-    if "--check-update" in sys.argv:
-        from mediaorg import update
-        print(update.describe(update.check_and_cache(fetch=True)))
-        sys.exit(0)
-
-    if "--update" in sys.argv:
-        from mediaorg import update
-        sys.exit(update.run_update(assume_yes="--yes" in sys.argv or "-y" in sys.argv,
-                                   dry_run="--dry-run" in sys.argv))
+    except Exception as e:
+        # Not just ImportError: a half-copied update.py raises SyntaxError, a
+        # shadowing 'mediaorg' on sys.path raises whatever its module body
+        # raises, and an unreadable file raises OSError. The friendly message
+        # is right for all of them. (KeyboardInterrupt/SystemExit still pass.)
+        print(f"❌ Critical Error: Could not load the mediaorg package. Make sure it's in the same directory. ({e})")
+        print("Try running: python run.py --doctor")
+        sys.exit(1)
+    code = update.dispatch_cli(sys.argv[1:])
+    if code is not None:
+        sys.exit(code)
 
     install_dependencies()
     

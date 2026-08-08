@@ -77,7 +77,16 @@ touched.
 
 Like every other flow in this app, it asks before it changes anything. If there
 is no terminal to ask (a cron job, a script, `--update < /dev/null`) it stops
-and tells you to opt in with `--yes` rather than deciding for you.
+and tells you to opt in with `--yes` rather than deciding for you. Ctrl-C or
+Ctrl-D at the prompt means "no".
+
+For scripting, `--update` exits:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Updated, already current, previewed with `--dry-run`, or you declined |
+| `1` | Refused (local edits, diverged, not a clone, no terminal), the pull failed, or the code came down but the dependency install did not |
+| `2` | The arguments could not be understood |
 
 **Notes**
 - Updating needs `git` and an install made with `git clone`, in a folder that
@@ -88,16 +97,17 @@ and tells you to opt in with `--yes` rather than deciding for you.
 - Updates follow the branch you are on. On `main` that is `origin/main`; on
   your own branch it is whatever that branch tracks. A branch that tracks
   nothing is reported as such rather than quietly fast-forwarded onto `main`.
-- **Launching the app contacts github.com.** The check is a `git fetch`, run in
-  the background at most once a day (and on a first launch, before any cache
-  exists) — no other data leaves the machine, and nothing is sent about your
-  library. On a media server, an air-gapped box or any host with restricted
+- **The app contacts github.com.** On launch it runs a `git fetch` in the
+  background, at most once a day (and on a first launch, before any cache
+  exists); `--check-update` and `--doctor` each fetch once when you run them.
+  No other data leaves the machine, and nothing is sent about your library. On a media server, an air-gapped box or any host with restricted
   egress, turn it off:
   ```bash
   MEDIAORG_NO_UPDATE_CHECK=1 python run.py     # this launch
   setx MEDIAORG_NO_UPDATE_CHECK 1              # Windows, permanently
   ```
-  With it off, nothing checks and nothing is sent; `python run.py --update`
+  With it off nothing is sent on its own, and `--doctor` compares against
+  what was last fetched instead of reaching out. `python run.py --update`
   still works whenever you ask for it explicitly.
 - The answer is cached next to the app (`.mediaorg_update_check.json`), so a
   normal launch is offline and instant. `MEDIAORG_UPDATE_INTERVAL=6` checks

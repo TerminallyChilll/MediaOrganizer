@@ -19,8 +19,11 @@ predate UTF-8.
 
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
 import os
+import site
 import subprocess
 import sys
 import threading
@@ -35,6 +38,7 @@ CACHE_NAME = ".mediaorg_update_check.json"
 DEFAULT_INTERVAL_HOURS = 24.0
 FETCH_TIMEOUT = 20      # seconds; a network call
 GIT_TIMEOUT = 15        # seconds; local git plumbing
+PIP_TIMEOUT = 600       # seconds; a dependency install may compile something
 
 # State values for UpdateStatus.state:
 #   'current'  — up to date with the tracked branch
@@ -44,6 +48,17 @@ GIT_TIMEOUT = 15        # seconds; local git plumbing
 #   'unknown'  — could not tell (no git, no network, not a clone, ...)
 CURRENT, BEHIND, AHEAD, DIVERGED, UNKNOWN = (
     'current', 'behind', 'ahead', 'diverged', 'unknown')
+VALID_STATES = frozenset({CURRENT, BEHIND, AHEAD, DIVERGED, UNKNOWN})
+
+# Sanity bound for a cached timestamp. json.load accepts the literals
+# Infinity and NaN, and either one makes every subsequent launch compute an
+# age that looks fresh — silently retiring the update check for good.
+MAX_TIMESTAMP = 1e15
+
+#: Most commit subjects kept in a status, live or cached.
+MAX_COMMITS = 20
+#: Most lines of git output echoed in one go.
+MAX_OUTPUT_LINES = 200
 
 
 def app_dir() -> Path:
@@ -88,23 +103,129 @@ class UpdateStatus:
 
     @classmethod
     def from_dict(cls, data: dict) -> "UpdateStatus":
-        known = {k: v for k, v in data.items()
-                 if k in cls.__dataclass_fields__ and k != 'stale'}
+        """Build a status from cache JSON, rejecting anything ill-typed.
+
+        The cache is a file on disk that anything can scribble in, and its
+        values are used arithmetically (``behind > 0``) and formatted into
+        the banner. A string where an int belongs used to crash the wizard
+        on every launch, before the menu was even drawn — so a value of the
+        wrong type makes the whole file invalid rather than a live landmine.
+
+        Raises ValueError; the caller treats that as "no usable cache".
+        """
+        known = {}
+        for name, field_def in cls.__dataclass_fields__.items():
+            if name == 'stale' or name not in data:
+                continue
+            value = data[name]
+            # `.type` is a string under PEP 563 (the __future__ import at the
+            # top) and a type object without it. Handle both, so deleting that
+            # import cannot quietly turn every check below into a no-op.
+            expected = field_def.type
+            if not isinstance(expected, str):
+                expected = getattr(expected, '__name__', '')
+            if expected == 'str':
+                ok = isinstance(value, str)
+                if ok:
+                    # Sanitise on the way *in*: the cache is a file anything
+                    # can write, it is published straight to the banner on the
+                    # next launch, and an escape sequence in it would repaint
+                    # the terminal exactly like a hostile commit subject.
+                    value = _printable(value)
+            elif expected == 'int':
+                # bool is an int subclass; True is not a commit count.
+                ok = isinstance(value, int) and not isinstance(value, bool)
+            elif expected == 'float':
+                # Infinity and NaN are literals json.load accepts. Either one
+                # in checked_at makes every future launch look "fresh" and
+                # silently retires the update check; a huge int additionally
+                # makes float() raise OverflowError.
+                ok = (isinstance(value, (int, float))
+                      and not isinstance(value, bool)
+                      and -MAX_TIMESTAMP < value < MAX_TIMESTAMP)
+                if ok:
+                    value = float(value)
+            elif expected.startswith('list'):
+                ok = isinstance(value, list) and all(isinstance(v, str) for v in value)
+                if ok:
+                    # Bounded like the live path: describe() prints every
+                    # entry, and a cache file with 100k of them is the same
+                    # "anything can write this" threat these checks exist for.
+                    value = [_printable(v) for v in value[:MAX_COMMITS]]
+            else:
+                # An annotation nobody taught this loop about. Refusing the
+                # file is the safe direction; trusting it is not.
+                ok = False
+            if not ok:
+                raise ValueError(
+                    f"cached field {name!r} should be {expected}, got "
+                    f"{type(value).__name__}")
+            known[name] = value
+        if 'state' in known and known['state'] not in VALID_STATES:
+            raise ValueError(f"cached state {known['state']!r} is not a known state")
         return cls(**known)
+
+
+# ── text from elsewhere ──────────────────────────────────────────────────
+
+def _printable(text: str, limit: int = 200) -> str:
+    """Strip control characters from text we did not write.
+
+    Commit subjects and git's own stderr come from the remote, are printed
+    by ``--check-update`` and the doctor, and are cached and replayed later.
+    An escape sequence in one of them could repaint the report or forge a
+    line of it, so nothing that moves the cursor survives this.
+    """
+    cleaned = ''.join(' ' if (ch < ' ' or '\x7f' <= ch <= '\x9f') else ch
+                      for ch in text)
+    cleaned = cleaned.strip()
+    # '...' not '…': the module prints on consoles that predate UTF-8, and a
+    # truncation marker that raises UnicodeEncodeError would take down the very
+    # report that was defending against a hostile subject.
+    return cleaned if len(cleaned) <= limit else cleaned[:limit - 3] + '...'
+
+
+def _printable_block(text: str, limit: int = 200,
+                     max_lines: int = MAX_OUTPUT_LINES) -> str:
+    """Sanitise multi-line output without flattening or unbounding it.
+
+    Per line, because :func:`_printable` maps every control character to a
+    space and that includes the newlines holding git's diffstat together —
+    and capped, because sanitising line by line otherwise removes the only
+    bound on how much a pull (or a remote's stderr) can print.
+    """
+    lines = text.splitlines()
+    shown = [_printable(line, limit=limit) for line in lines[:max_lines]]
+    if len(lines) > max_lines:
+        shown.append(f"    ... and {len(lines) - max_lines} more lines")
+    return "\n".join(shown)
 
 
 # ── git plumbing ─────────────────────────────────────────────────────────
 
-def _git_env() -> dict:
-    """git, with every interactive prompt disabled.
+# Variables that repoint git at a different repository than the one we are
+# standing in. Inheriting any of these would silently undo cwd=app_dir() and,
+# with it, the "only ever update this clone" guarantee.
+_REPO_REDIRECTING_VARS = (
+    'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR',
+    'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+    'GIT_CEILING_DIRECTORIES', 'GIT_NAMESPACE',
+)
 
-    Without this a fetch against a repo whose credentials expired blocks
-    forever on a password prompt that nobody is watching.
+
+def _git_env() -> dict:
+    """git, pointed at this clone, with every interactive prompt disabled.
+
+    Assignment, not ``setdefault``: an inherited ``GIT_ASKPASS`` is exactly
+    the case that hangs — a GUI credential prompt on a machine nobody is
+    watching — so ours has to win.
     """
     env = dict(os.environ)
+    for var in _REPO_REDIRECTING_VARS:
+        env.pop(var, None)
     env['GIT_TERMINAL_PROMPT'] = '0'
-    env.setdefault('GIT_ASKPASS', '')
-    env.setdefault('SSH_ASKPASS', '')
+    env['GIT_ASKPASS'] = ''
+    env['SSH_ASKPASS'] = ''
     env['GCM_INTERACTIVE'] = 'never'
     return env
 
@@ -207,6 +328,19 @@ def _resolve_upstream(branch: str) -> tuple[str, str]:
     return '', f"branch '{branch}' does not track a remote branch"
 
 
+def split_upstream(upstream: str) -> tuple[str, str] | None:
+    """An upstream ref as (remote, branch), or None if it names no remote.
+
+    ``@{upstream}`` can point at another *local* branch. Splitting that on
+    '/' yields an empty branch name and a `git pull <local-branch> ""`, so
+    the honest answer is "this is not something we can pull from".
+    """
+    remote, sep, branch = upstream.partition('/')
+    if not sep or not remote or not branch:
+        return None
+    return remote, branch
+
+
 def _short(rev: str) -> str:
     rc, out, _ = _git("rev-parse", "--short", rev)
     return out if rc == 0 else ''
@@ -222,25 +356,31 @@ def head_revision() -> str:
     return _short('HEAD')
 
 
-def local_commits_behind(upstream: str) -> tuple[int, int]:
-    """(ahead, behind) between HEAD and *upstream*."""
+def local_commits_behind(upstream: str) -> tuple[int, int] | None:
+    """(ahead, behind) between HEAD and *upstream*, or None if git could not say.
+
+    None rather than (0, 0): a comparison that *failed* is not the same as a
+    comparison that found no difference, and reporting the first as the
+    second means a broken clone shows "up to date" and never offers the
+    update that would fix it.
+    """
     rc, out, _ = _git("rev-list", "--left-right", "--count", f"HEAD...{upstream}")
     if rc != 0:
-        return 0, 0
+        return None
     parts = out.split()
     if len(parts) != 2:
-        return 0, 0
+        return None
     try:
         return int(parts[0]), int(parts[1])
     except ValueError:                          # pragma: no cover - defensive
-        return 0, 0
+        return None
 
 
-def incoming_commits(upstream: str, limit: int = 20) -> list[str]:
+def incoming_commits(upstream: str, limit: int = MAX_COMMITS) -> list[str]:
     """Subjects of the commits we do not have yet, newest first."""
     rc, out, _ = _git("log", f"--max-count={limit}", "--pretty=format:%h %s",
                       f"HEAD..{upstream}")
-    return out.splitlines() if rc == 0 and out else []
+    return [_printable(line) for line in out.splitlines()] if rc == 0 and out else []
 
 
 def working_tree_changes() -> list[str]:
@@ -292,14 +432,28 @@ def check(*, fetch: bool = True) -> UpdateStatus:
                      f"    git branch --set-upstream-to={DEFAULT_REMOTE}/{branch}")
         return _unknown(reason, hint)
 
+    parts = split_upstream(upstream)
+    if parts is None:
+        return _unknown(
+            f"branch '{branch}' tracks '{upstream}', which is not a remote branch",
+            f"Point it at the remote: "
+            f"git branch --set-upstream-to={DEFAULT_REMOTE}/{DEFAULT_BRANCH}")
+    remote, _remote_branch = parts
+
     if fetch:
-        remote = upstream.split('/')[0] if '/' in upstream else DEFAULT_REMOTE
         rc, _, err = _git("fetch", "--quiet", remote, timeout=FETCH_TIMEOUT)
         if rc != 0:
-            return _unknown(f"could not reach the remote: {err or 'git fetch failed'}",
-                            "Check your internet connection, then try again.")
+            return _unknown(
+                "could not reach the remote: "
+                f"{_printable(err) or 'git fetch failed'}",
+                "Check your internet connection, then try again.")
 
-    ahead, behind = local_commits_behind(upstream)
+    counts = local_commits_behind(upstream)
+    if counts is None:
+        return _unknown(
+            f"git could not compare this clone with {upstream}",
+            "Run 'python run.py --doctor' — the clone may be damaged.")
+    ahead, behind = counts
     if behind and ahead:
         state = DIVERGED
     elif behind:
@@ -334,14 +488,28 @@ def load_cache() -> UpdateStatus | None:
         return None
     try:
         st = UpdateStatus.from_dict(data)
-    except TypeError:
+    except (TypeError, ValueError):
+        # Ill-typed or unusable. Drop the file so the next check writes a
+        # good one instead of failing the same way on every future launch.
+        try:
+            cache_path().unlink()
+        except OSError:
+            pass
         return None
     st.stale = True
     return st
 
 
 def save_cache(status: UpdateStatus) -> None:
-    """Best effort — an unwritable app directory must not break the app."""
+    """Best effort — an unwritable app directory must not break the app.
+
+    An UNKNOWN is never written. "I could not tell" carries no information
+    worth remembering, and because it records no commit or branch it would
+    pass :func:`describes_current_checkout` and suppress the real check for
+    the rest of the interval.
+    """
+    if status.state == UNKNOWN:
+        return
     try:
         with open(cache_path(), 'w', encoding='utf-8') as f:
             json.dump(status.to_dict(), f, indent=2)
@@ -387,6 +555,16 @@ _lock = threading.Lock()
 _status: UpdateStatus | None = None
 _started = False
 _thread: threading.Thread | None = None
+_threads: list[threading.Thread] = []    # every checker ever started, for joining
+# Set once the current thread has published whatever it remembered, before it
+# goes anywhere near the network. Replaced (not cleared) per generation, so an
+# older thread finishing cannot satisfy a waiter on a newer one.
+_published = threading.Event()
+# Bumped for every checker started. A thread whose generation is no longer the
+# current one has been superseded and publishes nothing: without this, a check
+# that began *before* an update can land after it and announce an update for a
+# version already installed.
+_generation = 0
 
 
 def check_and_cache(*, fetch: bool = True) -> UpdateStatus:
@@ -394,52 +572,140 @@ def check_and_cache(*, fetch: bool = True) -> UpdateStatus:
 
     Used by the explicit commands (``--check-update``, the doctor) so that
     asking once means the next launch can answer without the network.
+
+    Bumping the generation retires any background check already running: it
+    started earlier, so its answer is older, and letting it publish over this
+    one is the same race the generation counter exists to settle.
     """
+    global _generation, _status
     st = check(fetch=fetch)
     if st.state != UNKNOWN:
         save_cache(st)
         with _lock:
-            global _status
+            _generation += 1
             _status = st
     return st
 
 
 def begin_background_check(*, force: bool = False) -> None:
-    """Publish the cached answer now; refresh over the network if it is old.
+    """Start the update check. Does no work on the calling thread.
 
-    Returns immediately either way — the network call, when one is needed,
-    happens on a daemon thread whose result shows up on the next menu draw.
+    Everything — reading the cache, checking it still describes this
+    checkout (two git subprocesses), and any network call — happens on a
+    daemon thread, so launching the app is never slower for having asked.
+    Callers who want the answer before drawing something use
+    :func:`wait_for_cache` (fast, local) or :func:`wait_for_check` (may
+    include the network).
     """
-    global _started, _status, _thread
+    global _started, _thread, _published, _generation
     if checks_disabled():
         return
     with _lock:
+        if _thread is not None and _thread.is_alive() and not force:
+            return                      # one check in flight is enough
         if _started and not force:
             return
+        previous_thread, previous_published = _thread, _published
         _started = True
-        cached = load_cache()
-    if cached is not None and not describes_current_checkout(cached):
-        # The checkout moved under us — a manual `git pull`, a `checkout`, a
-        # `reset`. The cached answer is about a commit that is no longer the
-        # one running, so it is not merely old, it is wrong: don't publish it
-        # even briefly, and re-measure regardless of its age.
-        cached = None
+        _generation += 1
+        generation = _generation
+        published = _published = threading.Event()
+        thread = threading.Thread(target=_refresh, args=(force, generation, published),
+                                  name="mediaorg-update-check", daemon=True)
+        _thread = thread
+        # Drop handles for checks that have already finished: without this a
+        # forced re-check leaks a Thread object per call for the life of the
+        # process, and join_background walks every one of them.
+        _threads[:] = [t for t in _threads if t.is_alive()]
+        _threads.append(thread)
+    # Started outside the lock: a thread that finishes instantly would
+    # otherwise block on a lock its own starter is still holding.
+    try:
+        thread.start()
+    except RuntimeError:
+        # Out of threads. Roll back rather than leave the module wedged: a
+        # dead _thread passes the alive check, _started blocks the retry, and
+        # an Event nobody will ever set makes every wait_for_cache pay its
+        # full timeout for an answer that is not coming.
+        with _lock:
+            _generation -= 1
+            _started = False
+            _thread, _published = previous_thread, previous_published
+            if _threads and _threads[-1] is thread:
+                _threads.pop()
+        published.set()         # release anyone already waiting on it
+
+
+def _publish(status: UpdateStatus | None, generation: int) -> bool:
+    """Publish a result unless a newer check has superseded this one."""
+    global _status
     with _lock:
-        _status = cached
+        if generation != _generation:
+            return False
+        _status = status
+        return True
+
+
+def _refresh(force: bool, generation: int, published: threading.Event) -> None:
+    """Publish what we remember, then re-measure if that is not enough."""
+    cached = None
+    try:
+        cached = load_cache()
+        if cached is not None and not describes_current_checkout(cached):
+            # The checkout moved under us — a manual `git pull`, a `checkout`,
+            # a `reset`. The cached answer is about a commit that is no longer
+            # the one running, so it is not merely old, it is wrong: don't
+            # publish it even briefly, and re-measure regardless of its age.
+            cached = None
+        _publish(cached, generation)
+    except Exception:                           # pragma: no cover - defensive
+        cached = None
+    finally:
+        published.set()
+
     interval = check_interval_hours()
+    # A cached timestamp from the future — a skewed clock, a cache copied from
+    # another machine — would otherwise read as permanently fresh.
+    age = time.time() - cached.checked_at if cached is not None else 0.0
     fresh = (cached is not None and interval > 0
-             and (time.time() - cached.checked_at) < interval * 3600)
+             and 0 <= age < interval * 3600)
     if fresh and not force:
         return
-    thread = threading.Thread(target=_refresh, name="mediaorg-update-check",
-                              daemon=True)
+
+    try:
+        st = check(fetch=True)
+    except Exception:                           # pragma: no cover - defensive
+        return
     with _lock:
-        _thread = thread
-    thread.start()
+        superseded = generation != _generation
+    if superseded:
+        return
+    # Don't cache a transient "no network" over a real answer: keep the last
+    # useful result so an offline launch still reports what it knew.
+    if st.state != UNKNOWN:
+        if _publish(st, generation):
+            save_cache(st)
+    elif latest_status() is None:
+        _publish(st, generation)
+
+
+def wait_for_cache(timeout: float) -> UpdateStatus | None:
+    """Wait for the remembered answer only — local work, no network.
+
+    This is the one every launch does: it costs a couple of git calls at
+    worst and lets the notice appear on the first menu draw rather than the
+    second. With no check running — checks disabled, or none started — there
+    is nothing to wait for and it returns at once.
+    """
+    with _lock:
+        running, published = _thread is not None, _published
+    if running:
+        published.wait(timeout)
+    return latest_status()
 
 
 def wait_for_check(timeout: float) -> UpdateStatus | None:
-    """Give a running check up to *timeout* seconds to finish.
+    """Give a running check up to *timeout* seconds to finish, network included.
 
     Only worth calling when there is no cached answer at all — the first
     launch after install, where waiting a moment is the difference between
@@ -453,36 +719,42 @@ def wait_for_check(timeout: float) -> UpdateStatus | None:
     return latest_status()
 
 
-def _refresh() -> None:
-    try:
-        st = check(fetch=True)
-    except Exception:                           # pragma: no cover - defensive
-        return
-    # Don't cache a transient "no network" over a real answer: keep the last
-    # useful result so an offline launch still reports what it knew.
-    global _status
-    if st.state != UNKNOWN:
-        save_cache(st)
-        with _lock:
-            _status = st
-    else:
-        with _lock:
-            if _status is None:
-                _status = st
-
-
 def latest_status() -> UpdateStatus | None:
     with _lock:
         return _status
 
 
+def join_background(timeout: float = 30.0) -> bool:
+    """Wait for every checker started so far. True if none is still running.
+
+    Tests use this to stop a daemon thread outliving the fixture that
+    pointed it at a scratch repository — so it has to cover threads a
+    ``force=True`` restart superseded, not just the newest one. Joining is
+    guarded by ``is_alive()``: a thread published but not yet started (the
+    window between the lock and ``start()``) cannot be joined at all.
+    """
+    with _lock:
+        threads = list(_threads)
+    deadline = time.monotonic() + timeout
+    for thread in threads:
+        if thread.is_alive():
+            thread.join(max(0.0, deadline - time.monotonic()))
+    return not any(thread.is_alive() for thread in threads)
+
+
 def reset_background_state() -> None:
-    """Test hook: forget the thread and the published status."""
-    global _started, _status, _thread
+    """Test hook: forget the published status and the thread handles.
+
+    Does not stop anything — call :func:`join_background` first if a check
+    may still be running against a directory that is about to disappear.
+    """
+    global _started, _status, _thread, _generation
     with _lock:
         _started = False
         _status = None
         _thread = None
+        _threads.clear()
+        _generation += 1        # orphan anything still in flight
 
 
 # ── presentation ─────────────────────────────────────────────────────────
@@ -582,16 +854,78 @@ def _can_prompt() -> bool:
         return False
 
 
-def _pip_install(req: Path) -> bool:
-    """Install requirements, retrying with --user on a permissions failure."""
-    for extra in ([], ["--user"]):
+def _in_virtualenv() -> bool:
+    """venv and virtualenv, old and new alike."""
+    return (sys.prefix != getattr(sys, 'base_prefix', sys.prefix)
+            or hasattr(sys, 'real_prefix'))      # virtualenv < 20
+
+
+def _user_site_usable() -> bool:
+    """Would `pip install --user` put packages somewhere this Python looks?
+
+    Not in a virtualenv (pip refuses outright), and not under conda, where
+    ~/.local IS on sys.path — so a --user install there shadows the
+    conda-managed package for every environment of that Python version on
+    the machine, which is a worse outcome than the failure it is retrying.
+    """
+    if _in_virtualenv() or os.environ.get('CONDA_PREFIX'):
+        return False
+    return bool(getattr(site, 'ENABLE_USER_SITE', True))
+
+
+def _pip_install(req: Path, timeout: int = PIP_TIMEOUT) -> bool:
+    """Install requirements, retrying with --user where that can help.
+
+    stdin is closed and the whole call — not each attempt — is bounded: pip
+    can ask questions, and an unattended ``--update --yes`` that stops for
+    one waits forever.
+
+    Note that neither attempt gets past an externally-managed environment
+    (PEP 668): pip applies that check to --user as well, so on a Debian or
+    Homebrew Python both fail identically and the user needs a virtualenv.
+    """
+    deadline = time.monotonic() + timeout
+    attempts = [[], ["--user"]] if _user_site_usable() else [[]]
+    for extra in attempts:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install",
-                                   *extra, "-r", str(req), "--quiet"])
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", *extra,
+                 "-r", str(req), "--quiet", "--disable-pip-version-check"],
+                check=True, stdin=subprocess.DEVNULL, timeout=remaining,
+            )
             return True
+        except subprocess.TimeoutExpired:
+            # "budget", not "took": the retry runs on whatever is left of the
+            # deadline, so it can be stopped well before `timeout` seconds.
+            print(f"[!] pip install ran out of its {timeout}s budget "
+                  f"and was stopped.")
+            return False
         except (subprocess.CalledProcessError, OSError):
             continue
     return False
+
+
+def _requirements_fingerprint() -> str | None:
+    """A hash of requirements.txt, or None if it cannot be read.
+
+    Compared either side of the pull to decide whether dependencies need
+    reinstalling. Reading the file beats diffing a commit range: it needs no
+    successful `git diff`, and it gets a rename or a deletion right.
+
+    Bytes, not text: a requirements.txt that is not UTF-8 (PowerShell 5.1
+    writes UTF-16LE; one latin-1 byte in a comment is enough) would raise
+    UnicodeDecodeError — and this is called *after* the pull has succeeded,
+    where an exception would kill the report, the cache write and, from the
+    wizard, the whole session.
+    """
+    try:
+        return hashlib.sha256(
+            (app_dir() / "requirements.txt").read_bytes()).hexdigest()
+    except OSError:
+        return None
 
 
 def run_update(*, assume_yes: bool = False, dry_run: bool = False) -> int:
@@ -627,14 +961,23 @@ def run_update(*, assume_yes: bool = False, dry_run: bool = False) -> int:
             print(f"      {line}")
         if len(dirty) > 20:
             print(f"      ... and {len(dirty) - 20} more")
-        print("\n    Keep them:     git stash")
-        print("    Throw them away: git checkout -- .")
-        print("    Then run:      python run.py --update")
+        # `git checkout -- .` restores the work tree from the index, so it
+        # leaves *staged* changes exactly where they were — and those show up
+        # in `git status --porcelain` too. Advising it would send the user
+        # round the loop to the identical refusal.
+        print("\n    Keep them:       git stash")
+        print("    Throw them away: git reset --hard")
+        print("    Then run:        python run.py --update")
         return 1
 
+    parts = split_upstream(st.upstream)
+    if parts is None:                           # pragma: no cover - check() guards
+        print(f"\n[!] {st.upstream} does not name a remote branch to pull from.")
+        return 1
+    remote, branch = parts
+
     if dry_run:
-        print("\n[dry-run] Would run: git pull --ff-only "
-              f"{st.upstream.replace('/', ' ', 1)}")
+        print(f"\n[dry-run] Would run: git pull --ff-only {remote} {branch}")
         return 0
 
     if not assume_yes:
@@ -650,20 +993,29 @@ def run_update(*, assume_yes: bool = False, dry_run: bool = False) -> int:
             print("    ...or see what it would do first:")
             print("        python run.py --update --dry-run")
             return 1
-        answer = input("\nUpdate now? (y/n) [y]: ").strip().lower()
+        try:
+            answer = input("\nUpdate now? (y/n) [y]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            # Ctrl-C / Ctrl-D at a confirmation means "no", not a traceback.
+            print("\nCancelled - nothing was changed.")
+            return 0
         if answer and answer not in ('y', 'yes'):
             print("Cancelled - nothing was changed.")
             return 0
 
     before = head_revision()
-    remote, _, branch = st.upstream.partition('/')
+    requirements_before = _requirements_fingerprint()
     print(f"\n-> git pull --ff-only {remote} {branch}")
     rc, out, err = _git("pull", "--ff-only", remote, branch,
                         timeout=FETCH_TIMEOUT * 3)
     if out:
-        print(out)
+        print(_printable_block(out))
     if rc != 0:
-        print(f"\n[!] Update failed: {err or 'git pull returned ' + str(rc)}")
+        # Generous per line: a pull failure lists the files involved, and this
+        # is the message the user most needs in full. Still bounded — git's
+        # stderr carries `remote:` lines the server chooses.
+        detail = _printable_block(err, limit=2000) if err else ''
+        print(f"\n[!] Update failed: {detail or 'git pull returned ' + str(rc)}")
         print("    Try manually, from the MediaOrganizer folder:")
         print(f"        cd \"{app_dir()}\"")
         print(f"        git pull --ff-only {remote} {branch}")
@@ -672,25 +1024,84 @@ def run_update(*, assume_yes: bool = False, dry_run: bool = False) -> int:
     after = head_revision()
 
     # Only reinstall when the dependency list actually moved: pip is slow and
-    # this runs on every update otherwise.
-    changed = _git("diff", "--name-only", f"{before}..{after}")[1].splitlines()
-    if 'requirements.txt' in changed:
+    # this would otherwise run on every update.
+    deps_failed = False
+    requirements_after = _requirements_fingerprint()
+    if requirements_after is not None and requirements_after != requirements_before:
         req = app_dir() / "requirements.txt"
         print("\n-> requirements.txt changed, updating dependencies...")
         if _pip_install(req):
             print("[OK] Dependencies updated.")
         else:
+            deps_failed = True
             print("[!] Dependency install failed. Run it yourself:")
             print(f"        python -m pip install -r \"{req}\"")
 
-    fresh = check(fetch=False)
-    save_cache(fresh)
+    save_cache(check(fetch=False))
     print("\n" + "=" * 70)
-    print(f"[OK] Updated {before} -> {after} (v{_version()}).")
-    print("     Restart Media Organizer to use the new version:")
+    if before and after and before == after and not deps_failed:
+        # Reachable, not defensive: someone else can pull during the
+        # confirmation prompt. Only "nothing changed" if pip agreed.
+        print("[OK] Already up to date - nothing changed.")
+        print("=" * 70)
+        return 0
+    moved = f"{before} -> {after}" if before and after else (after or "the latest commit")
+    if deps_failed:
+        # Not "[OK]": the code is new but its dependencies are not, which is
+        # exactly the state that fails confusingly on the next launch.
+        print(f"[!] Updated the code ({moved}), but the dependency install "
+              f"failed.")
+        print("     Finish it with the pip command above, then restart:")
+    else:
+        print(f"[OK] Updated {moved}.")
+        print("     Restart Media Organizer to use the new version:")
     print("         python run.py")
     print("=" * 70)
-    return 0
+    return 1 if deps_failed else 0
+
+
+#: Flags run.py handles before it imports anything heavy.
+CLI_FLAGS = ('--update', '--check-update', '--version', '-V')
+
+
+def dispatch_cli(argv: list[str]) -> int | None:
+    """Handle the update/version flags, or return None if none were given.
+
+    Lives here rather than in run.py so there is one parser for them instead
+    of a hand-rolled ``in sys.argv`` test that drifts from the real one.
+    Abbreviations are off, so ``--upd`` is an error in both parsers rather
+    than being ignored by one and honoured by the other.
+    """
+    if not any(flag in argv for flag in CLI_FLAGS):
+        return None
+    parser = argparse.ArgumentParser(prog="run.py", add_help=False,
+                                     allow_abbrev=False, exit_on_error=False)
+    parser.add_argument('--update', action='store_true')
+    parser.add_argument('--check-update', action='store_true')
+    parser.add_argument('--version', '-V', action='store_true')
+    parser.add_argument('--yes', '-y', action='store_true')
+    parser.add_argument('--dry-run', action='store_true')
+    try:
+        args, extra = parser.parse_known_args(argv)
+    except (argparse.ArgumentError, SystemExit):
+        # argparse exits the process on a malformed flag ("--dry-run=1").
+        # This function is documented to return a code, so it returns one.
+        print(f"[!] Could not understand: {' '.join(argv)}")
+        print(f"    Usage: python run.py [{' | '.join(CLI_FLAGS[:3])}] "
+              f"[--yes] [--dry-run]")
+        return 2
+    if extra:
+        print(f"[!] Unrecognized argument(s): {' '.join(extra)}")
+        print(f"    Usage: python run.py [{' | '.join(CLI_FLAGS[:3])}] "
+              f"[--yes] [--dry-run]")
+        return 2
+    if args.version:
+        print_version()
+        return 0
+    if args.check_update:
+        print(describe(check_and_cache(fetch=True)))
+        return 0
+    return run_update(assume_yes=args.yes, dry_run=args.dry_run)
 
 
 def print_version() -> None:
