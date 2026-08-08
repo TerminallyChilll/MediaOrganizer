@@ -7,6 +7,7 @@ import argparse
 import getpass
 import json
 import os
+import re
 import sys
 import uuid
 from datetime import datetime
@@ -16,7 +17,9 @@ from . import excel, extfix, llm, scan
 from .execute import (execute, journal_path, last_run_ops, list_runs,
                       pending_runs, recover, undo_last, undo_last_run,
                       undo_run, undo_session)
-from .parse import load_custom_patterns, parse_name
+from .parse import (COMPANION_EXTS, custom_patterns_path, is_media_file,
+                    load_custom_patterns, parse_name, pre_clean,
+                    save_custom_patterns)
 from .plan import (NamingScheme, Op, Plan, find_show_roots,
                    plan_loose_movies, plan_season_structure)
 
@@ -296,6 +299,50 @@ def run_organize(tv_path: str, dry_run: bool = False, *,
                         roots=[root], session=session)
 
 
+def run_organize_movies(movies_path: str, dry_run: bool = False, *,
+                        session: str | None = None) -> None:
+    """Give each loose movie file in the movies root its own folder.
+
+    Only reachable from `--action full` before now, so anyone using the menu
+    never saw it — and loose files in the root are invisible to `scan_movies`
+    (it walks directories only), so those movies were silently left out of
+    both the spreadsheet and the rename.
+    """
+    root = Path(movies_path)
+    plan = plan_loose_movies(root)
+    if not plan.ops:
+        print("\n   [OK] No loose movie files in the top of that folder.")
+        for op, reason in plan.skipped:
+            print(f"   SKIPPED ({reason}): {op.src or op.dst}")
+        return
+    movies = len({op.dst.parent for op in plan.ops if op.kind == "move"})
+    print(f"\n   [OK] {movies} loose movie file(s) to give a folder of their own.")
+    confirm_and_execute(plan, _journal_path(), dry_run, "loose-file moves",
+                        roots=[root], session=session)
+
+
+def _warn_loose_movies(movies_path) -> None:
+    """Point out loose files the media scan cannot see."""
+    if not movies_path:
+        return
+    try:
+        loose = [e.name for e in os.scandir(movies_path)
+                 if e.is_file(follow_symlinks=False) and is_media_file(e.name)]
+    except OSError:
+        return
+    if not loose:
+        return
+    print(f"\n   [!] {len(loose)} movie file(s) sit loose in the top of the "
+          f"Movies folder:")
+    for name in sorted(loose)[:5]:
+        print(f"       {name}")
+    if len(loose) > 5:
+        print(f"       ... and {len(loose) - 5} more")
+    print("       A movie scan only looks inside folders, so these are not in "
+          "the\n       spreadsheet and will not be renamed. Menu option "
+          "[3] gives each\n       one its own folder first.")
+
+
 def _report_misfiled(movies_rows, tv_rows, patterns) -> None:
     """Point out media that looks like it is in the wrong library.
 
@@ -536,12 +583,24 @@ def _ask_llm_results(df_movies, df_tv, patterns) -> dict:
                                          ollama_url=url)
     provider = prompt_input("Provider - [1] Gemini  [2] OpenAI [1]: ", default='1')
     provider = 'gemini' if provider != '2' else 'openai'
-    key = cfg.get(f'{provider}_key') or getpass.getpass(f"{provider} API key (input hidden): ")
-    if not key:
-        return {}
-    cfg[f'{provider}_key'] = key
-    llm.save_llm_config(cfg)
-    print(f"[!] API key saved to {llm.LLM_CONFIG_FILE} in plaintext. Restrict file permissions.")
+    env_key = llm.env_value(f'{provider}_key')
+    key = env_key or cfg.get(f'{provider}_key')
+    if key:
+        source = (f"the {llm.ENV_KEYS[f'{provider}_key']} environment variable"
+                  if env_key else llm.llm_config_path())
+        print(f"[OK] Using the saved {provider} key from {source}.")
+    else:
+        key = getpass.getpass(f"{provider} API key (input hidden): ")
+        if not key:
+            return {}
+        # Only a key typed here is written to disk. One supplied through the
+        # environment stays in the environment — copying it into a plaintext
+        # file the user never asked for would be a nasty surprise.
+        cfg[f'{provider}_key'] = key
+        llm.save_llm_config(cfg)
+        print(f"[!] API key saved to {llm.llm_config_path()} in plaintext "
+              f"(permissions 0600). Set "
+              f"{llm.ENV_KEYS[f'{provider}_key']} instead to avoid storing it.")
     print(f"Cleaning {len(candidates)} name(s) with {provider}...")
     return llm.clean_titles_with_llm(candidates, provider, api_key=key)
 
@@ -694,44 +753,242 @@ def run_undo(dry_run: bool = False, *, run_id: str | None = None,
     _report_undo(undo_last(journal, count, force=force))
 
 
-def run_text_export() -> None:
-    folder = browse_for_folder("Folder to export", allow_skip=False)
+# --- Inventory ---------------------------------------------------------------
+
+def collect_inventory(root: Path) -> tuple[list[dict], list[str]]:
+    """Every file under `root`, media or not. Returns (rows, walk errors).
+
+    Strictly read-only, and it classifies rather than filters: nothing is
+    left out for not looking like media.
+    """
+    rows: list[dict] = []
+    errors: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(
+            root, onerror=lambda e: errors.append(str(e))):
+        dirnames[:] = sorted(dirnames)
+        for fname in sorted(filenames):
+            full = Path(dirpath) / fname
+            try:
+                st = full.stat()
+                size, mtime = st.st_size, st.st_mtime
+            except OSError:
+                size, mtime = 0, 0
+            try:
+                rel = full.relative_to(root).as_posix()
+            except ValueError:
+                rel = str(full)
+            suffix = full.suffix.lower()
+            rows.append({
+                'Path': rel,
+                'Folder': Path(rel).parent.as_posix(),
+                'File Name': fname,
+                'Extension': suffix,
+                'Type': ('video' if is_media_file(fname)
+                         else 'companion' if suffix in COMPANION_EXTS
+                         else 'other'),
+                'Size (bytes)': size,
+                'Size (MB)': round(size / (1024 ** 2), 2),
+                'Modified': _fmt_ts(mtime) if mtime else '',
+            })
+    return rows, errors
+
+
+def _inventory_tree(root: Path) -> list[str]:
+    lines: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(dirnames)
+        try:
+            depth = len(Path(dirpath).relative_to(root).parts)
+        except ValueError:
+            depth = 0
+        lines.append("  " * depth + Path(dirpath).name + "/")
+        for f in sorted(filenames):
+            lines.append("  " * (depth + 1) + f)
+    return lines
+
+
+def write_inventory(root: Path, out: Path, dry_run: bool = False) -> bool:
+    """Write an inventory of `root` to `out`. Format follows out's suffix."""
+    rows, errors = collect_inventory(root)
+    if errors:
+        print(f"   [!] {len(errors)} directory error(s) during the walk — "
+              f"the inventory may be incomplete.")
+    if not rows:
+        print("[!] No files found. The path may be empty or inaccessible.")
+        print("    If this is a network share, check it is still mounted.")
+        return False
+
+    total_gb = sum(r['Size (bytes)'] for r in rows) / (1024 ** 3)
+    video = sum(1 for r in rows if r['Type'] == 'video')
+    if dry_run:
+        print(f"\n[dry-run] Would write {len(rows)} file(s) "
+              f"({total_gb:.2f} GB) to {out}")
+        return True
+
+    suffix = out.suffix.lower()
+    try:
+        if suffix == '.csv':
+            import csv
+            with open(out, 'w', newline='', encoding='utf-8-sig') as fh:
+                writer = csv.DictWriter(fh, fieldnames=list(rows[0]))
+                writer.writeheader()
+                writer.writerows(rows)
+        elif suffix == '.txt':
+            out.write_text("\n".join(_inventory_tree(root)), encoding="utf-8")
+        else:
+            import pandas as pd
+            with pd.ExcelWriter(out, engine='openpyxl') as writer:
+                pd.DataFrame(rows).to_excel(writer, sheet_name='Inventory',
+                                            index=False)
+                excel._autosize_columns(writer)
+    except PermissionError:
+        print(f"[!] Cannot write '{out.name}' — close it in other programs first.")
+        return False
+    except OSError as exc:
+        print(f"[!] Could not write '{out.name}': {exc}")
+        return False
+
+    print(f"\n[OK] Inventoried {len(rows)} file(s) ({total_gb:.2f} GB) — "
+          f"{video} video, {len(rows) - video} other.")
+    print(f"     Written to {out}")
+    return True
+
+
+def run_inventory() -> None:
+    """List EVERY file under a folder — media or not — and change nothing.
+
+    Distinct from [Scan library only], which understands media and writes the
+    Movies/TV sheets the renamer reads. This one makes no judgement about
+    what a file is: it is a plain record of what is on disk, which is what
+    you want for an audit, a backup list, or a before/after comparison.
+    """
+    folder = browse_for_folder("Folder to inventory", allow_skip=False)
     if not folder:
         return
-    out = Path(prompt_input("Output file [media_library.txt]: ",
-                            default="media_library.txt"))
-    lines = []
-    walk_errs: list[str] = []
-    try:
-        for dirpath, dirnames, filenames in os.walk(
-            folder, onerror=lambda e: walk_errs.append(str(e))
-        ):
-            dirnames.sort()
+    print("\n  [1] Excel spreadsheet (.xlsx)  - one row per file, with sizes")
+    print("  [2] Comma-separated values (.csv)")
+    print("  [3] Plain text tree (.txt)")
+    choice = prompt_input("Select (1-3) [1]: ", default='1')
+    ext = {'2': '.csv', '3': '.txt'}.get(choice, '.xlsx')
+    name = prompt_input(f"Output file [inventory{ext}]: ",
+                        default=f"inventory{ext}")
+    if not name.lower().endswith(ext):
+        name += ext
+    write_inventory(Path(folder), Path(name).resolve())
+
+
+# --- Custom word list --------------------------------------------------------
+
+def run_custom_words() -> None:
+    """View, add and remove the words stripped from names before parsing.
+
+    These were previously only reachable by hand-editing the JSON file:
+    ``save_custom_patterns`` existed but nothing ever called it, so there was
+    no way to add a word from the app and no way at all to take one back out.
+    """
+    def store(updated: list[str]) -> bool:
+        """Persist the list, reporting rather than crashing the wizard.
+
+        The app directory can legitimately be read-only — a system-wide
+        install, a read-only container mount — and an unhandled OSError here
+        would unwind all the way out of the menu.
+        """
+        try:
+            save_custom_patterns(updated)
+            return True
+        except OSError as exc:
+            print(f"   [!] Could not write {custom_patterns_path()}: {exc}")
+            print("   Set MEDIAORG_PATTERNS to a writable location and "
+                  "try again.")
+            return False
+
+    while True:
+        patterns = load_custom_patterns()
+        print("\n" + "-" * 60)
+        print("CUSTOM WORD LIST")
+        print("-" * 60)
+        print(f"File: {custom_patterns_path()}")
+        print("Anything matching one of these is removed from a name before\n"
+              "it is parsed - release-group tags, tracker names, and so on.\n"
+              "Each entry is a regular expression, matched case-insensitively.")
+        if patterns:
+            print()
+            for i, pat in enumerate(patterns, 1):
+                print(f"  [{i}] {pat}")
+        else:
+            print("\n  (the list is empty)")
+        print("\n  [a] Add a word        [r] Remove one")
+        print("  [c] Clear all         [t] Test against a filename")
+        print("  [q] Back to the menu")
+
+        action = prompt_input("\nSelect: ").lower()
+        if action in ('q', ''):
+            return
+
+        if action == 'a':
+            word = prompt_input("Word or pattern to strip: ")
+            if not word:
+                continue
             try:
-                depth = Path(dirpath).relative_to(folder).parts
-            except ValueError:
-                depth = ()
-            indent = "  " * len(depth)
-            lines.append(f"{indent}{Path(dirpath).name}/")
-            for f in sorted(filenames):
-                lines.append(f"{indent}  {f}")
-    except OSError as exc:
-        print(f"   [!] Could not walk directory: {exc}")
-    if walk_errs:
-        print(f"   [!] {len(walk_errs)} subdirectory error(s) during walk "
-              f"— export may be incomplete.")
-    if not lines:
-        print("[!] No files or folders found. The path may be inaccessible "
-              "or empty.")
-        print("    If this is a network share, ensure it is mounted and "
-              "accessible from the terminal.")
-        return
-    try:
-        out.write_text("\n".join(lines), encoding="utf-8")
-    except OSError as exc:
-        print(f"   [!] Could not write output file: {exc}")
-        return
-    print(f"[OK] Exported {len(lines)} line(s) to {out}")
+                re.compile(word)
+            except re.error as exc:
+                print(f"   [!] Not a valid pattern: {exc}")
+                print(f"   If you meant it literally, use: {re.escape(word)}")
+                if not ask_yes_no("Add the escaped version instead?",
+                                  default=True):
+                    continue
+                word = re.escape(word)
+            if word in patterns:
+                print("   [!] Already in the list.")
+                continue
+            # A pattern that eats a whole name is useless: pre_clean detects
+            # that at runtime and declines to apply it, so the entry would sit
+            # in the list doing nothing. Test the raw regex rather than
+            # pre_clean, which would hide exactly the case being looked for.
+            if not any(re.sub(word, '', probe, flags=re.IGNORECASE).strip()
+                       for probe in ("The Matrix 1999 1080p",
+                                     "Show S01E01 720p")):
+                print("   [!] That pattern matches whole names, so it would "
+                      "never be applied. Not added.")
+                continue
+            if store(patterns + [word]):
+                print(f"   [OK] Added: {word}")
+
+        elif action == 'r':
+            if not patterns:
+                print("   [!] Nothing to remove.")
+                continue
+            raw = prompt_input(f"Remove which (1-{len(patterns)}, or the word): ")
+            if not raw:
+                continue
+            if raw.isdigit() and 1 <= int(raw) <= len(patterns):
+                gone = patterns.pop(int(raw) - 1)
+            elif raw in patterns:
+                gone = raw
+                patterns.remove(raw)
+            else:
+                print("   [!] No such entry.")
+                continue
+            if store(patterns):
+                print(f"   [OK] Removed: {gone}")
+
+        elif action == 'c':
+            if not patterns:
+                print("   [!] Already empty.")
+                continue
+            if ask_yes_no(f"Remove all {len(patterns)} entries?", default=False):
+                if store([]):
+                    print("   [OK] Cleared.")
+
+        elif action == 't':
+            sample = prompt_input("Filename to test: ")
+            if not sample:
+                continue
+            parsed = parse_name(sample, custom_patterns=patterns)
+            print(f"   after stripping : {pre_clean(sample, patterns)}")
+            print(f"   parsed title    : {parsed.title}")
+            print(f"   year / quality  : {parsed.year or '-'} / "
+                  f"{parsed.quality or '-'}")
 
 
 # --- Menu / entry point ------------------------------------------------------
@@ -762,52 +1019,74 @@ def run_wizard() -> None:
             print("""
   [1] Clean file names        (scan -> preview -> rename)
   [2] Organize TV structure   (loose episodes -> Season folders)
-  [3] Do both                 (organize -> scan -> rename)
-  [4] Fix file extensions     (restore missing / bulk convert)
-  [5] Scan library only       (create/update the Excel spreadsheet)
-  [6] Export library to text file
-  [7] Undo last run
-  [8] Exit
+  [3] Organize movie files    (loose files -> one folder per movie)
+  [4] Do it all               (organize -> scan -> rename)
+  [5] Fix file extensions     (restore missing / bulk convert)
+  [6] Scan library only       (media only -> Excel, no changes made)
+  [7] Inventory every file    (every file, media or not -> xlsx/csv/txt)
+  [8] Custom word list        (add / remove words stripped from names)
+  [9] Undo last run
+  [0] Exit
 
 Tip: type 'back' or 'b' at any prompt to return here.""")
-            choice = prompt_input("\nSelect an option (1-8): ")
+            choice = prompt_input("\nSelect an option (0-9): ")
 
-            if choice == '8':
+            if choice == '0':
                 break
-            elif choice == '7':
+            elif choice == '9':
                 run_list_runs()
                 if pending_runs(_journal_path()):
                     run_undo(session=ask_yes_no(
                         "Undo the entire last action (all its runs)?",
                         default=False))
-            elif choice == '6':
-                run_text_export()
-            elif choice == '4':
+            elif choice == '8':
+                run_custom_words()
+            elif choice == '7':
+                run_inventory()
+            elif choice == '5':
                 run_extension_fixer()
+            elif choice == '3':
+                movies = browse_for_folder("Select your Movies folder",
+                                           allow_skip=False)
+                if movies:
+                    run_organize_movies(movies)
             elif choice == '2':
                 _, tv = _ask_paths(tv_only=True)
                 if tv:
                     run_organize(tv)
-            elif choice in ('1', '3', '5'):
+            elif choice in ('1', '4', '6'):
                 movies, tv = _ask_paths()
                 if not movies and not tv:
                     print("No folders selected.")
                     continue
                 xlsx = _ask_excel_path()
-                if choice == '3' and tv:
-                    print("\n[1/3] Organizing TV structure...")
-                    run_organize(tv)
-                if choice == '3':
-                    print("\n[2/3] Scanning library...")
-                elif choice == '1':
-                    print("\n[1/2] Scanning library...")
+                steps = 3 if choice == '4' else (2 if choice == '1' else 1)
+                step = 1
+                if choice == '4':
+                    session = uuid.uuid4().hex[:12]
+                    if tv:
+                        print(f"\n[{step}/{steps}] Organizing TV structure...")
+                        run_organize(tv, session=session)
+                    if movies:
+                        run_organize_movies(movies, session=session)
+                    step += 1
+                else:
+                    session = None
+                    # A media scan only looks inside folders, so loose files
+                    # in the movies root would go unmentioned otherwise.
+                    _warn_loose_movies(movies)
+                print(f"\n[{step}/{steps}] Scanning library...")
                 run_scan(movies, tv, xlsx)
-                if choice in ('1', '3'):
-                    print(f"\n[{'3/3' if choice == '3' else '2/2'}] Renaming...")
+                step += 1
+                if choice in ('1', '4'):
+                    print(f"\n[{step}/{steps}] Renaming...")
                     print("(You can edit the '... Fixed' columns in the spreadsheet "
                           "first - reopen this step afterwards.)")
                     if ask_yes_no("Proceed to renaming now?", default=True):
-                        run_rename(movies, tv, xlsx)
+                        run_rename(movies, tv, xlsx, session=session)
+                    if choice == '4':
+                        print("\nUndo this entire action: "
+                              "python run.py --undo-session")
             else:
                 print("Invalid choice.")
         except BackNavigation:
@@ -826,10 +1105,13 @@ def main() -> None:
                 pass
 
     parser = argparse.ArgumentParser(description="Media Organizer")
-    parser.add_argument('--action', choices=['scan', 'organize', 'rename', 'full'])
+    parser.add_argument('--action', choices=['scan', 'organize',
+                                             'organize-movies', 'rename',
+                                             'full', 'inventory'])
     parser.add_argument('--movies', help="Path to movies folder")
     parser.add_argument('--tv', help="Path to TV shows folder")
     parser.add_argument('--output', help="Excel file name")
+    parser.add_argument('--path', help="Folder to inventory (--action inventory)")
     parser.add_argument('--dry-run', action='store_true',
                         help="Show planned changes without touching disk")
     parser.add_argument('--undo', action='store_true',
@@ -863,10 +1145,21 @@ def main() -> None:
     movies = str(Path(args.movies).resolve()) if args.movies else None
     tv = str(Path(args.tv).resolve()) if args.tv else None
     xlsx = Path(args.output or "media_library.xlsx").resolve()
+    if args.action == 'inventory':
+        target = args.path or args.movies or args.tv
+        if not target:
+            sys.exit("[!] --path is required for 'inventory'.")
+        out = Path(args.output or "inventory.xlsx").resolve()
+        write_inventory(Path(target).resolve(), out, dry_run=args.dry_run)
+        return
     if args.action == 'organize':
         if not tv:
             sys.exit("[!] --tv is required for 'organize'.")
         run_organize(tv, dry_run=args.dry_run)
+    elif args.action == 'organize-movies':
+        if not movies:
+            sys.exit("[!] --movies is required for 'organize-movies'.")
+        run_organize_movies(movies, dry_run=args.dry_run)
     elif args.action == 'scan':
         run_scan(movies, tv, xlsx, dry_run=args.dry_run)
     elif args.action == 'rename':

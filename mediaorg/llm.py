@@ -8,27 +8,94 @@ import json, os, urllib.request, urllib.error, ssl, time
 
 LLM_CONFIG_FILE = ".media_llm_config.json"
 
+# Environment variables that stand in for the saved config. docker-compose.yml
+# has always passed these through, but nothing read them, so in a container
+# the key had to be retyped at every prompt.
+ENV_KEYS = {
+    'openai_key': 'OPENAI_API_KEY',
+    'gemini_key': 'GEMINI_API_KEY',
+    'ollama_url': 'OLLAMA_URL',
+    'ollama_model': 'OLLAMA_MODEL',
+}
+
 # ─── Config Caching ──────────────────────────────────────────────────
 
+def llm_config_path():
+    """Where the LLM config lives, independent of the current directory.
+
+    Same reasoning as the undo journal: cwd-relative meant a key saved from
+    one directory was invisible when the app was launched from another (a
+    desktop shortcut, the Windows launcher), so the prompt reappeared every
+    run and looked like the feature was broken.
+    """
+    env = os.environ.get("MEDIAORG_LLM_CONFIG")
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    app = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       LLM_CONFIG_FILE)
+    if not os.path.exists(app):
+        legacy = os.path.abspath(LLM_CONFIG_FILE)
+        if os.path.exists(legacy) and legacy != app:
+            return legacy
+    return app
+
+
+def env_value(key):
+    """The environment's value for a config key, or None."""
+    name = ENV_KEYS.get(key)
+    value = (os.environ.get(name) or '').strip() if name else ''
+    return value or None
+
+
 def load_llm_config():
-    if os.path.exists(LLM_CONFIG_FILE):
+    config = {}
+    path = llm_config_path()
+    if os.path.exists(path):
         try:
-            with open(LLM_CONFIG_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
+            with open(path, 'r', encoding='utf-8') as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                config = loaded
         except Exception as e:
             print(f"   [!] Could not load LLM config: {e}")
-    return {}
+    # The environment wins over the saved file: in Docker it is the only way
+    # to supply a key, and it lets one be rotated without editing the file.
+    # Blank values are ignored so an unset variable cannot wipe a saved key.
+    for key in ENV_KEYS:
+        value = env_value(key)
+        if value:
+            config[key] = value
+    return config
+
+def strip_env_values(config):
+    """Drop entries the environment is currently supplying.
+
+    load_llm_config() overlays every non-empty environment value into the dict
+    it returns, so any caller that saves that dict back would copy those values
+    into the file. With OPENAI_API_KEY set, configuring Ollama — or typing a
+    Gemini key — wrote the OpenAI key to plaintext, which is the opposite of
+    the guarantee this module makes.
+
+    Only an exact match is dropped: a value the user chose interactively is
+    theirs to keep even when the environment also sets that variable.
+    """
+    return {k: v for k, v in config.items()
+            if not (k in ENV_KEYS and env_value(k) == v)}
+
 
 def save_llm_config(config):
     # This file holds cloud API keys. Create it 0600 rather than writing it at
     # the default umask and chmod-ing after: that leaves a window where the key
     # is world-readable, and the chmod could race a change of directory. The
     # mode argument is ignored on Windows, where the file inherits directory ACLs.
+    #
+    # Filtering happens here rather than at the call sites so the guarantee
+    # cannot be lost by a future caller that forgets about it.
     try:
-        path = os.path.abspath(LLM_CONFIG_FILE)
+        path = llm_config_path()
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2)
+            json.dump(strip_env_values(config), f, indent=2)
     except Exception as e:
         print(f"   [!] Could not save LLM config: {e}")
 

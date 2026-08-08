@@ -10,7 +10,7 @@ A cross-platform tool to scan media libraries, organize TV show structures, and 
 - **Journaled undo:** every applied change is recorded (with the actual paths, plus the file's size and mtime) in `mediaorg_journal.jsonl`, which lives **next to the app** — not in whatever directory you happened to launch from. `python run.py --list-runs` shows the history; `--undo` reverses the last run, `--undo-run <id>` a specific one, and `--undo-session` the whole of a `--action full`. An *intent* record is written before every change, so a crash or a half-finished copy across drives is detected and cleaned up rather than left to block future runs.
 - **Excel journal:** your library is written to an `.xlsx`. Edit the `… Fixed` columns to override any title/year/quality and the next rename pass uses your values.
 - **Fix extensions:** restore stripped video extensions via magic-byte detection, or bulk-convert one extension to another.
-- **LLM support (optional):** names guessit can't parse are offered to a local (Ollama) or cloud (OpenAI/Gemini) model.
+- **LLM support (optional):** names guessit can't parse are offered to a local (Ollama) or cloud (OpenAI/Gemini) model. Configure it with environment variables (`OLLAMA_URL`, `OPENAI_API_KEY`, `GEMINI_API_KEY`) or answer the prompt once — see [LLM setup](#llm-setup).
 
 ## Installation & Usage
 
@@ -38,23 +38,53 @@ Launching `python run.py` opens the interactive wizard:
 ```
 [1] Clean file names        (scan -> preview -> rename)
 [2] Organize TV structure   (loose episodes -> Season folders)
-[3] Do both                 (organize -> scan -> rename)
-[4] Fix file extensions     (restore missing / bulk convert)
-[5] Scan library only       (create/update the Excel spreadsheet)
-[6] Export library to text file
-[7] Undo last run
+[3] Organize movie files    (loose files -> one folder per movie)
+[4] Do it all               (organize -> scan -> rename)
+[5] Fix file extensions     (restore missing / bulk convert)
+[6] Scan library only       (media only -> Excel, no changes made)
+[7] Inventory every file    (every file, media or not -> xlsx/csv/txt)
+[8] Custom word list        (add / remove words stripped from names)
+[9] Undo last run
+[0] Exit
 ```
 
-Every flow follows the same shape: **plan → preview → confirm → apply → journal**. Nothing touches your files until you've seen the full list of changes and said yes.
+Every flow that changes anything follows the same shape: **plan → preview →
+confirm → apply → journal**. Nothing touches your files until you've seen the
+full list of changes and said yes. `[6]`, `[7]` and `[8]` never touch your
+media at all.
 
 ### Non-interactive use
 ```bash
-python run.py --action scan     --movies /media/Movies --tv /media/TV --output lib.xlsx
-python run.py --action organize --tv /media/TV
-python run.py --action rename   --output lib.xlsx
-python run.py --action full     --movies /media/Movies --tv /media/TV
+python run.py --action scan            --movies /media/Movies --tv /media/TV --output lib.xlsx
+python run.py --action organize        --tv /media/TV
+python run.py --action organize-movies --movies /media/Movies
+python run.py --action rename          --output lib.xlsx
+python run.py --action full            --movies /media/Movies --tv /media/TV
+python run.py --action inventory       --path /media --output inventory.xlsx
 # add --dry-run to any of the above to preview without changing anything
 ```
+
+### Two ways to list what you have
+Both are read-only.
+
+- **`[6] Scan library only`** understands media. It writes the `Movies` and
+  `TV Shows` sheets the renamer reads, so this is the one to run before
+  editing the `… Fixed` columns.
+- **`[7] Inventory every file`** understands nothing. It records *every* file
+  under a folder — video, subtitles, artwork, a stray PDF — one row each with
+  path, extension, type, size and last-modified date, as `.xlsx`, `.csv` or a
+  plain `.txt` tree. Use it for an audit, a backup list, or a before/after
+  comparison.
+
+### Custom word list
+`[8]` manages the words stripped out of a name before it is parsed — release
+groups, tracker tags, whatever your library is littered with. You can add
+entries, **remove them individually, or clear the list**, and test a pattern
+against a real filename before committing to it. Each entry is a
+case-insensitive regular expression; a typo that isn't valid regex is offered
+back escaped, and a pattern that would match whole names is refused rather
+than silently ignored. The list lives next to the app (override with
+`MEDIAORG_PATTERNS`), so it follows you regardless of where you launch from.
 
 ### Undo
 ```bash
@@ -115,6 +145,32 @@ names says which folder is the show. The inner one always wins, so a show
 behind a wrapper is found correctly, and a dump folder is named as the show
 (`Downloads`, `Complete Series`). Fix those by typing the real name in the
 `Folder Fixed` column and re-running the rename.
+
+### LLM setup
+Optional, and only ever consulted for names guessit could not parse (those
+show up as `source="raw"`); you can also ask for every name to be sent. The
+renaming-engine prompt appears during `[1]` and `[4]`.
+
+| Variable | Used for |
+|---|---|
+| `OLLAMA_URL` | Ollama endpoint, default `http://localhost:11434` |
+| `OLLAMA_MODEL` | Preselects a model instead of choosing from the list |
+| `OPENAI_API_KEY` | OpenAI (`gpt-4o-mini`) |
+| `GEMINI_API_KEY` | Google Gemini (`gemini-2.0-flash`) |
+
+The environment takes precedence over a saved key, which is what makes the
+Docker services work — `docker-compose.yml` passes all of these through. A
+key supplied that way is **never written to disk**. A key you type at the
+prompt is saved to `.media_llm_config.json` (mode `0600`, next to the app,
+override with `MEDIAORG_LLM_CONFIG`) so you only type it once; the tool tells
+you when it does this. An unset variable is ignored rather than blanking a
+key you already saved.
+
+Local models are batched 15 names at a time (40 for cloud) and asked for JSON
+specifically, and the response parser copes with the usual local-model output
+— markdown fences, single quotes, trailing commas, a wrapper object, or
+alternative field names. If a batch fails, the run continues with the names
+that did come back.
 
 ### The Fixed-columns workflow
 1. Run a scan (`[5]`). Open the `.xlsx`.

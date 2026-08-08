@@ -455,3 +455,88 @@ def test_a_nested_show_is_not_absorbed_into_its_parent(tmp_path):
     rows = {r["Show Folder"]: r["Episode File"] for r in scan_tv(tv)}
     assert rows == {"Show": "Show.S01E01.mkv",
                     "Show/Other Show": "Season 1/Other.S01E01.mkv"}
+
+
+# --- Movie rename regressions ------------------------------------------------
+
+def test_movie_renames_converge_on_a_second_pass(tmp_path):
+    """Titles ending in a number were degraded by every run after the first:
+    "Blade Runner 2049" lost its number, "300" grew a "() [1080p]" each time."""
+    movies = tmp_path / "Movies"
+    for folder, f in [("Blade.Runner.2049.2017.2160p", "Blade.Runner.2049.2017.2160p.mkv"),
+                      ("300.2006.1080p", "300.2006.1080p.mkv"),
+                      ("Apollo.13.1995.1080p", "Apollo.13.1995.1080p.mkv")]:
+        make_movie(movies, folder, [f])
+
+    for _ in range(2):
+        rows = scan_movies(movies)
+        plan = plan_renames(pd.DataFrame(rows), str(movies), None, None,
+                            NamingScheme())
+        for op in plan.ops:
+            op.dst.parent.mkdir(parents=True, exist_ok=True)
+            op.src.rename(op.dst)
+
+    names = sorted(p.name for p in movies.rglob("*.mkv"))
+    assert names == ["300 (2006) [1080p].mkv",
+                     "Apollo 13 (1995) [1080p].mkv",
+                     "Blade Runner 2049 (2017) [2160p].mkv"]
+    # A third pass must plan nothing at all.
+    rows = scan_movies(movies)
+    assert plan_renames(pd.DataFrame(rows), str(movies), None, None,
+                        NamingScheme()).ops == []
+
+
+def test_a_comma_in_a_lone_filename_is_not_a_separator(tmp_path):
+    """Splitting on the comma made two phantom sources, both skipped as
+    missing, so the file was silently never renamed."""
+    movies = tmp_path / "Movies"
+    make_movie(movies, "Crouching Tiger Hidden Dragon (2000)",
+               ["Crouching Tiger, Hidden Dragon.mkv"])
+    rows = scan_movies(movies)
+    plan = plan_renames(pd.DataFrame(rows), str(movies), None, None,
+                        NamingScheme())
+    assert plan.skipped == []
+    assert any(op.dst.name == "Crouching Tiger, Hidden Dragon (2000).mkv"
+               for op in plan.ops)
+
+
+def test_legacy_comma_joined_list_still_splits(tmp_path):
+    assert excel._video_files({'Video Files': 'A.2001.mkv, B.2002.mkv'}) == \
+        ['A.2001.mkv', 'B.2002.mkv']
+    assert excel._video_files({'Video Files': 'Crouching Tiger, Hidden Dragon.mkv'}) == \
+        ['Crouching Tiger, Hidden Dragon.mkv']
+    assert excel._video_files({'Video Files': 'A.mkv | B.mkv'}) == ['A.mkv', 'B.mkv']
+    assert excel._video_files({'Video Files': ''}) == []
+
+
+def test_root_level_files_do_not_plan_a_rename_of_the_library_root(tmp_path):
+    """A recursive scan records root-level files under '.', which was then
+    treated as a folder to rename — a move of the root into itself."""
+    from mediaorg.scan import scan_recursive
+    movies = tmp_path / "Movies"
+    movies.mkdir()
+    (movies / "Inception.2010.1080p.mkv").write_text("x")
+
+    rows = scan_recursive(movies)
+    plan = plan_renames(pd.DataFrame(rows), str(movies), None, None,
+                        NamingScheme())
+    assert all(op.src != movies for op in plan.ops if op.src)
+    assert [op.dst.name for op in plan.ops] == ["Inception (2010) [1080p].mkv"]
+
+
+def test_llm_quality_is_applied(tmp_path):
+    """The prompt asks for quality and the parser returns it, but it used to
+    be dropped, so an LLM-resolved name came out with no [1080p]."""
+    movies = tmp_path / "Movies"
+    make_movie(movies, "hopeless.name.xyz", ["hopeless.name.xyz.mkv"])
+    llm_results = {
+        "hopeless.name.xyz": {"title": "Hopeless Name", "year": "2011",
+                              "quality": "1080p"},
+        "hopeless.name.xyz.mkv": {"title": "Hopeless Name", "year": "2011",
+                                  "quality": "1080p"},
+    }
+    rows = scan_movies(movies)
+    plan = plan_renames(pd.DataFrame(rows), str(movies), None, None,
+                        NamingScheme(), llm_results)
+    assert sorted(op.dst.name for op in plan.ops) == \
+        ["Hopeless Name (2011) [1080p]", "Hopeless Name (2011) [1080p].mkv"]

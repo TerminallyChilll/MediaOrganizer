@@ -197,8 +197,65 @@ def _parsed_from_llm(llm_r: dict, fallback: ParsedName) -> ParsedName:
     p.title = llm_r.get('title') or p.title
     if llm_r.get('year'):
         p.year = _safe_int_year(llm_r['year'])
+    # The prompt asks for quality and _parse_llm_response returns it, but it
+    # used to be dropped here — so on a name guessit could not read at all,
+    # the LLM's resolution was thrown away and the new name had no [1080p].
+    if llm_r.get('quality'):
+        p.quality = str(llm_r['quality'])
     p.source = "llm"
     return p
+
+
+def _video_files(row) -> list[str]:
+    """The names listed in one row's "Video Files" cell.
+
+    The scanner joins with " | ". The legacy scanner used a comma, which is
+    still accepted — but only when every part looks like a media filename.
+    Splitting unconditionally on a comma tore a lone
+    "Crouching Tiger, Hidden Dragon.mkv" into two phantom sources; both were
+    then skipped as missing and the file was never renamed at all.
+    """
+    raw = str(row.get('Video Files') or '').strip()
+    if not raw:
+        return []
+    if '|' in raw:
+        return [v.strip() for v in raw.split('|') if v.strip()]
+    parts = [v.strip() for v in raw.split(',') if v.strip()]
+    if len(parts) > 1 and all(Path(p).suffix.lower() in VIDEO_EXTS
+                              for p in parts):
+        return parts
+    return [raw]
+
+
+def _plan_movie_files(row, folder_path: Path, scheme: NamingScheme,
+                      llm_results: dict, custom_patterns, ops: list[Op],
+                      folder_parse: ParsedName | None = None) -> None:
+    """Plan the renames for the video files listed on one Movies row."""
+    for vf in _video_files(row):
+        ext = Path(vf).suffix
+        pf = parse_name(vf, kind_hint="movie", custom_patterns=custom_patterns)
+        if vf in llm_results:
+            pf = _parsed_from_llm(llm_results[vf], pf)
+        if get_val(row, 'Title Fixed', ''):
+            pf.title = get_val(row, 'Title Fixed', '')
+        # Honor Fixed-column overrides on file-level parses too, so Year
+        # Fixed / Quality Fixed apply uniformly to folder and file renames.
+        if get_val(row, 'Year Fixed', ''):
+            pf.year = _safe_int_year(get_val(row, 'Year Fixed', ''))
+        if get_val(row, 'Quality Fixed', 'Quality'):
+            pf.quality = get_val(row, 'Quality Fixed', 'Quality')
+        if folder_parse is not None:
+            pf.year = pf.year or folder_parse.year
+            pf.quality = pf.quality or folder_parse.quality
+        new_file = build_movie_file_name(
+            pf, ext,
+            _clean(row.get('Size (GB)')) if scheme.movie_file_include_size else None,
+            scheme)
+        # Guard against a stem-less name (".mkv"): sanitize now always
+        # returns a fallback, but the check keeps the invariant local.
+        if Path(new_file).stem and _differs(new_file, vf):
+            ops.extend(_companion_ops(folder_path / vf, vf, new_file))
+            ops.append(Op("move", folder_path / vf, folder_path / new_file))
 
 
 def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
@@ -219,9 +276,25 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
             old_folder = _clean(row.get('Folder Name'))
             if not old_folder:
                 continue
+            if old_folder == '.':
+                # A recursive scan records files sitting directly in the
+                # movies root under '.'. Their own renames are handled from
+                # the Video Files column below, but treating '.' as a folder
+                # to rename means planning a move of the library root into a
+                # subdirectory of itself — it fails with EINVAL, and until it
+                # does it sits in the confirmation preview looking terrifying.
+                _plan_movie_files(row, movies_path, scheme, llm_results,
+                                  custom_patterns, ops)
+                continue
             folder_path = movies_path / old_folder
 
-            p = parse_name(old_folder, custom_patterns=custom_patterns)
+            # These rows are known to be movies, so say so. Left to guess,
+            # guessit reads the trailing number of a title like "Blade Runner
+            # 2049 (2017)" — which is our own output — as an episode number,
+            # and the second run renames the file to "Blade Runner (2017)".
+            # "300 (2006) [1080p].mkv" grew a new "() [1080p]" every run.
+            p = parse_name(old_folder, kind_hint="movie",
+                           custom_patterns=custom_patterns)
             if old_folder in llm_results:
                 p = _parsed_from_llm(llm_results[old_folder], p)
             if get_val(row, 'Title Fixed', ''):
@@ -235,37 +308,8 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
                 p.quality = quality
 
             # Files first (children before parent).
-            # Support both pipe (new scanner) and comma (legacy scanner) delimiters.
-            vf_str = str(row.get('Video Files') or '')
-            delim = '|' if '|' in vf_str else ','
-            for vf in vf_str.split(delim):
-                vf = vf.strip()
-                if not vf:
-                    continue
-                ext = Path(vf).suffix
-                pf = parse_name(vf, custom_patterns=custom_patterns)
-                if vf in llm_results:
-                    pf = _parsed_from_llm(llm_results[vf], pf)
-                if get_val(row, 'Title Fixed', ''):
-                    pf.title = get_val(row, 'Title Fixed', '')
-                # Honor Fixed-column overrides on file-level parses too,
-                # so Year Fixed / Quality Fixed apply uniformly to both
-                # folder and file renames.
-                if get_val(row, 'Year Fixed', ''):
-                    pf.year = _safe_int_year(get_val(row, 'Year Fixed', ''))
-                if get_val(row, 'Quality Fixed', 'Quality'):
-                    pf.quality = get_val(row, 'Quality Fixed', 'Quality')
-                pf.year = pf.year or p.year
-                pf.quality = pf.quality or p.quality
-                new_file = build_movie_file_name(
-                    pf, ext,
-                    _clean(row.get('Size (GB)')) if scheme.movie_file_include_size else None,
-                    scheme)
-                # Guard against a stem-less name (".mkv"): sanitize now always
-                # returns a fallback, but the check keeps the invariant local.
-                if Path(new_file).stem and _differs(new_file, vf):
-                    ops.extend(_companion_ops(folder_path / vf, vf, new_file))
-                    ops.append(Op("move", folder_path / vf, folder_path / new_file))
+            _plan_movie_files(row, folder_path, scheme, llm_results,
+                              custom_patterns, ops, folder_parse=p)
 
             folder_fixed = _clean(row.get('Folder Fixed'))
             # Spreadsheet overrides were previously taken verbatim, so a user
