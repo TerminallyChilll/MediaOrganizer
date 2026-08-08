@@ -1024,29 +1024,61 @@ def run_update() -> bool:
     everything.
     """
     before = update.head_revision()
-    code = update.run_update()
-    if code != 0:
-        return False
-    update.begin_background_check(force=True)
-    return update.head_revision() != before
+    update.run_update()
+    moved = update.head_revision() != before
+    if moved:
+        update.begin_background_check(force=True)
+    # Deliberately not keyed on the exit code: a pull that succeeded and a
+    # dependency install that then failed is a non-zero exit *and* new files
+    # on disk. Staying in the menu there is the worst of both.
+    return moved
+
+
+def _start_update_check() -> None:
+    """Kick off the update check. Never lets it stop the app from starting."""
+    try:
+        update.begin_background_check()
+        if update.wait_for_cache(2.0) is None:
+            # Nothing remembered from a previous launch (a fresh install, or
+            # the first run after the cache was cleared): wait a moment so the
+            # very first launch is the one that tells you an update exists.
+            update.wait_for_check(2.0)
+    except Exception:
+        pass                    # an update check is never worth a failed launch
+
+
+def _update_notice(shown_already: bool) -> str:
+    """The full notice the first time, a one-liner on every redraw after.
+
+    Fourteen lines between the header and the menu, every single time you
+    come back from a task, stops being information and becomes wallpaper.
+    """
+    try:
+        status = update.latest_status()
+        if status is None or not status.update_available:
+            return ''
+        if not shown_already:
+            return update.banner(status)
+        plural = '' if status.behind == 1 else 's'
+        return (f"\n  [!] Update available ({status.behind} commit{plural} "
+                f"behind) - press [U] to install it.")
+    except Exception:
+        return ''
 
 
 def run_wizard() -> None:
     from . import __version__
-    update.begin_background_check()
-    if update.latest_status() is None:
-        # Nothing remembered from a previous launch (a fresh install, or the
-        # first run after the cache was cleared): wait a moment so the very
-        # first launch is the one that tells you an update exists.
-        update.wait_for_check(2.0)
+    _start_update_check()
+    notice_shown = False
     while True:
         try:
             print("\n" + "=" * 70)
             print(f"MEDIA ORGANIZER v{__version__}")
             print("=" * 70)
-            notice = update.banner()
+            notice = _update_notice(notice_shown)
             if notice:
                 print(notice)
+                notice_shown = True
             print("""
   [1] Clean file names        (scan -> preview -> rename)
   [2] Organize TV structure   (loose episodes -> Season folders)
@@ -1141,7 +1173,12 @@ def main() -> None:
             except Exception:
                 pass
 
-    parser = argparse.ArgumentParser(description="Media Organizer")
+    # No abbreviations: run.py dispatches --update/--version before the
+    # dependency install, and it cannot resolve prefixes the way argparse
+    # does. Rejecting "--upd" in both places beats one honouring it and
+    # the other silently ignoring it.
+    parser = argparse.ArgumentParser(description="Media Organizer",
+                                     allow_abbrev=False)
     parser.add_argument('--action', choices=['scan', 'organize',
                                              'organize-movies', 'rename',
                                              'full', 'inventory'])

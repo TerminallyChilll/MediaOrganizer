@@ -77,7 +77,12 @@ touched.
 
 Like every other flow in this app, it asks before it changes anything. If there
 is no terminal to ask (a cron job, a script, `--update < /dev/null`) it stops
-and tells you to opt in with `--yes` rather than deciding for you.
+and tells you to opt in with `--yes` rather than deciding for you. Ctrl-C or
+Ctrl-D at the prompt means "no".
+
+For scripting: `--update` exits `0` when it updated or was already current,
+and non-zero when it refused, the pull failed, or the code came down but the
+dependency install did not.
 
 **Notes**
 - Updating needs `git` and an install made with `git clone`, in a folder that

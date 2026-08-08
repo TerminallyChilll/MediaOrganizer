@@ -202,6 +202,18 @@ def check_version() -> tuple[str, str]:
     with no network is not broken either.
     """
     from . import update
+    if update.checks_disabled():
+        # MEDIAORG_NO_UPDATE_CHECK is a promise that this app does not reach
+        # the network on its own. The doctor is not an exception to it — a
+        # diagnostic that quietly breaks the guarantee it is reporting on is
+        # worse than one that says less. Local comparison only.
+        st = update.check(fetch=False)
+        note = ("Update checks are off (MEDIAORG_NO_UPDATE_CHECK=1) — "
+                "not contacting github.com.")
+        if st.state == update.BEHIND:
+            return _warn(f"{note}\n  Against what was last fetched: "
+                         f"{st.behind} commit(s) behind {st.upstream}.")
+        return _ok(note)
     st = update.check_and_cache(fetch=True)
     if st.state == update.UNKNOWN:
         return _warn(f"Could not check for updates: {st.reason}"

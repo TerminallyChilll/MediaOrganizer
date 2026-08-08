@@ -8,7 +8,9 @@ opinion about what git says, and a mocked git would only test the opinion.
 import json
 import shutil
 import subprocess
+import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -29,6 +31,17 @@ def isolated_background_state():
     update.reset_background_state()
     yield
     update.reset_background_state()
+
+
+def _quiesce():
+    """Wait for the check thread to exit before the scratch repo goes away.
+
+    The thread is a daemon, so nothing else stops it: without this an
+    in-flight check outlives the fixture that pointed ``app_dir`` at a
+    temporary clone and runs its next git command — a real fetch — against
+    the developer's own repository.
+    """
+    assert update.join_background(30), "background update check did not finish"
 
 
 @pytest.fixture
@@ -57,7 +70,10 @@ def repos(tmp_path, monkeypatch):
     monkeypatch.setattr(update, "app_dir", lambda: clone)
     monkeypatch.delenv("MEDIAORG_NO_UPDATE_CHECK", raising=False)
     monkeypatch.delenv("MEDIAORG_UPDATE_INTERVAL", raising=False)
-    return seed, clone
+    yield seed, clone
+    # Teardown runs before monkeypatch unwinds app_dir, which is the whole
+    # point: the thread must be gone while it still points at the clone.
+    _quiesce()
 
 
 def _push_commit(seed, message="new work", path="run.py", body=None):
@@ -216,7 +232,7 @@ def test_fresh_cache_skips_the_network(repos, monkeypatch):
     monkeypatch.setattr(update, "check",
                         lambda **kw: called.append(kw) or update.UpdateStatus())
     update.begin_background_check()
-    time.sleep(0.2)
+    _quiesce()                       # deterministic: no wall-clock guessing
     assert called == []
     assert update.latest_status().state == update.CURRENT
 
@@ -229,11 +245,7 @@ def test_stale_cache_triggers_a_refresh(repos):
     _push_commit(seed, "found on refresh")
 
     update.begin_background_check()
-    for _ in range(100):                              # the thread is daemonic
-        if (update.latest_status() or stale).state == update.BEHIND:
-            break
-        time.sleep(0.1)
-    assert update.latest_status().state == update.BEHIND
+    assert update.wait_for_check(30).state == update.BEHIND
 
 
 def test_offline_check_does_not_overwrite_a_good_cached_answer(repos, monkeypatch):
@@ -246,7 +258,7 @@ def test_offline_check_does_not_overwrite_a_good_cached_answer(repos, monkeypatc
     monkeypatch.setattr(update, "check", lambda **kw: update.UpdateStatus(
         state=update.UNKNOWN, reason="could not reach the remote"))
     update.begin_background_check()
-    time.sleep(0.3)
+    _quiesce()
     # The remembered "you are behind" survives a flight-mode launch.
     assert update.load_cache().state == update.BEHIND
     assert update.latest_status().state == update.BEHIND
@@ -519,3 +531,341 @@ def test_declining_the_confirmation_changes_nothing(repos, monkeypatch):
 
     assert update.run_update() == 0
     assert (clone / "run.py").read_text() == "print('v1')\n"
+
+
+# --- what a failed git call is allowed to mean --------------------------------
+
+def test_a_failed_comparison_is_not_reported_as_up_to_date(repos, monkeypatch):
+    """(0, 0) means "no difference"; a failed rev-list means "I don't know".
+    Conflating them hides the very update that would repair a broken clone."""
+    monkeypatch.setattr(update, "local_commits_behind", lambda upstream: None)
+    st = update.check(fetch=True)
+    assert st.state == update.UNKNOWN
+    assert "could not compare" in st.reason
+    assert update.banner(st) == ""
+
+
+def test_rev_list_failure_surfaces_as_none(repos):
+    assert update.local_commits_behind("origin/no-such-branch-here") is None
+
+
+def test_git_env_wins_over_an_inherited_askpass(monkeypatch):
+    """An inherited GIT_ASKPASS is the case that hangs — a GUI prompt on an
+    unattended box — so ours must overwrite it, not defer to it."""
+    monkeypatch.setenv("GIT_ASKPASS", "/usr/bin/some-gui-prompter")
+    monkeypatch.setenv("SSH_ASKPASS", "/usr/bin/some-gui-prompter")
+    env = update._git_env()
+    assert env["GIT_ASKPASS"] == ""
+    assert env["SSH_ASKPASS"] == ""
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_git_env_drops_repo_redirecting_variables(monkeypatch):
+    """GIT_DIR/GIT_WORK_TREE override cwd, which would send every command —
+    including the pull — at a repository that is not this clone."""
+    monkeypatch.setenv("GIT_DIR", "/somewhere/else/.git")
+    monkeypatch.setenv("GIT_WORK_TREE", "/somewhere/else")
+    monkeypatch.setenv("GIT_INDEX_FILE", "/somewhere/else/index")
+    env = update._git_env()
+    assert "GIT_DIR" not in env
+    assert "GIT_WORK_TREE" not in env
+    assert "GIT_INDEX_FILE" not in env
+
+
+def test_an_inherited_git_dir_does_not_redirect_the_check(repos, tmp_path,
+                                                          monkeypatch):
+    elsewhere = tmp_path / "elsewhere"
+    _git(tmp_path, "init", "--initial-branch=main", str(elsewhere))
+    monkeypatch.setenv("GIT_DIR", str(elsewhere / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(elsewhere))
+    # Still measuring the clone, not the repository the environment names.
+    assert update.check(fetch=True).state == update.CURRENT
+
+
+# --- a cache is a file anything can scribble in -------------------------------
+
+def test_an_ill_typed_cache_is_rejected_not_believed(repos):
+    """`{"behind": "5"}` used to crash the wizard on launch, before the menu
+    was drawn, on every single run until the file was deleted by hand."""
+    _, clone = repos
+    (clone / update.CACHE_NAME).write_text(json.dumps(
+        {"state": "behind", "behind": "5", "upstream": "origin/main"}))
+    assert update.load_cache() is None
+    assert update.banner(update.UpdateStatus()) == ""
+
+
+def test_a_rejected_cache_is_removed_so_it_cannot_recur(repos):
+    _, clone = repos
+    (clone / update.CACHE_NAME).write_text(json.dumps({"checked_at": None}))
+    update.load_cache()
+    assert not (clone / update.CACHE_NAME).exists()
+
+
+def test_a_true_is_not_a_commit_count(repos):
+    _, clone = repos
+    (clone / update.CACHE_NAME).write_text(json.dumps({"behind": True}))
+    assert update.load_cache() is None
+
+
+def test_an_integer_timestamp_is_accepted_as_a_float(repos):
+    _, clone = repos
+    (clone / update.CACHE_NAME).write_text(json.dumps(
+        {"state": "current", "checked_at": 1700000000}))
+    loaded = update.load_cache()
+    assert loaded is not None and loaded.checked_at == 1700000000.0
+
+
+def test_an_unknown_is_never_written_to_the_cache(repos):
+    _, clone = repos
+    update.save_cache(update.UpdateStatus(state=update.UNKNOWN, reason="offline"))
+    assert not (clone / update.CACHE_NAME).exists()
+
+
+# --- the launch thread does no work -------------------------------------------
+
+def test_begin_background_check_does_not_run_git_on_the_caller(repos, monkeypatch):
+    """Everything — cache read, checkout comparison, network — belongs to the
+    thread. The launch path promises to return immediately, so it must."""
+    callers = []
+    real_git = update._git
+
+    def recording_git(*args, **kw):
+        callers.append(threading.current_thread().name)
+        return real_git(*args, **kw)
+
+    monkeypatch.setattr(update, "_git", recording_git)
+    update.begin_background_check()
+    caller_ran_git = [n for n in callers if n == threading.current_thread().name]
+    assert caller_ran_git == []
+    _quiesce()
+    assert callers, "the thread should have done the work instead"
+
+
+def test_waiting_for_the_cache_returns_at_once_when_nothing_is_running(repos):
+    started = time.monotonic()
+    assert update.wait_for_cache(30) is None
+    assert time.monotonic() - started < 1
+
+
+# --- pip ----------------------------------------------------------------------
+
+def test_pip_is_bounded_and_cannot_ask_questions(repos, monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(kwargs)
+        seen['cmd'] = cmd
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(update.subprocess, "run", fake_run)
+    assert update._pip_install(Path("requirements.txt")) is True
+    assert seen['stdin'] is subprocess.DEVNULL      # pip cannot stop for input
+    assert seen['timeout'] == update.PIP_TIMEOUT    # ...or run forever
+
+
+def test_pip_timeout_is_reported_not_retried(repos, monkeypatch, capsys):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        raise subprocess.TimeoutExpired(cmd, kwargs.get('timeout', 0))
+
+    monkeypatch.setattr(update.subprocess, "run", fake_run)
+    monkeypatch.setattr(update, "_in_virtualenv", lambda: False)
+    assert update._pip_install(Path("requirements.txt")) is False
+    assert len(calls) == 1                          # no --user retry after a hang
+    assert "exceeded" in capsys.readouterr().out
+
+
+def test_no_user_retry_inside_a_virtualenv(repos, monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        raise subprocess.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr(update.subprocess, "run", fake_run)
+    monkeypatch.setattr(update, "_in_virtualenv", lambda: True)
+    assert update._pip_install(Path("requirements.txt")) is False
+    assert len(calls) == 1
+    assert not any("--user" in c for c in calls)    # pip refuses it in a venv
+
+
+def test_dependencies_reinstall_is_decided_by_the_file_not_a_diff(repos, monkeypatch):
+    """Reading requirements.txt either side of the pull works even when the
+    commit range cannot be computed, and gets a deletion right."""
+    seed, _ = repos
+    calls = []
+    monkeypatch.setattr(update, "_pip_install", lambda req: calls.append(req) or True)
+    monkeypatch.setattr(update, "_git", _failing_diff(update._git))
+
+    _push_commit(seed, "needs a newer pandas", path="requirements.txt",
+                 body="pandas>=2.3\n")
+    assert update.run_update(assume_yes=True) == 0
+    assert len(calls) == 1
+
+
+def _failing_diff(real):
+    def wrapper(*args, **kw):
+        if args and args[0] == "diff":
+            return 1, "", "simulated: git diff unavailable"
+        return real(*args, **kw)
+    return wrapper
+
+
+def test_a_failed_dependency_install_is_not_reported_as_success(repos, monkeypatch,
+                                                                capsys):
+    seed, _ = repos
+    monkeypatch.setattr(update, "_pip_install", lambda req: False)
+    _push_commit(seed, "needs a newer pandas", path="requirements.txt",
+                 body="pandas>=2.3\n")
+
+    code = update.run_update(assume_yes=True)
+    out = capsys.readouterr().out
+    assert code == 1                       # the caller can tell something broke
+    assert "[OK] Updated" not in out       # ...and so can the user
+    assert "dependency install failed" in out
+
+
+# --- the confirmation ---------------------------------------------------------
+
+def test_ctrl_d_at_the_confirmation_is_a_no_not_a_traceback(repos, monkeypatch,
+                                                            capsys):
+    seed, clone = repos
+    _push_commit(seed, "the fix", body="print('v2')\n")
+    monkeypatch.setattr(update, "_can_prompt", lambda: True)
+
+    def eof(*a):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", eof)
+    assert update.run_update() == 0
+    assert (clone / "run.py").read_text() == "print('v1')\n"
+    assert "Cancelled" in capsys.readouterr().out
+
+
+def test_ctrl_c_at_the_confirmation_is_a_no_not_a_traceback(repos, monkeypatch):
+    seed, clone = repos
+    _push_commit(seed, "the fix", body="print('v2')\n")
+    monkeypatch.setattr(update, "_can_prompt", lambda: True)
+
+    def interrupt(*a):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", interrupt)
+    assert update.run_update() == 0
+    assert (clone / "run.py").read_text() == "print('v1')\n"
+
+
+def test_the_dirty_tree_advice_actually_clears_a_staged_change(repos, capsys):
+    """`git checkout -- .` restores from the index, so it leaves staged
+    changes in place — and `git status --porcelain` still calls them dirty."""
+    seed, clone = repos
+    _push_commit(seed, "the fix", body="print('v2')\n")
+    (clone / "run.py").write_text("print('mine')\n")
+    _git(clone, "add", "run.py")                    # staged, not just modified
+
+    assert update.run_update(assume_yes=True) == 1
+    out = capsys.readouterr().out
+    assert "git checkout -- ." not in out           # would not have worked
+    assert "git reset --hard" in out
+
+    _git(clone, "reset", "--hard")                  # the advice, followed
+    assert update.working_tree_changes() == []
+    assert update.run_update(assume_yes=True) == 0  # and now it goes through
+
+
+# --- upstreams that name no remote --------------------------------------------
+
+def test_an_upstream_on_another_local_branch_is_refused(repos):
+    """`git pull --ff-only main ""` is what splitting that on '/' produces."""
+    _, clone = repos
+    _git(clone, "branch", "release")
+    _git(clone, "checkout", "-b", "work")
+    _git(clone, "branch", "--set-upstream-to=release")
+
+    st = update.check(fetch=True)
+    assert st.state == update.UNKNOWN
+    assert "not a remote branch" in st.reason
+    assert update.run_update(assume_yes=True) == 1
+
+
+def test_split_upstream_rejects_what_it_cannot_pull_from():
+    assert update.split_upstream("origin/main") == ("origin", "main")
+    assert update.split_upstream("upstream/feature/x") == ("upstream", "feature/x")
+    assert update.split_upstream("main") is None
+    assert update.split_upstream("origin/") is None
+    assert update.split_upstream("") is None
+
+
+# --- text from the remote -----------------------------------------------------
+
+def test_commit_subjects_cannot_repaint_the_terminal(repos):
+    """Subjects are remote-controlled, printed by --check-update and the
+    doctor, and replayed from the cache long afterwards."""
+    seed, _ = repos
+    _push_commit(seed, "innocent\x1b[2J\x1b[H FORGED: up to date")
+
+    st = update.check(fetch=True)
+    assert st.commits
+    assert "\x1b" not in st.commits[0]
+    assert "\x1b" not in update.describe(st)
+
+
+def test_a_hostile_subject_cannot_pad_the_report_indefinitely(repos):
+    seed, _ = repos
+    _push_commit(seed, "x" * 5000)
+    st = update.check(fetch=True)
+    assert len(st.commits[0]) <= 210
+
+
+# --- the CLI ------------------------------------------------------------------
+
+def test_dispatch_declines_argv_that_is_not_its_business():
+    assert update.dispatch_cli(["--action", "scan"]) is None
+    assert update.dispatch_cli([]) is None
+
+
+def test_dispatch_rejects_junk_rather_than_ignoring_it(capsys):
+    assert update.dispatch_cli(["--version", "--nonsense"]) == 2
+    assert "Unrecognized argument" in capsys.readouterr().out
+
+
+def test_version_reports_the_installed_commit(repos, capsys):
+    assert update.dispatch_cli(["--version"]) == 0
+    out = capsys.readouterr().out
+    assert update.head_revision() in out
+
+
+# --- the kill switch is a promise ---------------------------------------------
+
+def test_the_doctor_respects_the_no_check_switch(repos, monkeypatch):
+    """MEDIAORG_NO_UPDATE_CHECK=1 is documented as "nothing is sent". A
+    diagnostic that fetches anyway breaks the guarantee it reports on."""
+    from mediaorg import doctor
+    seed, _ = repos
+    _push_commit(seed, "not to be discovered over the network")
+    monkeypatch.setenv("MEDIAORG_NO_UPDATE_CHECK", "1")
+
+    fetches = []
+    real_git = update._git
+
+    def recording_git(*args, **kw):
+        if args and args[0] == "fetch":
+            fetches.append(args)
+        return real_git(*args, **kw)
+
+    monkeypatch.setattr(update, "_git", recording_git)
+    status, message = doctor.check_version()
+    assert fetches == []
+    assert "MEDIAORG_NO_UPDATE_CHECK=1" in message
+
+
+def test_the_doctor_still_checks_when_the_switch_is_off(repos, monkeypatch):
+    from mediaorg import doctor
+    seed, _ = repos
+    _push_commit(seed, "a real update")
+    monkeypatch.delenv("MEDIAORG_NO_UPDATE_CHECK", raising=False)
+    status, message = doctor.check_version()
+    assert status == "WARN"
+    assert "1 commit behind" in message
