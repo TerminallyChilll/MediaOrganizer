@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from mediaorg import llm, wizard
+from mediaorg import llm, update, wizard
 from mediaorg.parse import load_custom_patterns, save_custom_patterns
 
 
@@ -392,3 +392,78 @@ def test_a_missing_parent_directory_is_created(tmp_path, monkeypatch):
     _drive(monkeypatch, ["a", "RARBG", "q"])
     wizard.run_custom_words()
     assert load_custom_patterns() == ["RARBG"]
+
+
+# --- Update notice in the menu -----------------------------------------------
+
+@pytest.fixture
+def quiet_update_check(monkeypatch):
+    """The menu kicks off a network check on entry; keep tests offline."""
+    monkeypatch.setattr(update, "begin_background_check", lambda **kw: None)
+    monkeypatch.setattr(update, "latest_status", lambda: None)
+
+
+def test_menu_is_silent_when_there_is_no_update(quiet_update_check, monkeypatch, capsys):
+    _drive(monkeypatch, ["0"])
+    wizard.run_wizard()
+    out = capsys.readouterr().out
+    assert "Update available" not in out
+    assert "[U] Update Media Organizer" in out      # the option is still offered
+
+
+def test_menu_shows_the_update_command_when_behind(quiet_update_check, monkeypatch, capsys):
+    monkeypatch.setattr(update, "latest_status", lambda: update.UpdateStatus(
+        state=update.BEHIND, behind=3, upstream="origin/main",
+        local="aaaaaaa", remote="bbbbbbb"))
+    _drive(monkeypatch, ["0"])
+    wizard.run_wizard()
+    out = capsys.readouterr().out
+    assert "3 commits behind origin/main" in out
+    assert "python run.py --update" in out
+
+
+def _fake_update(monkeypatch, revisions, code=0):
+    """Stand in for an update that moves HEAD through *revisions*."""
+    seen = iter(revisions)
+    monkeypatch.setattr(update, "head_revision", lambda: next(seen))
+    monkeypatch.setattr(update, "run_update", lambda **kw: code)
+
+
+def test_menu_u_runs_the_update_and_exits_when_it_pulled(quiet_update_check,
+                                                         monkeypatch, capsys):
+    """After a successful pull the files on disk no longer match the modules
+    this process imported, so the wizard must hand back to a fresh launch."""
+    _fake_update(monkeypatch, ["aaaaaaa", "bbbbbbb"])
+    _drive(monkeypatch, ["u"])                       # no "0" — it must exit itself
+    wizard.run_wizard()
+    assert "Exiting so the new version is loaded" in capsys.readouterr().out
+
+
+def test_menu_u_returns_to_the_menu_when_already_current(quiet_update_check,
+                                                         monkeypatch):
+    _fake_update(monkeypatch, ["aaaaaaa", "aaaaaaa"])
+    _drive(monkeypatch, ["U", "0"])                  # must still be here for the "0"
+    wizard.run_wizard()
+
+
+def test_menu_u_exits_even_when_the_local_refs_looked_up_to_date(
+        quiet_update_check, monkeypatch, capsys):
+    """A clone that has never fetched reads as up to date offline. The pull
+    still moves HEAD, so the decision to relaunch must come from HEAD, not
+    from a status measured before the fetch."""
+    monkeypatch.setattr(update, "check",
+                        lambda **kw: update.UpdateStatus(state=update.CURRENT))
+    _fake_update(monkeypatch, ["aaaaaaa", "bbbbbbb"])
+    _drive(monkeypatch, ["u"])
+    wizard.run_wizard()
+    assert "Exiting so the new version is loaded" in capsys.readouterr().out
+
+
+def test_menu_u_stays_put_when_the_update_was_refused(quiet_update_check,
+                                                      monkeypatch, capsys):
+    """A dirty work tree stops the update; nothing was pulled, so the wizard
+    keeps running rather than sending the user off to relaunch."""
+    _fake_update(monkeypatch, ["aaaaaaa"], code=1)   # HEAD read once, then no more
+    _drive(monkeypatch, ["u", "0"])
+    wizard.run_wizard()
+    assert "Exiting so the new version is loaded" not in capsys.readouterr().out

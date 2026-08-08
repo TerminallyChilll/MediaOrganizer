@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from . import excel, extfix, llm, scan
+from . import excel, extfix, llm, scan, update
 from .execute import (execute, journal_path, last_run_ops, list_runs,
                       pending_runs, recover, undo_last, undo_last_run,
                       undo_run, undo_session)
@@ -1010,12 +1010,43 @@ def _ask_excel_path() -> Path:
     return Path(name).resolve()
 
 
+def run_update() -> bool:
+    """Menu entry [U]: update the clone in place.
+
+    Returns True once the files on disk have moved on from the modules this
+    process already imported, so the caller can send the user back to a
+    fresh launch rather than run half-old code.
+
+    The answer comes from HEAD either side of the update, not from a status
+    read beforehand: an offline status can be measuring refs that were
+    already stale (a clone that has never fetched reads as up to date), and
+    would then report "nothing changed" for an update that changed
+    everything.
+    """
+    before = update.head_revision()
+    code = update.run_update()
+    if code != 0:
+        return False
+    update.begin_background_check(force=True)
+    return update.head_revision() != before
+
+
 def run_wizard() -> None:
+    from . import __version__
+    update.begin_background_check()
+    if update.latest_status() is None:
+        # Nothing remembered from a previous launch (a fresh install, or the
+        # first run after the cache was cleared): wait a moment so the very
+        # first launch is the one that tells you an update exists.
+        update.wait_for_check(2.0)
     while True:
         try:
             print("\n" + "=" * 70)
-            print("MEDIA ORGANIZER")
+            print(f"MEDIA ORGANIZER v{__version__}")
             print("=" * 70)
+            notice = update.banner()
+            if notice:
+                print(notice)
             print("""
   [1] Clean file names        (scan -> preview -> rename)
   [2] Organize TV structure   (loose episodes -> Season folders)
@@ -1026,13 +1057,19 @@ def run_wizard() -> None:
   [7] Inventory every file    (every file, media or not -> xlsx/csv/txt)
   [8] Custom word list        (add / remove words stripped from names)
   [9] Undo last run
+  [U] Update Media Organizer  (git pull + dependencies)
   [0] Exit
 
 Tip: type 'back' or 'b' at any prompt to return here.""")
-            choice = prompt_input("\nSelect an option (0-9): ")
+            choice = prompt_input("\nSelect an option (0-9, U): ")
 
             if choice == '0':
                 break
+            elif choice.lower() == 'u':
+                if run_update():
+                    print("\nExiting so the new version is loaded on the "
+                          "next launch.")
+                    break
             elif choice == '9':
                 run_list_runs()
                 if pending_runs(_journal_path()):
@@ -1127,7 +1164,25 @@ def main() -> None:
                              "(--action full makes several)")
     parser.add_argument('--force', action='store_true',
                         help="Undo even if a file was modified since, or out of order")
+    parser.add_argument('--update', action='store_true',
+                        help="Update to the latest version (git pull + dependencies)")
+    parser.add_argument('--check-update', action='store_true',
+                        help="Report how many commits behind this copy is, "
+                             "without changing anything")
+    parser.add_argument('--yes', '-y', action='store_true',
+                        help="Answer yes to the --update confirmation")
+    parser.add_argument('--version', '-V', action='store_true',
+                        help="Print the version and installed commit")
     args = parser.parse_args()
+
+    if args.version:
+        update.print_version()
+        return
+    if args.check_update:
+        print(update.describe(update.check_and_cache(fetch=True)))
+        return
+    if args.update:
+        sys.exit(update.run_update(assume_yes=args.yes, dry_run=args.dry_run))
 
     if args.list_runs:
         run_list_runs()

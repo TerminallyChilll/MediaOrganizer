@@ -5,6 +5,7 @@ __pycache__/
 .media_llm_config.json
 .media_renamer_config.json
 custom_strip_patterns.json
+.mediaorg_update_check.json
 *.xlsx
 *.csv
 .DS_Store

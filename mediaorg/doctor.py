@@ -72,6 +72,7 @@ def check_package_structure() -> tuple[str, str]:
         root / "mediaorg" / "parse.py",
         root / "mediaorg" / "llm.py",
         root / "mediaorg" / "extfix.py",
+        root / "mediaorg" / "update.py",
     ]
     missing = [str(p.relative_to(root)) for p in required if not p.exists()]
     if missing:
@@ -192,6 +193,30 @@ def fix_interrupted() -> tuple[str, str]:
     if not notes:
         return _ok("Nothing to recover")
     return _ok(f"Recovered {len(notes)} interrupted change(s)")
+
+
+def check_version() -> tuple[str, str]:
+    """Is this copy up to date with the branch it tracks?
+
+    Never a FAIL: an old-but-working install is not broken, and a laptop
+    with no network is not broken either.
+    """
+    from . import update
+    st = update.check_and_cache(fetch=True)
+    if st.state == update.UNKNOWN:
+        return _warn(f"Could not check for updates: {st.reason}"
+                     + (f"\n  {st.hint}" if st.hint else ""))
+    if st.state == update.BEHIND:
+        plural = "" if st.behind == 1 else "s"
+        return _warn(f"{st.behind} commit{plural} behind {st.upstream}.\n"
+                     f"  Update with:  python run.py --update")
+    if st.state == update.DIVERGED:
+        return _warn(f"Diverged from {st.upstream} "
+                     f"({st.ahead} local, {st.behind} remote commits) — "
+                     f"cannot fast-forward.")
+    if st.state == update.AHEAD:
+        return _ok(f"Up to date with {st.upstream}, plus {st.ahead} local commit(s)")
+    return _ok(f"Up to date with {st.upstream} ({st.local})")
 
 
 def check_stdout() -> tuple[str, str]:
@@ -382,6 +407,11 @@ def run_doctor(*, auto_fix: bool = False) -> int:
     # 8. Unicode output
     s, msg = check_stdout()
     report(s, "Terminal Unicode", msg)
+
+    # 9. Version / updates
+    from . import __version__
+    s, msg = check_version()
+    report(s, f"Version (v{__version__})", msg)
 
     # Summary
     print("\n" + "=" * 60)

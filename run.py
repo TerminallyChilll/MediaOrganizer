@@ -98,6 +98,25 @@ def main():
         auto = "--fix" in sys.argv
         sys.exit(run_doctor(auto_fix=auto))
 
+    # ── Version / update ──
+    # Handled before install_dependencies(): pulling a fix is exactly what you
+    # want to do when the dependency install is what's broken, and none of
+    # these touch pandas/guessit.
+    if "--version" in sys.argv or "-V" in sys.argv:
+        from mediaorg import update
+        update.print_version()
+        sys.exit(0)
+
+    if "--check-update" in sys.argv:
+        from mediaorg import update
+        print(update.describe(update.check_and_cache(fetch=True)))
+        sys.exit(0)
+
+    if "--update" in sys.argv:
+        from mediaorg import update
+        sys.exit(update.run_update(assume_yes="--yes" in sys.argv or "-y" in sys.argv,
+                                   dry_run="--dry-run" in sys.argv))
+
     install_dependencies()
     
     # Now import the actual application and run it
