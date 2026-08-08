@@ -669,3 +669,78 @@ def test_a_show_with_a_dump_folder_is_not_split_in_two(tmp_path):
     touch(tmp_path / "Show.S01E01.mkv")
     touch(tmp_path / "Downloads" / "Show.S01E02.mkv")
     assert find_show_roots(tmp_path) == [tmp_path]
+
+
+def test_a_bucket_named_other_does_not_hide_shows(tmp_path):
+    """"Other" is an ordinary catch-all bucket name, not a local-extras marker.
+
+    Treating it as one made the show search step over it, so every show
+    beneath "TV/Other/" was undiscoverable.
+    """
+    touch(tmp_path / "Other" / "Show" / "Season 1" / "Show.S01E01.mkv")
+    touch(tmp_path / "Drama" / "Show2" / "Season 1" / "S2.S01E01.mkv")
+    assert find_show_roots(tmp_path) == [tmp_path / "Drama" / "Show2",
+                                         tmp_path / "Other" / "Show"]
+
+
+def test_a_trailers_folder_is_still_not_a_show(tmp_path):
+    """The other names stay: a folder called Trailers holding an episode-coded
+    trailer must not be promoted to a show of its own."""
+    touch(tmp_path / "Show" / "Season 1" / "Show.S01E01.mkv")
+    touch(tmp_path / "Show" / "Trailers" / "Show.S01E01.Trailer.mkv")
+    assert find_show_roots(tmp_path) == [tmp_path / "Show"]
+    assert plan_season_structure(tmp_path / "Show").ops == []
+
+
+def test_one_unreadable_dir_does_not_suppress_unrelated_rmdirs(tmp_path, monkeypatch):
+    """A shared flag let one unreadable corner block every rmdir in the walk."""
+    season = tmp_path / "Season 1"
+    touch(season / "Disc 1" / "Show.S01E01.mkv")
+    (season / "Locked").mkdir()
+
+    real_scandir = os.scandir
+
+    def flaky_scandir(path=".", *args, **kwargs):
+        if os.path.basename(str(path)) == "Locked":
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", flaky_scandir)
+    plan = plan_season_structure(tmp_path)
+
+    rmdirs = {o.dst for o in plan.ops if o.kind == "rmdir"}
+    # "Disc 1" is emptied by this plan and is nowhere near the unreadable dir.
+    assert season / "Disc 1" in rmdirs
+    # The unreadable directory itself, and the season folder above it, are not
+    # known to be empty and must be left alone.
+    assert season / "Locked" not in rmdirs and season not in rmdirs
+
+
+def test_duplicate_season_rmdir_waits_until_it_is_really_empty(tmp_path):
+    """Step 1 emitted its rmdir unconditionally.
+
+    `place` only routes files it can identify, so a subdirectory holding a
+    placeable episode plus an unplaceable file survives the merge — and the
+    rmdir above it then fails with "Directory not empty", on this run and
+    every run after it.
+    """
+    touch(tmp_path / "Season 2" / "Show.S02E01.mkv")
+    touch(tmp_path / "S02" / "keep" / "Show.S02E02.mkv")
+    touch(tmp_path / "S02" / "keep" / "notes.txt")
+
+    plan = plan_season_structure(tmp_path)
+    assert [o.dst for o in plan.ops if o.kind == "rmdir"] == []
+    apply_plan(plan)
+    assert (tmp_path / "Season 2" / "Show.S02E02.mkv").exists()
+    assert (tmp_path / "S02" / "keep" / "notes.txt").exists()
+
+
+def test_duplicate_season_rmdir_still_happens_when_it_does_empty(tmp_path):
+    """The ordinary case must keep cleaning up after itself."""
+    touch(tmp_path / "Season 2" / "Show.S02E01.mkv")
+    touch(tmp_path / "S02" / "keep" / "Show.S02E02.mkv")
+
+    plan = plan_season_structure(tmp_path)
+    apply_plan(plan)
+    assert not (tmp_path / "S02").exists()
+    assert (tmp_path / "Season 2" / "Show.S02E02.mkv").exists()

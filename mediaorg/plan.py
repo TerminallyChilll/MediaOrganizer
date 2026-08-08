@@ -132,8 +132,14 @@ SEASON_LIKE_PATTERN = re.compile(r'^([^\-\|.]+?)\s+[Ss](\d{1,4})(?:\s*\(?\d{4}\)
 # disagree about what counts as a show.
 SPECIALS_FOLDER_PATTERN = re.compile(
     r'^(?:specials?|extras?|featurettes?|bonus|trailers?|interviews?'
-    r'|deleted[ ._-]?scenes|behind[ ._-]?the[ ._-]?scenes|other)$',
+    r'|deleted[ ._-]?scenes|behind[ ._-]?the[ ._-]?scenes)$',
     re.IGNORECASE)
+# Note: "Other" is deliberately NOT in that list, despite being one of the
+# names media servers use for local extras. This pattern also decides what the
+# show search treats as a show's own content and steps over, so a catch-all
+# bucket named "TV/Other/" made every show beneath it undiscoverable. The rest
+# of the names are safe because a folder called "Trailers" or "Specials" is
+# almost never a show, whereas "Other" is an ordinary bucket name.
 
 _SXXEYY = re.compile(_SE_CORE)
 _NXN = re.compile(r'(?<!\d)(\d{1,2})[xX](\d{1,2})(?!\d)')
@@ -423,7 +429,20 @@ def _lift_media(source_dir: Path, dest_for, *, include_root: bool) -> list[Op]:
     # os.walk swallows every scandir failure when onerror is None, so an
     # unreadable directory would silently look empty — and an empty directory
     # is exactly what makes the parent look rmdir-able.
-    unreadable: list[str] = []
+    # Which directories could not be read, so their parents can be excluded
+    # from rmdir individually. A single shared flag would let one unreadable
+    # corner of the tree suppress every rmdir in the walk, leaving unrelated
+    # emptied directories behind.
+    unreadable: set[Path] = set()
+    unreadable_unknown = False
+
+    def note_unreadable(err: OSError) -> None:
+        nonlocal unreadable_unknown
+        if getattr(err, "filename", None):
+            unreadable.add(Path(err.filename))
+        else:
+            unreadable_unknown = True   # can't localise it: stay cautious
+
     # Walked top-down so junk directories can be pruned from `dirnames` before
     # they are descended into, then reversed for bottom-up processing. Walking
     # bottom-up directly gives no chance to prune: os.walk would traverse the
@@ -431,8 +450,8 @@ def _lift_media(source_dir: Path, dest_for, *, include_root: bool) -> list[Op]:
     # then lift its thumbnails into the library, and for .trashes /
     # $recycle.bin it would resurrect deleted files.
     walked = []
-    for dirpath, dirnames, filenames in os.walk(
-            source_dir, onerror=lambda err: unreadable.append(str(err))):
+    for dirpath, dirnames, filenames in os.walk(source_dir,
+                                                onerror=note_unreadable):
         dirnames[:] = [d for d in dirnames if not is_junk_dir(d)]
         walked.append((dirpath, list(dirnames), filenames))
     walked.reverse()
@@ -453,9 +472,12 @@ def _lift_media(source_dir: Path, dest_for, *, include_root: bool) -> list[Op]:
 
         leftover_dirs = [d for d in dirnames
                          if not is_junk_dir(d) and current / d not in emptied]
-        # An unreadable subdirectory is not known to be empty, so never plan a
-        # rmdir that depends on it.
-        if not staying and not leftover_dirs and not unreadable:
+        # An unreadable directory is not known to be empty, so never plan a
+        # rmdir for it or for anything above it — but leave the rest of the
+        # tree alone.
+        blocked = unreadable_unknown or any(
+            path == current or current in path.parents for path in unreadable)
+        if not staying and not leftover_dirs and not blocked:
             ops.append(Op("rmdir", None, current))
             emptied.add(current)
     return ops
@@ -558,10 +580,18 @@ def plan_season_structure(show_path: Path) -> Plan:
             if extra == canon:
                 continue
             extra_path = show_path / extra
+            emptied_completely = True
             for child in _child_dirs(extra_path):
                 lifted = _lift_media(child, place, include_root=True)
                 if any(o.kind == "move" for o in lifted):
                     ops.extend(lifted)
+                    # `place` only routes what it can identify, so a child
+                    # holding a placeable episode *and* an unplaceable file
+                    # keeps the latter and survives. Only a lift that plans
+                    # the child's own rmdir has actually cleared it out.
+                    if not any(o.kind == "rmdir" and o.dst == child
+                               for o in lifted):
+                        emptied_completely = False
                 else:
                     ops.append(Op("move", child, show_path / canon / child.name))
             try:
@@ -573,7 +603,10 @@ def plan_season_structure(show_path: Path) -> Plan:
             for name in files_in_extra:
                 ops.append(Op("move", extra_path / name,
                               show_path / canon / name))
-            ops.append(Op("rmdir", None, extra_path))
+            # rmdir is empty-only: planning one for a directory that still has
+            # content just fails, and goes on failing identically every run.
+            if emptied_completely:
+                ops.append(Op("rmdir", None, extra_path))
 
     # 2. Flatten everything nested inside season folders, at any depth. A
     #    season folder should hold episodes, not a directory tree: per-episode
