@@ -650,3 +650,22 @@ def test_stray_root_folder_with_shows_two_levels_down(tmp_path):
     touch(tmp_path / "Stray.S01E05.WEB" / "ep.mkv")
     assert find_show_roots(tmp_path) == [tmp_path / "Drama" / "Breaking Bad",
                                          tmp_path / "Drama" / "The Office"]
+
+
+def test_root_that_is_a_show_still_finds_shows_beside_it(tmp_path):
+    """A library root can be a show *and* hold other shows.
+
+    Returning as soon as the root qualified dropped those siblings silently:
+    never organized, and no row in the spreadsheet either.
+    """
+    touch(tmp_path / "Show.S01E01.mkv")
+    touch(tmp_path / "Other Show" / "Season 1" / "Other.S01E01.mkv")
+    assert find_show_roots(tmp_path) == [tmp_path, tmp_path / "Other Show"]
+
+
+def test_a_show_with_a_dump_folder_is_not_split_in_two(tmp_path):
+    """The other side of that rule: only a child with season folders of its
+    own is a separate show. A child holding loose episodes is a dump folder."""
+    touch(tmp_path / "Show.S01E01.mkv")
+    touch(tmp_path / "Downloads" / "Show.S01E02.mkv")
+    assert find_show_roots(tmp_path) == [tmp_path]

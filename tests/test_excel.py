@@ -424,3 +424,34 @@ def test_wrapper_dirs_on_the_way_to_a_show_are_not_reported_as_gaps(tmp_path):
 
     rows = scan_tv(tv)
     assert [r["Show Folder"] for r in rows] == ["Genre/Show"]
+
+
+def test_scan_sees_episodes_in_a_dump_subfolder(tmp_path):
+    """The scanner and the organizer must agree about what a show contains.
+
+    scan_tv only walked top-level files and season-ish folders, so an episode
+    in "Disc 1" was invisible — while the organizer would happily move it. A
+    scan-then-rename run (menu [1] or [5], no organize step) skipped it, and
+    the recursive fallback never fired because the show had other episodes.
+    """
+    tv = tmp_path / "TV"
+    (tv / "Show" / "Season 1").mkdir(parents=True)
+    (tv / "Show" / "Season 1" / "Show.S01E01.mkv").write_text("x")
+    (tv / "Show" / "Disc 1").mkdir(parents=True)
+    (tv / "Show" / "Disc 1" / "Show.S01E02.mkv").write_text("x")
+
+    files = {r["Episode File"] for r in scan_tv(tv)}
+    assert files == {"Season 1/Show.S01E01.mkv", "Disc 1/Show.S01E02.mkv"}
+
+
+def test_a_nested_show_is_not_absorbed_into_its_parent(tmp_path):
+    """A subfolder with season folders of its own is a show, not a dump."""
+    tv = tmp_path / "TV"
+    (tv / "Show").mkdir(parents=True)
+    (tv / "Show" / "Show.S01E01.mkv").write_text("x")
+    (tv / "Show" / "Other Show" / "Season 1").mkdir(parents=True)
+    (tv / "Show" / "Other Show" / "Season 1" / "Other.S01E01.mkv").write_text("x")
+
+    rows = {r["Show Folder"]: r["Episode File"] for r in scan_tv(tv)}
+    assert rows == {"Show": "Show.S01E01.mkv",
+                    "Show/Other Show": "Season 1/Other.S01E01.mkv"}

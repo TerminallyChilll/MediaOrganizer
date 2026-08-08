@@ -280,17 +280,27 @@ def find_show_roots(library_root: Path,
     library_root = Path(library_root)
 
     def collect(directory: Path, depth: int) -> list[Path]:
-        if _has_own_season_content(directory):
-            return [directory]
-        if depth > max_depth:
-            return []
+        own = _has_own_season_content(directory)
         below: list[Path] = []
-        for child in _child_dirs(directory):
-            # Season/specials/episode folders are this directory's own
-            # content, so never treat them as candidate shows.
-            if _is_show_marker_dir(child.name):
-                continue
-            below.extend(collect(child, depth + 1))
+        if depth <= max_depth:
+            for child in _child_dirs(directory):
+                # Season/specials/episode folders are this directory's own
+                # content, so never treat them as candidate shows.
+                if _is_show_marker_dir(child.name):
+                    continue
+                found = collect(child, depth + 1)
+                if own:
+                    # This directory is already a show, so most of what is
+                    # inside it belongs to it. Only a child with season
+                    # folders of its own is unambiguously a separate show; one
+                    # holding just loose episodes is a dump folder to tidy up.
+                    found = [p for p in found if has_season_structure(p)]
+                below.extend(found)
+        if own:
+            # A library root can be a show *and* hold other shows beside it.
+            # Returning early here dropped those siblings silently — they were
+            # never organized and never even appeared in the spreadsheet.
+            return [directory] + below
         if below:
             return below
         return [directory] if folder_has_episodes_or_seasons(directory) else []

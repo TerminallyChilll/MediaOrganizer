@@ -14,7 +14,7 @@ from tqdm import tqdm
 from .parse import (VIDEO_EXTS, is_junk_dir, is_junk_name, is_media_file,
                     parse_name)
 from .plan import (SPECIALS_FOLDER_PATTERN, extract_season_episode,
-                   find_show_roots)
+                   find_show_roots, has_season_structure)
 
 # Anchored. The old unanchored substring search matched "Seasoning Show",
 # "S1" and "s0", and since this pattern also drives show-folder re-parenting a
@@ -145,6 +145,33 @@ def _scan_show_episodes(show_path: Path,
                     if not specials:
                         continue
                     s, ep = 0, 0  # Specials/Extras: season 0 by convention
+                full = Path(dirpath) / f
+                episodes.append({
+                    'season': s, 'episode': ep,
+                    'rel_path': _rel(full, show_path),
+                    'size': round(full.stat().st_size / 1024 ** 3, 2)})
+
+    # Episodes dumped in a subfolder that is not season-ish at all — "Disc 1",
+    # "Downloads". The organizer lifts these into their season, so the scanner
+    # has to see them too: otherwise a scan-then-rename run (menu [1] or [5],
+    # with no organize step) silently skips them, and the two halves of the
+    # tool disagree about what the library contains. A subfolder with season
+    # folders of its own is a nested show and stays out of this show's rows,
+    # the same rule the organizer applies before lifting anything.
+    for entry in entries:
+        if not entry.is_dir(follow_symlinks=False):
+            continue
+        if _is_seasonish(entry.name) or is_junk_dir(entry.name):
+            continue
+        if has_season_structure(Path(entry.path)):
+            continue
+        for dirpath, _dirnames, filenames in _walk(Path(entry.path)):
+            for f in sorted(filenames):
+                if not is_media_file(f):
+                    continue
+                s, ep, _date = _episode_key(f, custom_patterns)
+                if s is None:
+                    continue
                 full = Path(dirpath) / f
                 episodes.append({
                     'season': s, 'episode': ep,
