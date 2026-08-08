@@ -67,16 +67,35 @@ def load_llm_config():
             config[key] = value
     return config
 
+def strip_env_values(config):
+    """Drop entries the environment is currently supplying.
+
+    load_llm_config() overlays every non-empty environment value into the dict
+    it returns, so any caller that saves that dict back would copy those values
+    into the file. With OPENAI_API_KEY set, configuring Ollama — or typing a
+    Gemini key — wrote the OpenAI key to plaintext, which is the opposite of
+    the guarantee this module makes.
+
+    Only an exact match is dropped: a value the user chose interactively is
+    theirs to keep even when the environment also sets that variable.
+    """
+    return {k: v for k, v in config.items()
+            if not (k in ENV_KEYS and env_value(k) == v)}
+
+
 def save_llm_config(config):
     # This file holds cloud API keys. Create it 0600 rather than writing it at
     # the default umask and chmod-ing after: that leaves a window where the key
     # is world-readable, and the chmod could race a change of directory. The
     # mode argument is ignored on Windows, where the file inherits directory ACLs.
+    #
+    # Filtering happens here rather than at the call sites so the guarantee
+    # cannot be lost by a future caller that forgets about it.
     try:
         path = llm_config_path()
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2)
+            json.dump(strip_env_values(config), f, indent=2)
     except Exception as e:
         print(f"   [!] Could not save LLM config: {e}")
 

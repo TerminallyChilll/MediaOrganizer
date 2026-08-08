@@ -180,12 +180,81 @@ def test_env_vars_supply_the_llm_config(tmp_path, monkeypatch):
     assert cfg["ollama_url"] == "http://nas:11434"
 
 
-def test_an_env_key_is_never_written_to_disk(tmp_path, monkeypatch):
+def test_loading_alone_never_creates_the_config_file(tmp_path, monkeypatch):
     target = tmp_path / "llm.json"
     monkeypatch.setenv("MEDIAORG_LLM_CONFIG", str(target))
     monkeypatch.setenv("GEMINI_API_KEY", "secret")
     llm.load_llm_config()
     assert not target.exists()
+
+
+def test_an_env_key_is_never_written_to_disk(tmp_path, monkeypatch):
+    """The save path is what matters here, not the load path.
+
+    load_llm_config overlays every env value into the dict it returns, so any
+    caller that saves that dict back copied those values into plaintext. The
+    earlier version of this test only called load_llm_config and checked the
+    file was not created — so it passed while the guarantee was being broken
+    one line later.
+    """
+    target = tmp_path / "llm.json"
+    monkeypatch.setenv("MEDIAORG_LLM_CONFIG", str(target))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-from-env")
+    monkeypatch.setenv("GEMINI_API_KEY", "gk-gemini-from-env")
+
+    llm.save_llm_config(llm.load_llm_config())
+
+    written = json.loads(target.read_text())
+    assert "openai_key" not in written
+    assert "gemini_key" not in written
+    assert "sk-openai-from-env" not in target.read_text()
+
+
+def test_configuring_ollama_does_not_leak_a_cloud_key(tmp_path, monkeypatch):
+    """The exact shape of the wizard's Ollama branch: env keys are present in
+    cfg, and it saves the whole dict after adding the url and model."""
+    target = tmp_path / "llm.json"
+    monkeypatch.setenv("MEDIAORG_LLM_CONFIG", str(target))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-from-env")
+
+    cfg = llm.load_llm_config()
+    cfg.update({"ollama_url": "http://localhost:11434",
+                "ollama_model": "llama3"})
+    llm.save_llm_config(cfg)
+
+    written = json.loads(target.read_text())
+    assert written == {"ollama_url": "http://localhost:11434",
+                       "ollama_model": "llama3"}
+
+
+def test_a_typed_key_is_still_saved_when_another_comes_from_the_env(tmp_path, monkeypatch):
+    """Only the env-supplied value is dropped — a key the user typed is
+    theirs, and must survive so they are not asked for it again."""
+    target = tmp_path / "llm.json"
+    monkeypatch.setenv("MEDIAORG_LLM_CONFIG", str(target))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-from-env")
+
+    cfg = llm.load_llm_config()
+    cfg["gemini_key"] = "gk-typed-by-hand"
+    llm.save_llm_config(cfg)
+
+    written = json.loads(target.read_text())
+    assert written == {"gemini_key": "gk-typed-by-hand"}
+
+
+def test_an_interactively_chosen_value_survives_even_if_the_env_sets_it(tmp_path, monkeypatch):
+    """Only an exact match is dropped. Picking a different Ollama URL than
+    the environment's is a deliberate choice and has to persist."""
+    target = tmp_path / "llm.json"
+    monkeypatch.setenv("MEDIAORG_LLM_CONFIG", str(target))
+    monkeypatch.setenv("OLLAMA_URL", "http://from-env:11434")
+
+    cfg = llm.load_llm_config()
+    cfg["ollama_url"] = "http://chosen-by-user:11434"
+    llm.save_llm_config(cfg)
+
+    assert json.loads(target.read_text()) == {
+        "ollama_url": "http://chosen-by-user:11434"}
 
 
 def test_a_blank_env_var_does_not_wipe_a_saved_key(tmp_path, monkeypatch):
