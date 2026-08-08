@@ -1055,16 +1055,21 @@ def test_no_user_retry_under_conda(repos, monkeypatch):
 
 def test_the_pip_bound_covers_the_whole_call_not_each_attempt(repos, monkeypatch):
     timeouts = []
+    spent = 0.25            # comfortably above Windows' ~16ms clock resolution
 
     def fake_run(cmd, **kwargs):
         timeouts.append(kwargs['timeout'])
+        time.sleep(spent)   # the first attempt consumes part of the budget
         raise subprocess.CalledProcessError(1, cmd)
 
     monkeypatch.setattr(update.subprocess, "run", fake_run)
     monkeypatch.setattr(update, "_user_site_usable", lambda: True)
     update._pip_install(Path("requirements.txt"), timeout=5)
+
     assert len(timeouts) == 2
-    assert sum(timeouts) <= 10 and timeouts[1] < timeouts[0]
+    assert timeouts[0] <= 5
+    # The retry gets what is left of the same budget, not a second full one.
+    assert timeouts[1] <= 5 - spent + 0.05
 
 
 # --- a requirements.txt that is not UTF-8 -------------------------------------
