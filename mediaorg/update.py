@@ -317,6 +317,22 @@ def check_interval_hours() -> float:
 _lock = threading.Lock()
 _status: UpdateStatus | None = None
 _started = False
+_thread: threading.Thread | None = None
+
+
+def check_and_cache(*, fetch: bool = True) -> UpdateStatus:
+    """A check whose answer primes the startup banner.
+
+    Used by the explicit commands (``--check-update``, the doctor) so that
+    asking once means the next launch can answer without the network.
+    """
+    st = check(fetch=fetch)
+    if st.state != UNKNOWN:
+        save_cache(st)
+        with _lock:
+            global _status
+            _status = st
+    return st
 
 
 def begin_background_check(*, force: bool = False) -> None:
@@ -325,7 +341,7 @@ def begin_background_check(*, force: bool = False) -> None:
     Returns immediately either way — the network call, when one is needed,
     happens on a daemon thread whose result shows up on the next menu draw.
     """
-    global _started, _status
+    global _started, _status, _thread
     if checks_disabled():
         return
     with _lock:
@@ -339,8 +355,26 @@ def begin_background_check(*, force: bool = False) -> None:
              and (time.time() - cached.checked_at) < interval * 3600)
     if fresh and not force:
         return
-    threading.Thread(target=_refresh, name="mediaorg-update-check",
-                     daemon=True).start()
+    thread = threading.Thread(target=_refresh, name="mediaorg-update-check",
+                              daemon=True)
+    with _lock:
+        _thread = thread
+    thread.start()
+
+
+def wait_for_check(timeout: float) -> UpdateStatus | None:
+    """Give a running check up to *timeout* seconds to finish.
+
+    Only worth calling when there is no cached answer at all — the first
+    launch after install, where waiting a moment is the difference between
+    the notice appearing now and appearing next time. A dead network costs
+    the timeout, never more.
+    """
+    with _lock:
+        thread = _thread
+    if thread is not None and thread.is_alive():
+        thread.join(timeout)
+    return latest_status()
 
 
 def _refresh() -> None:
@@ -368,10 +402,11 @@ def latest_status() -> UpdateStatus | None:
 
 def reset_background_state() -> None:
     """Test hook: forget the thread and the published status."""
-    global _started, _status
+    global _started, _status, _thread
     with _lock:
         _started = False
         _status = None
+        _thread = None
 
 
 # ── presentation ─────────────────────────────────────────────────────────

@@ -10,6 +10,7 @@ A cross-platform tool to scan media libraries, organize TV show structures, and 
 - **Journaled undo:** every applied change is recorded (with the actual paths, plus the file's size and mtime) in `mediaorg_journal.jsonl`, which lives **next to the app** — not in whatever directory you happened to launch from. `python run.py --list-runs` shows the history; `--undo` reverses the last run, `--undo-run <id>` a specific one, and `--undo-session` the whole of a `--action full`. An *intent* record is written before every change, so a crash or a half-finished copy across drives is detected and cleaned up rather than left to block future runs.
 - **Excel journal:** your library is written to an `.xlsx`. Edit the `… Fixed` columns to override any title/year/quality and the next rename pass uses your values.
 - **Fix extensions:** restore stripped video extensions via magic-byte detection, or bulk-convert one extension to another.
+- **Self-updating:** the wizard tells you how many commits behind you are and prints the command (and the folder to run it in) to catch up — or press `[U]` and it updates itself. See [Updating](#updating).
 - **LLM support (optional):** names guessit can't parse are offered to a local (Ollama) or cloud (OpenAI/Gemini) model. Configure it with environment variables (`OLLAMA_URL`, `OPENAI_API_KEY`, `GEMINI_API_KEY`) or answer the prompt once — see [LLM setup](#llm-setup).
 
 ## Installation & Usage
@@ -32,6 +33,57 @@ cd MediaOrganizer
 1. Edit `docker-compose.yml` to map your media folders.
 2. `docker compose run --rm media-organizer` (use `run`, not `up` — the wizard is interactive).
 
+## Updating
+Launching the wizard tells you when your copy is behind, and exactly what to
+type to catch up:
+
+```
+----------------------------------------------------------------------
+  Update available: you are 3 commits behind origin/main.
+  (you have a1b2c3d, latest is e4f5g6h)
+
+  To update, run this in a terminal in the MediaOrganizer folder:
+      cd "C:\Users\you\MediaOrganizer"
+      python run.py --update
+
+  ...or press [U] here and the wizard will do it for you.
+----------------------------------------------------------------------
+```
+
+So there are two ways to update — pick either:
+
+- **From the menu:** press **`[U]`**. It updates and then asks you to relaunch.
+- **From a terminal**, in the folder you cloned into:
+  ```bash
+  cd path/to/MediaOrganizer     # the folder containing run.py
+  python run.py --update        # Windows: py run.py --update
+  ```
+
+Other commands:
+```bash
+python run.py --version        # which version and commit you are on
+python run.py --check-update   # how far behind you are, and what you're missing
+python run.py --update --dry-run   # show what would be pulled, change nothing
+python run.py --update --yes       # skip the confirmation
+```
+
+**What the update does:** fetches, fast-forwards your clone to the latest
+commit, and reinstalls dependencies only if `requirements.txt` changed. It
+never discards your work — if you have edited files locally, or made your own
+commits, it stops and prints the git command to resolve that first. Your
+library, journal, spreadsheets and word list are untracked files and are never
+touched.
+
+**Notes**
+- Updating needs `git` and an install made with `git clone`. If you downloaded
+  a ZIP instead, the app says so and prints the `git clone` command to switch
+  to one (your settings live outside the repo, so nothing is lost).
+- The check runs at most once a day and is cached next to the app, so a normal
+  launch is offline and instant. `MEDIAORG_NO_UPDATE_CHECK=1` turns it off
+  entirely; `MEDIAORG_UPDATE_INTERVAL=6` checks every 6 hours instead.
+- No update available means no message — the notice only appears when there is
+  actually something to get.
+
 ## How it works
 Launching `python run.py` opens the interactive wizard:
 
@@ -45,6 +97,7 @@ Launching `python run.py` opens the interactive wizard:
 [7] Inventory every file    (every file, media or not -> xlsx/csv/txt)
 [8] Custom word list        (add / remove words stripped from names)
 [9] Undo last run
+[U] Update Media Organizer  (git pull + dependencies)
 [0] Exit
 ```
 

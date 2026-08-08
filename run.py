@@ -109,7 +109,7 @@ def main():
 
     if "--check-update" in sys.argv:
         from mediaorg import update
-        print(update.describe(update.check(fetch=True)))
+        print(update.describe(update.check_and_cache(fetch=True)))
         sys.exit(0)
 
     if "--update" in sys.argv:

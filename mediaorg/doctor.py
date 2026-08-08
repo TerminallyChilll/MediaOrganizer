@@ -202,7 +202,7 @@ def check_version() -> tuple[str, str]:
     with no network is not broken either.
     """
     from . import update
-    st = update.check(fetch=True)
+    st = update.check_and_cache(fetch=True)
     if st.state == update.UNKNOWN:
         return _warn(f"Could not check for updates: {st.reason}"
                      + (f"\n  {st.hint}" if st.hint else ""))

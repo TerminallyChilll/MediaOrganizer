@@ -1028,6 +1028,11 @@ def run_update() -> bool:
 def run_wizard() -> None:
     from . import __version__
     update.begin_background_check()
+    if update.latest_status() is None:
+        # Nothing remembered from a previous launch (a fresh install, or the
+        # first run after the cache was cleared): wait a moment so the very
+        # first launch is the one that tells you an update exists.
+        update.wait_for_check(2.0)
     while True:
         try:
             print("\n" + "=" * 70)
@@ -1168,7 +1173,7 @@ def main() -> None:
         update.print_version()
         return
     if args.check_update:
-        print(update.describe(update.check(fetch=True)))
+        print(update.describe(update.check_and_cache(fetch=True)))
         return
     if args.update:
         sys.exit(update.run_update(assume_yes=args.yes, dry_run=args.dry_run))

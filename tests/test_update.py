@@ -346,3 +346,21 @@ def test_update_of_a_non_git_copy_explains_the_alternative(tmp_path, monkeypatch
     monkeypatch.setattr(update, "app_dir", lambda: plain)
     assert update.run_update(assume_yes=True) == 1
     assert "git clone" in capsys.readouterr().out
+
+
+def test_first_launch_can_wait_for_the_answer(repos):
+    """With no cache there is nothing to show yet, so the caller is allowed
+    to wait a moment rather than let the first launch say nothing."""
+    seed, _ = repos
+    _push_commit(seed, "the very first thing you should hear about")
+    update.begin_background_check()
+    st = update.wait_for_check(30)
+    assert st is not None and st.state == update.BEHIND
+
+
+def test_waiting_when_no_check_is_running_returns_immediately(repos):
+    update.save_cache(update.check(fetch=True))
+    update.begin_background_check()               # cache is fresh: no thread
+    started = time.monotonic()
+    assert update.wait_for_check(30).state == update.CURRENT
+    assert time.monotonic() - started < 1
