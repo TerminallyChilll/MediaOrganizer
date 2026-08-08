@@ -492,3 +492,28 @@ def test_a_broken_update_check_never_stops_the_app_starting(monkeypatch, capsys)
     _drive(monkeypatch, ["0"])
     wizard.run_wizard()                          # must reach the menu, not raise
     assert "[1] Clean file names" in capsys.readouterr().out
+
+
+def test_the_launch_never_pays_the_update_budget_twice(monkeypatch):
+    """`wait_for_cache` returning None is ambiguous — nothing remembered, or
+    not published yet — so the two waits share one deadline rather than
+    charging the user for both."""
+    import time as _time
+    spent = 0.4
+    waits = []
+    monkeypatch.setattr(update, "begin_background_check", lambda **kw: None)
+
+    def slow_cache_wait(timeout):
+        waits.append(timeout)
+        _time.sleep(spent)          # the local phase used part of the budget
+        return None
+
+    monkeypatch.setattr(update, "wait_for_cache", slow_cache_wait)
+    monkeypatch.setattr(update, "wait_for_check", lambda t: waits.append(t))
+    started = _time.monotonic()
+    wizard._start_update_check()
+
+    assert waits[0] == wizard.LAUNCH_CHECK_BUDGET
+    # The second wait gets what is left of the same budget, not a fresh one.
+    assert waits[1] <= wizard.LAUNCH_CHECK_BUDGET - spent + 0.05
+    assert _time.monotonic() - started < wizard.LAUNCH_CHECK_BUDGET

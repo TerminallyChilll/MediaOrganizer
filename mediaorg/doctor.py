@@ -9,6 +9,10 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:                       # no runtime import: the doctor has to
+    from .update import UpdateStatus    # work even when the install is broken
 
 # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -217,7 +221,7 @@ def check_version() -> tuple[str, str]:
     return status, message
 
 
-def _version_verdict(st, *, offline: bool) -> tuple[str, str]:
+def _version_verdict(st: "UpdateStatus", *, offline: bool) -> tuple[str, str]:
     """Turn an update status into a doctor line.
 
     Shared by both paths so that turning the network check off changes what
@@ -242,7 +246,13 @@ def _version_verdict(st, *, offline: bool) -> tuple[str, str]:
     if st.state == update.AHEAD:
         return _ok(f"Level with {against} {st.upstream}, "
                    f"plus {st.ahead} local commit(s)")
-    return _ok(f"Level with {against} {st.upstream} ({st.local})")
+    if st.state == update.CURRENT:
+        at = f" ({st.local})" if st.local else ""
+        return _ok(f"Level with {against} {st.upstream}{at}")
+    # Not a state this function knows. A diagnostic that defaults to "healthy"
+    # for an unrecognised value is failing in the wrong direction.
+    return _warn(f"Unrecognised update state {st.state!r} — "
+                 f"treating as 'could not check'.")
 
 
 def check_stdout() -> tuple[str, str]:

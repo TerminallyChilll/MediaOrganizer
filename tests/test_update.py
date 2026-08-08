@@ -5,9 +5,11 @@ clone standing in for the user's install — because the whole feature is an
 opinion about what git says, and a mocked git would only test the opinion.
 """
 
+import copy
 import json
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -591,7 +593,9 @@ def test_an_ill_typed_cache_is_rejected_not_believed(repos):
     (clone / update.CACHE_NAME).write_text(json.dumps(
         {"state": "behind", "behind": "5", "upstream": "origin/main"}))
     assert update.load_cache() is None
-    assert update.banner(update.UpdateStatus()) == ""
+    # The value that used to reach banner() cannot be built at all now.
+    with pytest.raises(ValueError):
+        update.UpdateStatus.from_dict({"state": "behind", "behind": "5"})
 
 
 def test_a_rejected_cache_is_removed_so_it_cannot_recur(repos):
@@ -659,8 +663,9 @@ def test_pip_is_bounded_and_cannot_ask_questions(repos, monkeypatch):
 
     monkeypatch.setattr(update.subprocess, "run", fake_run)
     assert update._pip_install(Path("requirements.txt")) is True
-    assert seen['stdin'] is subprocess.DEVNULL      # pip cannot stop for input
-    assert seen['timeout'] == update.PIP_TIMEOUT    # ...or run forever
+    assert seen['stdin'] is subprocess.DEVNULL     # pip cannot stop for input
+    # A deadline for the whole call, so two attempts cannot cost 2x the bound.
+    assert 0 < seen['timeout'] <= update.PIP_TIMEOUT
 
 
 def test_pip_timeout_is_reported_not_retried(repos, monkeypatch, capsys):
@@ -834,7 +839,8 @@ def test_dispatch_rejects_junk_rather_than_ignoring_it(capsys):
 def test_version_reports_the_installed_commit(repos, capsys):
     assert update.dispatch_cli(["--version"]) == 0
     out = capsys.readouterr().out
-    assert update.head_revision() in out
+    sha = update.head_revision()
+    assert sha and sha in out          # '' in out would pass no matter what
 
 
 # --- the kill switch is a promise ---------------------------------------------
@@ -907,3 +913,253 @@ def test_the_doctor_still_checks_when_the_switch_is_off(repos, monkeypatch):
     status, message = doctor.check_version()
     assert status == "WARN"
     assert "1 commit behind" in message
+
+
+# --- the cache validates values, not just types -------------------------------
+
+def test_validation_survives_dropping_the_future_import(repos, monkeypatch):
+    """`field.type` is a string only under PEP 563. If that import ever goes,
+    every check must still run rather than silently accepting everything."""
+    real = update.UpdateStatus.__dataclass_fields__
+    patched = {}
+    for name, field_def in real.items():
+        clone_field = copy.copy(field_def)
+        clone_field.type = {'str': str, 'int': int, 'float': float,
+                            'list[str]': list, 'bool': bool}.get(field_def.type,
+                                                                 field_def.type)
+        patched[name] = clone_field
+    monkeypatch.setattr(update.UpdateStatus, "__dataclass_fields__", patched)
+    with pytest.raises(ValueError):
+        update.UpdateStatus.from_dict({"behind": "5"})
+    assert update.UpdateStatus.from_dict({"behind": 5}).behind == 5
+
+
+def test_infinity_cannot_retire_the_update_check(repos):
+    """time.time() - inf is -inf, which is younger than any interval — the
+    check would look fresh forever and never run again."""
+    _, clone = repos
+    (clone / update.CACHE_NAME).write_text('{"state": "current", "checked_at": Infinity}')
+    assert update.load_cache() is None
+
+
+def test_nan_is_rejected_too(repos):
+    _, clone = repos
+    (clone / update.CACHE_NAME).write_text('{"state": "current", "checked_at": NaN}')
+    assert update.load_cache() is None
+
+
+def test_an_overflowing_timestamp_does_not_escape_as_arithmetic_error(repos):
+    _, clone = repos
+    (clone / update.CACHE_NAME).write_text(
+        '{"state": "current", "checked_at": ' + "9" * 400 + '}')
+    assert update.load_cache() is None        # not an OverflowError
+
+
+def test_a_future_timestamp_does_not_count_as_fresh(repos):
+    """A skewed clock, or a cache copied from another machine, must not
+    suppress the check for the rest of time."""
+    seed, _ = repos
+    future = update.check(fetch=True)
+    future.checked_at = time.time() + 5000 * 3600
+    update.save_cache(future)
+    _push_commit(seed, "would never be found")
+
+    update.begin_background_check()
+    assert update.wait_for_check(30).state == update.BEHIND
+
+
+def test_a_state_that_is_not_a_state_is_rejected(repos):
+    _, clone = repos
+    (clone / update.CACHE_NAME).write_text(json.dumps({"state": "banana"}))
+    assert update.load_cache() is None
+
+
+def test_a_tampered_cache_cannot_repaint_the_terminal(repos):
+    """The live path sanitises commit subjects; the cache is replayed through
+    exactly the same banner on the next launch."""
+    _, clone = repos
+    (clone / update.CACHE_NAME).write_text(json.dumps({
+        "state": "behind", "behind": 1,
+        "upstream": "origin/main\x1b[2J\x1b[H  [OK] Up to date",
+        "local": "aaaaaaa", "remote": "bbbbbbb",
+        "checked_at": time.time()}))
+    loaded = update.load_cache()
+    assert loaded is not None
+    assert "\x1b" not in loaded.upstream
+    assert "\x1b" not in update.banner(loaded)
+
+
+def test_the_truncation_marker_is_ascii(repos):
+    """The module prints on consoles that predate UTF-8."""
+    marked = update._printable("y" * 400)
+    assert marked.endswith("...")
+    marked.encode("ascii")               # would raise if '…' crept back in
+
+
+# --- two generations of the same check ----------------------------------------
+
+def test_a_superseded_check_cannot_publish_over_a_newer_one(repos):
+    """A check that began before an update can finish after it. Its answer is
+    about the old commit, so announcing it would offer an update already
+    installed."""
+    seed, _ = repos
+    _push_commit(seed, "the fix")
+    old = update.check(fetch=True)
+    assert old.state == update.BEHIND
+
+    update.begin_background_check()
+    _quiesce()
+    update.reset_background_state()      # stands in for "generation moved on"
+    assert update._publish(old, generation=-1) is False
+    assert update.latest_status() is None
+
+
+def test_forcing_a_recheck_while_one_runs_does_not_lose_the_thread(repos):
+    """join_background is what the test suite relies on to keep a daemon
+    fetch from escaping onto the real repository — it has to cover the
+    threads a force=True restart superseded, not just the newest."""
+    update.begin_background_check()
+    update.begin_background_check(force=True)
+    with update._lock:
+        assert len(update._threads) == 2
+    assert update.join_background(30) is True
+
+
+def test_joining_a_thread_that_never_started_is_not_an_error(repos):
+    """There is a window where the handle is published but start() has not
+    run — and start() itself can fail under thread exhaustion."""
+    never_started = threading.Thread(target=lambda: None)
+    with update._lock:
+        update._threads.append(never_started)
+    assert update.join_background(1) is True     # not RuntimeError
+
+
+# --- pip ----------------------------------------------------------------------
+
+def test_no_user_retry_under_conda(repos, monkeypatch):
+    """~/.local IS on sys.path for conda interpreters, so a --user install
+    shadows the conda-managed package for every env of that version."""
+    monkeypatch.setenv("CONDA_PREFIX", "/opt/conda/envs/media")
+    monkeypatch.setattr(update, "_in_virtualenv", lambda: False)
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        raise subprocess.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr(update.subprocess, "run", fake_run)
+    assert update._pip_install(Path("requirements.txt")) is False
+    assert len(calls) == 1
+    assert not any("--user" in c for c in calls)
+
+
+def test_the_pip_bound_covers_the_whole_call_not_each_attempt(repos, monkeypatch):
+    timeouts = []
+
+    def fake_run(cmd, **kwargs):
+        timeouts.append(kwargs['timeout'])
+        raise subprocess.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr(update.subprocess, "run", fake_run)
+    monkeypatch.setattr(update, "_user_site_usable", lambda: True)
+    update._pip_install(Path("requirements.txt"), timeout=5)
+    assert len(timeouts) == 2
+    assert sum(timeouts) <= 10 and timeouts[1] < timeouts[0]
+
+
+# --- a requirements.txt that is not UTF-8 -------------------------------------
+
+def test_a_non_utf8_requirements_file_does_not_kill_the_update(repos):
+    """The fingerprint is taken after the pull has already succeeded. An
+    exception there loses the report, the cache write and — from the wizard —
+    the whole session."""
+    seed, clone = repos
+    _push_commit(seed, "the fix", body="print('v2')\n")
+    (clone / "requirements.txt").write_bytes(
+        "pandas>=2.2\n".encode("utf-16-le"))     # what PowerShell 5.1 writes
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-m", "local encoding")
+    _git(clone, "reset", "--hard", "HEAD~1")     # keep the tree clean
+
+    assert update._requirements_fingerprint() is not None    # must not raise
+    assert update.run_update(assume_yes=True) == 0
+    assert (clone / "run.py").read_text() == "print('v2')\n"
+
+
+def test_a_missing_requirements_file_is_not_an_error(repos):
+    _, clone = repos
+    (clone / "requirements.txt").unlink()
+    assert update._requirements_fingerprint() is None
+
+
+# --- output the user needs in full --------------------------------------------
+
+def test_the_pull_summary_keeps_its_lines(repos, capsys):
+    seed, _ = repos
+    _push_commit(seed, "the fix", body="print('v2')\n")
+    update.run_update(assume_yes=True)
+    out = capsys.readouterr().out
+    assert "Fast-forward" in out
+    # The diffstat is several lines; flattening it into one run-on line is
+    # what sanitising the whole blob at once used to do.
+    assert "Updating" in out and out.count("\n") > 10
+
+
+def test_a_failed_pull_reports_the_whole_error(repos, monkeypatch, capsys):
+    seed, _ = repos
+    _push_commit(seed, "the fix")
+    long_error = "\n".join(f"    path/to/file_{i}.mkv" for i in range(60))
+    real_git = update._git
+
+    def failing_pull(*args, **kw):
+        if args and args[0] == "pull":
+            return 1, "", "error: Your local changes would be overwritten by:\n" + long_error
+        return real_git(*args, **kw)
+
+    monkeypatch.setattr(update, "_git", failing_pull)
+    assert update.run_update(assume_yes=True) == 1
+    out = capsys.readouterr().out
+    assert "file_59.mkv" in out            # not truncated at 200 characters
+
+
+# --- dispatch contract --------------------------------------------------------
+
+def test_a_malformed_flag_returns_a_code_rather_than_exiting():
+    """argparse exits the process by default; this function is documented to
+    return int | None, and tests and other callers rely on that."""
+    assert update.dispatch_cli(["--update", "--dry-run=1"]) == 2
+    assert update.dispatch_cli(["-V", "-yz"]) == 2
+
+
+def test_the_deps_failure_survives_an_unmoved_head(repos, monkeypatch, capsys):
+    """Someone else can pull during the confirmation prompt: HEAD does not
+    move, requirements.txt did, pip fails — that is not 'nothing changed'."""
+    seed, clone = repos
+    _push_commit(seed, "newer deps", path="requirements.txt", body="pandas>=2.3\n")
+    monkeypatch.setattr(update, "_pip_install", lambda req, **kw: False)
+    real_git = update._git
+
+    def pull_then_stand_still(*args, **kw):
+        if args and args[0] == "pull":
+            # Simulate the file arriving without HEAD appearing to move.
+            (clone / "requirements.txt").write_text("pandas>=2.3\n")
+            return 0, "Already up to date.", ""
+        return real_git(*args, **kw)
+
+    monkeypatch.setattr(update, "_git", pull_then_stand_still)
+    code = update.run_update(assume_yes=True)
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "Already up to date - nothing changed" not in out
+
+
+def test_update_module_pulls_in_no_third_party_packages():
+    """run.py imports this before installing dependencies, on every launch."""
+    probe = subprocess.run(
+        [sys.executable, "-c",
+         "import mediaorg.update, sys;"
+         "print(sorted(m for m in sys.modules"
+         " if m in ('pandas', 'guessit', 'openpyxl', 'tqdm', 'numpy')))"],
+        cwd=str(Path(__file__).resolve().parent.parent),
+        capture_output=True, text=True, check=True)
+    assert probe.stdout.strip() == "[]"

@@ -103,7 +103,16 @@ def main():
     # want to do when the dependency install is what's broken, and none of
     # these touch pandas/guessit. The parsing lives in mediaorg.update so this
     # and the wizard's parser cannot disagree about what was typed.
-    from mediaorg import update
+    # Guarded like the wizard import below: this is now the first mediaorg
+    # import on an ordinary launch, and a half-copied or shadowed package here
+    # would otherwise print a raw traceback from the one script whose job is
+    # to be friendly about exactly that.
+    try:
+        from mediaorg import update
+    except ImportError as e:
+        print(f"❌ Critical Error: Could not load the mediaorg package. Make sure it's in the same directory. ({e})")
+        print("Try running: python run.py --doctor")
+        sys.exit(1)
     code = update.dispatch_cli(sys.argv[1:])
     if code is not None:
         sys.exit(code)

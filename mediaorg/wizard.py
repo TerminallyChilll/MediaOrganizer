@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sys
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,8 @@ from .plan import (NamingScheme, Op, Plan, find_show_roots,
                    plan_loose_movies, plan_season_structure)
 
 CONFIG_FILE = ".media_renamer_config.json"
+#: Seconds a launch will ever spend waiting for the update check.
+LAUNCH_CHECK_BUDGET = 2.0
 
 
 class BackNavigation(Exception):
@@ -1036,13 +1039,18 @@ def run_update() -> bool:
 
 def _start_update_check() -> None:
     """Kick off the update check. Never lets it stop the app from starting."""
+    deadline = time.monotonic() + LAUNCH_CHECK_BUDGET
     try:
         update.begin_background_check()
-        if update.wait_for_cache(2.0) is None:
+        if update.wait_for_cache(LAUNCH_CHECK_BUDGET) is None:
             # Nothing remembered from a previous launch (a fresh install, or
             # the first run after the cache was cleared): wait a moment so the
             # very first launch is the one that tells you an update exists.
-            update.wait_for_check(2.0)
+            # One shared deadline, because a None above is ambiguous — it can
+            # also mean the local phase simply has not finished yet, and
+            # paying the budget twice is how "never slower" becomes four
+            # seconds on a cold start behind an on-access virus scanner.
+            update.wait_for_check(max(0.0, deadline - time.monotonic()))
     except Exception:
         pass                    # an update check is never worth a failed launch
 

@@ -20,8 +20,10 @@ predate UTF-8.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import site
 import subprocess
 import sys
 import threading
@@ -46,6 +48,12 @@ PIP_TIMEOUT = 600       # seconds; a dependency install may compile something
 #   'unknown'  — could not tell (no git, no network, not a clone, ...)
 CURRENT, BEHIND, AHEAD, DIVERGED, UNKNOWN = (
     'current', 'behind', 'ahead', 'diverged', 'unknown')
+VALID_STATES = frozenset({CURRENT, BEHIND, AHEAD, DIVERGED, UNKNOWN})
+
+# Sanity bound for a cached timestamp. json.load accepts the literals
+# Infinity and NaN, and either one makes every subsequent launch compute an
+# age that looks fresh — silently retiring the update check for good.
+MAX_TIMESTAMP = 1e15
 
 
 def app_dir() -> Path:
@@ -105,24 +113,48 @@ class UpdateStatus:
             if name == 'stale' or name not in data:
                 continue
             value = data[name]
+            # `.type` is a string under PEP 563 (the __future__ import at the
+            # top) and a type object without it. Handle both, so deleting that
+            # import cannot quietly turn every check below into a no-op.
             expected = field_def.type
+            if not isinstance(expected, str):
+                expected = getattr(expected, '__name__', '')
             if expected == 'str':
                 ok = isinstance(value, str)
+                if ok:
+                    # Sanitise on the way *in*: the cache is a file anything
+                    # can write, it is published straight to the banner on the
+                    # next launch, and an escape sequence in it would repaint
+                    # the terminal exactly like a hostile commit subject.
+                    value = _printable(value)
             elif expected == 'int':
                 # bool is an int subclass; True is not a commit count.
                 ok = isinstance(value, int) and not isinstance(value, bool)
             elif expected == 'float':
-                ok = isinstance(value, (int, float)) and not isinstance(value, bool)
-                value = float(value) if ok else value
+                # Infinity and NaN are literals json.load accepts. Either one
+                # in checked_at makes every future launch look "fresh" and
+                # silently retires the update check; a huge int additionally
+                # makes float() raise OverflowError.
+                ok = (isinstance(value, (int, float))
+                      and not isinstance(value, bool)
+                      and -MAX_TIMESTAMP < value < MAX_TIMESTAMP)
+                if ok:
+                    value = float(value)
             elif expected.startswith('list'):
                 ok = isinstance(value, list) and all(isinstance(v, str) for v in value)
-            else:                               # pragma: no cover - defensive
-                ok = True
+                if ok:
+                    value = [_printable(v) for v in value]
+            else:
+                # An annotation nobody taught this loop about. Refusing the
+                # file is the safe direction; trusting it is not.
+                ok = False
             if not ok:
                 raise ValueError(
                     f"cached field {name!r} should be {expected}, got "
                     f"{type(value).__name__}")
             known[name] = value
+        if 'state' in known and known['state'] not in VALID_STATES:
+            raise ValueError(f"cached state {known['state']!r} is not a known state")
         return cls(**known)
 
 
@@ -139,7 +171,10 @@ def _printable(text: str, limit: int = 200) -> str:
     cleaned = ''.join(' ' if (ch < ' ' or '\x7f' <= ch <= '\x9f') else ch
                       for ch in text)
     cleaned = cleaned.strip()
-    return cleaned if len(cleaned) <= limit else cleaned[:limit - 1] + '…'
+    # '...' not '…': the module prints on consoles that predate UTF-8, and a
+    # truncation marker that raises UnicodeEncodeError would take down the very
+    # report that was defending against a hostile subject.
+    return cleaned if len(cleaned) <= limit else cleaned[:limit - 3] + '...'
 
 
 # ── git plumbing ─────────────────────────────────────────────────────────
@@ -496,9 +531,16 @@ _lock = threading.Lock()
 _status: UpdateStatus | None = None
 _started = False
 _thread: threading.Thread | None = None
-# Set once the thread has published whatever it remembered, before it goes
-# anywhere near the network.
+_threads: list[threading.Thread] = []    # every checker ever started, for joining
+# Set once the current thread has published whatever it remembered, before it
+# goes anywhere near the network. Replaced (not cleared) per generation, so an
+# older thread finishing cannot satisfy a waiter on a newer one.
 _published = threading.Event()
+# Bumped for every checker started. A thread whose generation is no longer the
+# current one has been superseded and publishes nothing: without this, a check
+# that began *before* an update can land after it and announce an update for a
+# version already installed.
+_generation = 0
 
 
 def check_and_cache(*, fetch: bool = True) -> UpdateStatus:
@@ -526,25 +568,40 @@ def begin_background_check(*, force: bool = False) -> None:
     :func:`wait_for_cache` (fast, local) or :func:`wait_for_check` (may
     include the network).
     """
-    global _started, _thread
+    global _started, _thread, _published, _generation
     if checks_disabled():
         return
     with _lock:
+        if _thread is not None and _thread.is_alive() and not force:
+            return                      # one check in flight is enough
         if _started and not force:
             return
         _started = True
-        _published.clear()
-        thread = threading.Thread(target=_refresh, args=(force,),
+        _generation += 1
+        generation = _generation
+        published = _published = threading.Event()
+        thread = threading.Thread(target=_refresh, args=(force, generation, published),
                                   name="mediaorg-update-check", daemon=True)
         _thread = thread
+        _threads.append(thread)
     # Started outside the lock: a thread that finishes instantly would
     # otherwise block on a lock its own starter is still holding.
     thread.start()
 
 
-def _refresh(force: bool = False) -> None:
-    """Publish what we remember, then re-measure if that is not enough."""
+def _publish(status: UpdateStatus | None, generation: int) -> bool:
+    """Publish a result unless a newer check has superseded this one."""
     global _status
+    with _lock:
+        if generation != _generation:
+            return False
+        _status = status
+        return True
+
+
+def _refresh(force: bool, generation: int, published: threading.Event) -> None:
+    """Publish what we remember, then re-measure if that is not enough."""
+    cached = None
     try:
         cached = load_cache()
         if cached is not None and not describes_current_checkout(cached):
@@ -553,16 +610,18 @@ def _refresh(force: bool = False) -> None:
             # the one running, so it is not merely old, it is wrong: don't
             # publish it even briefly, and re-measure regardless of its age.
             cached = None
-        with _lock:
-            _status = cached
+        _publish(cached, generation)
     except Exception:                           # pragma: no cover - defensive
         cached = None
     finally:
-        _published.set()
+        published.set()
 
     interval = check_interval_hours()
+    # A cached timestamp from the future — a skewed clock, a cache copied from
+    # another machine — would otherwise read as permanently fresh.
+    age = time.time() - cached.checked_at if cached is not None else 0.0
     fresh = (cached is not None and interval > 0
-             and (time.time() - cached.checked_at) < interval * 3600)
+             and 0 <= age < interval * 3600)
     if fresh and not force:
         return
 
@@ -570,16 +629,17 @@ def _refresh(force: bool = False) -> None:
         st = check(fetch=True)
     except Exception:                           # pragma: no cover - defensive
         return
+    with _lock:
+        superseded = generation != _generation
+    if superseded:
+        return
     # Don't cache a transient "no network" over a real answer: keep the last
     # useful result so an offline launch still reports what it knew.
     if st.state != UNKNOWN:
-        save_cache(st)
-        with _lock:
-            _status = st
-    else:
-        with _lock:
-            if _status is None:
-                _status = st
+        if _publish(st, generation):
+            save_cache(st)
+    elif latest_status() is None:
+        _publish(st, generation)
 
 
 def wait_for_cache(timeout: float) -> UpdateStatus | None:
@@ -591,9 +651,9 @@ def wait_for_cache(timeout: float) -> UpdateStatus | None:
     is nothing to wait for and it returns at once.
     """
     with _lock:
-        running = _thread is not None
+        running, published = _thread is not None, _published
     if running:
-        _published.wait(timeout)
+        published.wait(timeout)
     return latest_status()
 
 
@@ -618,27 +678,36 @@ def latest_status() -> UpdateStatus | None:
 
 
 def join_background(timeout: float = 30.0) -> bool:
-    """Wait for the check thread to exit. Returns True if none is running.
+    """Wait for every checker started so far. True if none is still running.
 
     Tests use this to stop a daemon thread outliving the fixture that
-    pointed it at a scratch repository.
+    pointed it at a scratch repository — so it has to cover threads a
+    ``force=True`` restart superseded, not just the newest one. Joining is
+    guarded by ``is_alive()``: a thread published but not yet started (the
+    window between the lock and ``start()``) cannot be joined at all.
     """
     with _lock:
-        thread = _thread
-    if thread is None:
-        return True
-    thread.join(timeout)
-    return not thread.is_alive()
+        threads = list(_threads)
+    deadline = time.monotonic() + timeout
+    for thread in threads:
+        if thread.is_alive():
+            thread.join(max(0.0, deadline - time.monotonic()))
+    return not any(thread.is_alive() for thread in threads)
 
 
 def reset_background_state() -> None:
-    """Test hook: forget the thread and the published status."""
-    global _started, _status, _thread
+    """Test hook: forget the published status and the thread handles.
+
+    Does not stop anything — call :func:`join_background` first if a check
+    may still be running against a directory that is about to disappear.
+    """
+    global _started, _status, _thread, _generation
     with _lock:
         _started = False
         _status = None
         _thread = None
-        _published.clear()
+        _threads.clear()
+        _generation += 1        # orphan anything still in flight
 
 
 # ── presentation ─────────────────────────────────────────────────────────
@@ -739,24 +808,46 @@ def _can_prompt() -> bool:
 
 
 def _in_virtualenv() -> bool:
-    return sys.prefix != getattr(sys, 'base_prefix', sys.prefix)
+    """venv and virtualenv, old and new alike."""
+    return (sys.prefix != getattr(sys, 'base_prefix', sys.prefix)
+            or hasattr(sys, 'real_prefix'))      # virtualenv < 20
+
+
+def _user_site_usable() -> bool:
+    """Would `pip install --user` put packages somewhere this Python looks?
+
+    Not in a virtualenv (pip refuses outright), and not under conda, where
+    ~/.local IS on sys.path — so a --user install there shadows the
+    conda-managed package for every environment of that Python version on
+    the machine, which is a worse outcome than the failure it is retrying.
+    """
+    if _in_virtualenv() or os.environ.get('CONDA_PREFIX'):
+        return False
+    return bool(getattr(site, 'ENABLE_USER_SITE', True))
 
 
 def _pip_install(req: Path, timeout: int = PIP_TIMEOUT) -> bool:
-    """Install requirements, retrying with --user on a permissions failure.
+    """Install requirements, retrying with --user where that can help.
 
-    stdin is closed and the call is bounded: pip can ask questions, and an
-    unattended ``--update --yes`` that stops for one waits forever. ``--user``
-    is skipped inside a virtualenv, where pip rejects it outright, and on
-    PEP 668 installs it is the retry that has a chance of working.
+    stdin is closed and the whole call — not each attempt — is bounded: pip
+    can ask questions, and an unattended ``--update --yes`` that stops for
+    one waits forever.
+
+    Note that neither attempt gets past an externally-managed environment
+    (PEP 668): pip applies that check to --user as well, so on a Debian or
+    Homebrew Python both fail identically and the user needs a virtualenv.
     """
-    attempts = [[]] if _in_virtualenv() else [[], ["--user"]]
+    deadline = time.monotonic() + timeout
+    attempts = [[], ["--user"]] if _user_site_usable() else [[]]
     for extra in attempts:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
             subprocess.run(
                 [sys.executable, "-m", "pip", "install", *extra,
                  "-r", str(req), "--quiet", "--disable-pip-version-check"],
-                check=True, stdin=subprocess.DEVNULL, timeout=timeout,
+                check=True, stdin=subprocess.DEVNULL, timeout=remaining,
             )
             return True
         except subprocess.TimeoutExpired:
@@ -768,14 +859,21 @@ def _pip_install(req: Path, timeout: int = PIP_TIMEOUT) -> bool:
 
 
 def _requirements_fingerprint() -> str | None:
-    """The contents of requirements.txt, or None if there is no such file.
+    """A hash of requirements.txt, or None if it cannot be read.
 
     Compared either side of the pull to decide whether dependencies need
     reinstalling. Reading the file beats diffing a commit range: it needs no
     successful `git diff`, and it gets a rename or a deletion right.
+
+    Bytes, not text: a requirements.txt that is not UTF-8 (PowerShell 5.1
+    writes UTF-16LE; one latin-1 byte in a comment is enough) would raise
+    UnicodeDecodeError — and this is called *after* the pull has succeeded,
+    where an exception would kill the report, the cache write and, from the
+    wizard, the whole session.
     """
     try:
-        return (app_dir() / "requirements.txt").read_text(encoding='utf-8')
+        return hashlib.sha256(
+            (app_dir() / "requirements.txt").read_bytes()).hexdigest()
     except OSError:
         return None
 
@@ -861,10 +959,15 @@ def run_update(*, assume_yes: bool = False, dry_run: bool = False) -> int:
     rc, out, err = _git("pull", "--ff-only", remote, branch,
                         timeout=FETCH_TIMEOUT * 3)
     if out:
-        print(_printable(out, limit=4000))
+        # Per line: _printable maps every control character to a space, and
+        # that includes the newlines holding git's diffstat together.
+        print("\n".join(_printable(line) for line in out.splitlines()))
     if rc != 0:
-        print(f"\n[!] Update failed: "
-              f"{_printable(err) or 'git pull returned ' + str(rc)}")
+        # Generous limit: a pull failure lists the files involved, and this is
+        # the one message the user most needs in full.
+        detail = "\n".join(_printable(line, limit=2000)
+                           for line in err.splitlines()) if err else ''
+        print(f"\n[!] Update failed: {detail or 'git pull returned ' + str(rc)}")
         print("    Try manually, from the MediaOrganizer folder:")
         print(f"        cd \"{app_dir()}\"")
         print(f"        git pull --ff-only {remote} {branch}")
@@ -888,7 +991,9 @@ def run_update(*, assume_yes: bool = False, dry_run: bool = False) -> int:
 
     save_cache(check(fetch=False))
     print("\n" + "=" * 70)
-    if before and after and before == after:    # pragma: no cover - defensive
+    if before and after and before == after and not deps_failed:
+        # Reachable, not defensive: someone else can pull during the
+        # confirmation prompt. Only "nothing changed" if pip agreed.
         print("[OK] Already up to date - nothing changed.")
         print("=" * 70)
         return 0
@@ -922,13 +1027,21 @@ def dispatch_cli(argv: list[str]) -> int | None:
     if not any(flag in argv for flag in CLI_FLAGS):
         return None
     parser = argparse.ArgumentParser(prog="run.py", add_help=False,
-                                     allow_abbrev=False)
+                                     allow_abbrev=False, exit_on_error=False)
     parser.add_argument('--update', action='store_true')
     parser.add_argument('--check-update', action='store_true')
     parser.add_argument('--version', '-V', action='store_true')
     parser.add_argument('--yes', '-y', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
-    args, extra = parser.parse_known_args(argv)
+    try:
+        args, extra = parser.parse_known_args(argv)
+    except (argparse.ArgumentError, SystemExit):
+        # argparse exits the process on a malformed flag ("--dry-run=1").
+        # This function is documented to return a code, so it returns one.
+        print(f"[!] Could not understand: {' '.join(argv)}")
+        print(f"    Usage: python run.py [{' | '.join(CLI_FLAGS[:3])}] "
+              f"[--yes] [--dry-run]")
+        return 2
     if extra:
         print(f"[!] Unrecognized argument(s): {' '.join(extra)}")
         print(f"    Usage: python run.py [{' | '.join(CLI_FLAGS[:3])}] "
