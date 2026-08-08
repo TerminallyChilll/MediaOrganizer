@@ -1016,13 +1016,19 @@ def run_update() -> bool:
     Returns True once the files on disk have moved on from the modules this
     process already imported, so the caller can send the user back to a
     fresh launch rather than run half-old code.
+
+    The answer comes from HEAD either side of the update, not from a status
+    read beforehand: an offline status can be measuring refs that were
+    already stale (a clone that has never fetched reads as up to date), and
+    would then report "nothing changed" for an update that changed
+    everything.
     """
-    before = update.check(fetch=False)
+    before = update.head_revision()
     code = update.run_update()
     if code != 0:
         return False
     update.begin_background_check(force=True)
-    return before.state == update.BEHIND
+    return update.head_revision() != before
 
 
 def run_wizard() -> None:

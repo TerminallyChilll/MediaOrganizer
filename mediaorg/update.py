@@ -181,6 +181,16 @@ def _short(rev: str) -> str:
     return out if rc == 0 else ''
 
 
+def head_revision() -> str:
+    """The commit currently checked out, short form ('' if not a clone).
+
+    The only honest answer to "did the files on disk just change?" — take it
+    either side of an update rather than inferring from a status measured
+    before the fetch, which can be reading refs that were already stale.
+    """
+    return _short('HEAD')
+
+
 def local_commits_behind(upstream: str) -> tuple[int, int]:
     """(ahead, behind) between HEAD and *upstream*."""
     rc, out, _ = _git("rev-list", "--left-right", "--count", f"HEAD...{upstream}")
@@ -438,6 +448,12 @@ def banner(status: UpdateStatus | None = None) -> str:
         "      python run.py --update",
         "",
         "  ...or press [U] here and the wizard will do it for you.",
+        "",
+        # The only place this is discoverable in the UI: a media server on a
+        # restricted network should not have to read the source to find out
+        # that launching the app contacts github.com.
+        "  (This check contacts github.com once a day. Turn it off with the",
+        "   environment variable MEDIAORG_NO_UPDATE_CHECK=1.)",
         "-" * 70,
     ]
     return "\n".join(lines)
@@ -553,7 +569,7 @@ def run_update(*, assume_yes: bool = False, dry_run: bool = False) -> int:
             print("Cancelled - nothing was changed.")
             return 0
 
-    before = _short('HEAD')
+    before = head_revision()
     remote, _, branch = st.upstream.partition('/')
     print(f"\n-> git pull --ff-only {remote} {branch}")
     rc, out, err = _git("pull", "--ff-only", remote, branch,
@@ -567,7 +583,7 @@ def run_update(*, assume_yes: bool = False, dry_run: bool = False) -> int:
         print(f"        git pull --ff-only {remote} {branch}")
         return 1
 
-    after = _short('HEAD')
+    after = head_revision()
 
     # Only reinstall when the dependency list actually moved: pip is slow and
     # this runs on every update otherwise.

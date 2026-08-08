@@ -161,6 +161,16 @@ def test_banner_names_the_command_and_the_folder(repos):
     assert str(clone) in text          # ...and *where* to type it
 
 
+def test_banner_names_the_off_switch(repos):
+    """The banner is the only place a user on a restricted network finds out
+    that launching the app talks to github.com, and how to stop it."""
+    seed, _ = repos
+    _push_commit(seed, "something new")
+    text = update.banner(update.check(fetch=True))
+    assert "github.com" in text
+    assert "MEDIAORG_NO_UPDATE_CHECK=1" in text
+
+
 def test_banner_pluralises(repos):
     seed, _ = repos
     _push_commit(seed, "one")

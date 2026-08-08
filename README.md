@@ -78,9 +78,20 @@ touched.
 - Updating needs `git` and an install made with `git clone`. If you downloaded
   a ZIP instead, the app says so and prints the `git clone` command to switch
   to one (your settings live outside the repo, so nothing is lost).
-- The check runs at most once a day and is cached next to the app, so a normal
-  launch is offline and instant. `MEDIAORG_NO_UPDATE_CHECK=1` turns it off
-  entirely; `MEDIAORG_UPDATE_INTERVAL=6` checks every 6 hours instead.
+- **Launching the app contacts github.com.** The check is a `git fetch`, run in
+  the background at most once a day (and on a first launch, before any cache
+  exists) — no other data leaves the machine, and nothing is sent about your
+  library. On a media server, an air-gapped box or any host with restricted
+  egress, turn it off:
+  ```bash
+  MEDIAORG_NO_UPDATE_CHECK=1 python run.py     # this launch
+  setx MEDIAORG_NO_UPDATE_CHECK 1              # Windows, permanently
+  ```
+  With it off, nothing checks and nothing is sent; `python run.py --update`
+  still works whenever you ask for it explicitly.
+- The answer is cached next to the app (`.mediaorg_update_check.json`), so a
+  normal launch is offline and instant. `MEDIAORG_UPDATE_INTERVAL=6` checks
+  every 6 hours instead of every 24.
 - No update available means no message — the notice only appears when there is
   actually something to get.
 
