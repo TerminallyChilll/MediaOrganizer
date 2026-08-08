@@ -861,6 +861,44 @@ def test_the_doctor_respects_the_no_check_switch(repos, monkeypatch):
     assert "MEDIAORG_NO_UPDATE_CHECK=1" in message
 
 
+def test_locally_visible_problems_survive_the_switch(repos, monkeypatch):
+    """Turning the network check off changes what is measured, not which
+    problems get reported: a diverged clone is diverged either way."""
+    from mediaorg import doctor
+    seed, clone = repos
+    _push_commit(seed, "upstream work")
+    update.check(fetch=True)                     # get the remote ref locally
+    (clone / "notes.txt").write_text("mine")
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-m", "local tweak")
+    monkeypatch.setenv("MEDIAORG_NO_UPDATE_CHECK", "1")
+
+    status, message = doctor.check_version()
+    assert status == "WARN"
+    assert "Diverged" in message
+    assert "MEDIAORG_NO_UPDATE_CHECK=1" in message
+
+
+def test_a_broken_install_is_reported_even_with_checks_off(tmp_path, monkeypatch):
+    from mediaorg import doctor
+    plain = tmp_path / "downloaded-zip"
+    plain.mkdir()
+    monkeypatch.setattr(update, "app_dir", lambda: plain)
+    monkeypatch.setenv("MEDIAORG_NO_UPDATE_CHECK", "1")
+
+    status, message = doctor.check_version()
+    assert status == "WARN"                      # not a silent [OK]
+    assert "git clone" in message
+
+
+def test_offline_up_to_date_does_not_claim_a_fresh_comparison(repos, monkeypatch):
+    from mediaorg import doctor
+    monkeypatch.setenv("MEDIAORG_NO_UPDATE_CHECK", "1")
+    status, message = doctor.check_version()
+    assert status == "OK"
+    assert "last fetched" in message
+
+
 def test_the_doctor_still_checks_when_the_switch_is_off(repos, monkeypatch):
     from mediaorg import doctor
     seed, _ = repos

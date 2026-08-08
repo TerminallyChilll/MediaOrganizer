@@ -202,33 +202,47 @@ def check_version() -> tuple[str, str]:
     with no network is not broken either.
     """
     from . import update
-    if update.checks_disabled():
-        # MEDIAORG_NO_UPDATE_CHECK is a promise that this app does not reach
-        # the network on its own. The doctor is not an exception to it — a
-        # diagnostic that quietly breaks the guarantee it is reporting on is
-        # worse than one that says less. Local comparison only.
-        st = update.check(fetch=False)
-        note = ("Update checks are off (MEDIAORG_NO_UPDATE_CHECK=1) — "
-                "not contacting github.com.")
-        if st.state == update.BEHIND:
-            return _warn(f"{note}\n  Against what was last fetched: "
-                         f"{st.behind} commit(s) behind {st.upstream}.")
-        return _ok(note)
-    st = update.check_and_cache(fetch=True)
+    # MEDIAORG_NO_UPDATE_CHECK is a promise that this app does not reach the
+    # network on its own. The doctor is not an exception to it — a diagnostic
+    # that quietly breaks the guarantee it is reporting on is worse than one
+    # that says less. It still runs the check, just without the fetch: a
+    # missing git, a damaged clone or a diverged branch are all visible
+    # locally, and they are exactly what someone runs the doctor to find.
+    offline = update.checks_disabled()
+    st = update.check(fetch=False) if offline else update.check_and_cache(fetch=True)
+    status, message = _version_verdict(st, offline=offline)
+    if offline:
+        message = ("Update checks are off (MEDIAORG_NO_UPDATE_CHECK=1) — "
+                   "not contacting github.com.\n  " + message)
+    return status, message
+
+
+def _version_verdict(st, *, offline: bool) -> tuple[str, str]:
+    """Turn an update status into a doctor line.
+
+    Shared by both paths so that turning the network check off changes what
+    is *measured*, never which problems get reported.
+    """
+    from . import update
+    # Offline, "up to date" only means "matches the last fetch", which may be
+    # weeks old. Say that rather than implying a fresh comparison.
+    against = "what was last fetched from" if offline else "the latest"
     if st.state == update.UNKNOWN:
         return _warn(f"Could not check for updates: {st.reason}"
                      + (f"\n  {st.hint}" if st.hint else ""))
     if st.state == update.BEHIND:
         plural = "" if st.behind == 1 else "s"
-        return _warn(f"{st.behind} commit{plural} behind {st.upstream}.\n"
+        return _warn(f"{st.behind} commit{plural} behind {against} "
+                     f"{st.upstream}.\n"
                      f"  Update with:  python run.py --update")
     if st.state == update.DIVERGED:
         return _warn(f"Diverged from {st.upstream} "
                      f"({st.ahead} local, {st.behind} remote commits) — "
                      f"cannot fast-forward.")
     if st.state == update.AHEAD:
-        return _ok(f"Up to date with {st.upstream}, plus {st.ahead} local commit(s)")
-    return _ok(f"Up to date with {st.upstream} ({st.local})")
+        return _ok(f"Level with {against} {st.upstream}, "
+                   f"plus {st.ahead} local commit(s)")
+    return _ok(f"Level with {against} {st.upstream} ({st.local})")
 
 
 def check_stdout() -> tuple[str, str]:
