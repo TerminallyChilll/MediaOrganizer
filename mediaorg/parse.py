@@ -6,6 +6,7 @@ original casing of the title substring (WALL-E, Se7en stay intact).
 
 import datetime
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -88,8 +89,31 @@ class ParsedName:
     part: int | None = None
 
 
-def load_custom_patterns(folder: Path | str = ".") -> list[str]:
-    path = Path(folder) / CUSTOM_PATTERNS_FILE
+def custom_patterns_path(folder: Path | str | None = None) -> Path:
+    """Where the custom word list lives, independent of the current directory.
+
+    Same reasoning as the undo journal: a cwd-relative file meant that
+    double-clicking the launcher, or running from anywhere else, silently
+    started an empty list and the words the user had added stopped being
+    stripped. Order: explicit folder -> ``$MEDIAORG_PATTERNS`` -> next to the
+    app -> adopt a pre-existing file in the cwd, so upgrading users keep the
+    list they already have.
+    """
+    if folder is not None:
+        return Path(folder) / CUSTOM_PATTERNS_FILE
+    env = os.environ.get("MEDIAORG_PATTERNS")
+    if env:
+        return Path(env).expanduser()
+    app = Path(__file__).resolve().parent.parent / CUSTOM_PATTERNS_FILE
+    if not app.exists():
+        legacy = Path.cwd() / CUSTOM_PATTERNS_FILE
+        if legacy.exists() and legacy != app:
+            return legacy
+    return app
+
+
+def load_custom_patterns(folder: Path | str | None = None) -> list[str]:
+    path = custom_patterns_path(folder)
     if path.exists():
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -99,8 +123,9 @@ def load_custom_patterns(folder: Path | str = ".") -> list[str]:
     return []
 
 
-def save_custom_patterns(patterns: list[str], folder: Path | str = ".") -> None:
-    (Path(folder) / CUSTOM_PATTERNS_FILE).write_text(
+def save_custom_patterns(patterns: list[str],
+                         folder: Path | str | None = None) -> None:
+    custom_patterns_path(folder).write_text(
         json.dumps(patterns, indent=2), encoding="utf-8")
 
 
@@ -144,6 +169,11 @@ def parse_name(name: str, kind_hint: str | None = None,
     """
     cleaned = pre_clean(name, custom_patterns)
     options = {'type': kind_hint} if kind_hint else {}
+    # Release group is never used by any name we build, and guessit's
+    # heuristic for it eats real titles: in "WALL-E.2008.1080p.mkv" it reads
+    # "WALL" as the group and leaves the title as "E". Turning the rule off
+    # costs nothing and fixes every hyphenated title in that shape.
+    options['excludes'] = ['release_group']
     g = guessit(cleaned, options)
 
     eps = g.get('episode')

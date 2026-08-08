@@ -139,3 +139,39 @@ def test_tmp_suffix_is_shared_with_extension_repair():
     from mediaorg.parse import TMP_SUFFIX
     from mediaorg.extfix import _KNOWN_NON_VIDEO
     assert TMP_SUFFIX in _KNOWN_NON_VIDEO
+
+
+# --- Movie-name regressions --------------------------------------------------
+
+def test_release_group_heuristic_does_not_eat_hyphenated_titles():
+    """guessit read "WALL" as the release group and left the title as "E"."""
+    p = parse_name("WALL-E.2008.1080p.mkv", kind_hint="movie")
+    assert p.title == "WALL-E" and p.year == 2008 and p.quality == "1080p"
+    p = parse_name("WALL-E.2008.1080p.BluRay.x264-RARBG.mkv", kind_hint="movie")
+    assert p.title == "WALL-E"
+    p = parse_name("Spider-Man.2002.720p.mkv", kind_hint="movie")
+    assert p.title == "Spider-Man"
+
+
+def test_movie_hint_keeps_a_trailing_number_in_the_title():
+    """Without the hint guessit reads the trailing number as an episode, so a
+    second pass over the tool's own output renamed the file again."""
+    for name, title in [("Blade Runner 2049 (2017) [2160p].mkv", "Blade Runner 2049"),
+                        ("Apollo 13 (1995) [1080p].mkv", "Apollo 13"),
+                        ("Ocean's 11 (2001) [1080p].mkv", "Ocean's 11"),
+                        ("Fahrenheit 451 (2018) [1080p].mkv", "Fahrenheit 451")]:
+        assert parse_name(name, kind_hint="movie").title == title
+
+
+def test_custom_pattern_file_is_anchored_to_the_app(tmp_path, monkeypatch):
+    """A cwd-relative word list vanished when launched from another folder."""
+    from mediaorg.parse import (custom_patterns_path, load_custom_patterns,
+                                save_custom_patterns)
+    target = tmp_path / "words.json"
+    monkeypatch.setenv("MEDIAORG_PATTERNS", str(target))
+    assert custom_patterns_path() == target
+    save_custom_patterns(["RARBG", r"YTS\.MX"])
+    monkeypatch.chdir(tmp_path / "..") if (tmp_path / "..").exists() else None
+    assert load_custom_patterns() == ["RARBG", r"YTS\.MX"]
+    save_custom_patterns([])
+    assert load_custom_patterns() == []

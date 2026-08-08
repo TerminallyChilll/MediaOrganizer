@@ -79,18 +79,23 @@ def check_package_structure() -> tuple[str, str]:
     return _ok("Package structure intact")
 
 
-def _validate_json(path: Path) -> tuple[str, str, str]:
-    """Return (status, filename, detail)."""
+def _validate_json(path: Path) -> tuple[str, Path, str]:
+    """Return (status, path, detail).
+
+    The full path, not just the name: these files are resolved relative to
+    the app rather than the current directory, so the repair step has to be
+    pointed at the file that was actually checked.
+    """
     name = path.name
     if not path.exists():
-        return ("WARN", name, f"{name} not present (will be created on first use)")
+        return ("WARN", path, f"{name} not present (will be created on first use)")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, (dict, list)):
-            return ("FAIL", name, f"{name} is not a JSON object/array")
-        return ("OK", name, f"{name} — valid JSON")
+            return ("FAIL", path, f"{name} is not a JSON object/array")
+        return ("OK", path, f"{path} — valid JSON")
     except json.JSONDecodeError as e:
-        return ("FAIL", name, f"{name} is corrupted: {e}")
+        return ("FAIL", path, f"{path} is corrupted: {e}")
 
 
 def check_configs() -> list[tuple[str, str, str]]:
@@ -105,10 +110,16 @@ def check_configs() -> list[tuple[str, str, str]]:
        document, so :func:`json.loads` would fail on a healthy journal.
        Use :func:`check_journal` for journal integrity instead.
     """
+    from .llm import llm_config_path
+    from .parse import custom_patterns_path
+    # The LLM config and the word list are resolved the same way the journal
+    # is (app directory, or an adopted legacy file), so check where they will
+    # actually be read from rather than assuming the current directory.
     results = []
-    for name in (".media_renamer_config.json", ".media_llm_config.json",
-                 "custom_strip_patterns.json"):
-        results.append(_validate_json(Path(name)))
+    for path in (Path(".media_renamer_config.json"),
+                 Path(llm_config_path()),
+                 custom_patterns_path()):
+        results.append(_validate_json(path))
     return results
 
 
@@ -341,11 +352,11 @@ def run_doctor(*, auto_fix: bool = False) -> int:
 
     # 5. Config files
     print("\n── Config files ──")
-    for s, name, msg in check_configs():
-        report(s, name, msg)
+    for s, path, msg in check_configs():
+        report(s, path.name, msg)
         if s == "FAIL" and auto_fix:
-            sf, mf = fix_corrupted_config(Path(name))
-            report(sf, f"{name} (fix)", mf)
+            sf, mf = fix_corrupted_config(path)
+            report(sf, f"{path.name} (fix)", mf)
             if sf == "OK":
                 fixed += 1
                 issues -= 1

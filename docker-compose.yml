@@ -19,6 +19,10 @@ services:
       - /mnt/nas-media/Movies:/media/Movies
       - /mnt/nas-media/TV Shows:/media/TV_Shows
     environment:
+      # These are read by mediaorg.llm.load_llm_config(). The environment
+      # wins over any saved config, and a key supplied this way is never
+      # written to disk. Leaving one unset is fine — a blank value is
+      # ignored rather than treated as an empty key.
       - TZ=${TZ:-America/New_York}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
