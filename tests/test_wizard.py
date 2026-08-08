@@ -299,3 +299,27 @@ def test_ollama_round_trip_against_a_live_stub_server():
 
 def test_unreachable_ollama_reports_no_models_rather_than_crashing():
     assert llm.list_ollama_models("http://127.0.0.1:9") == []
+
+
+def test_an_unwritable_word_list_reports_instead_of_crashing(tmp_path, monkeypatch, capsys):
+    """The app directory can legitimately be unwritable (a system-wide
+    install, a read-only container mount). An unhandled OSError here unwound
+    out of the whole menu.
+
+    A regular file stands in for the unwritable location: chmod is no
+    obstacle to root, which is how the container test suite runs.
+    """
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("this is a file, so it cannot contain the word list")
+    monkeypatch.setenv("MEDIAORG_PATTERNS", str(blocker / "words.json"))
+    _drive(monkeypatch, ["a", "RARBG", "q"])
+    wizard.run_custom_words()              # must return, not raise
+    assert "Could not write" in capsys.readouterr().out
+
+
+def test_a_missing_parent_directory_is_created(tmp_path, monkeypatch):
+    target = tmp_path / "new" / "deeper" / "words.json"
+    monkeypatch.setenv("MEDIAORG_PATTERNS", str(target))
+    _drive(monkeypatch, ["a", "RARBG", "q"])
+    wizard.run_custom_words()
+    assert load_custom_patterns() == ["RARBG"]

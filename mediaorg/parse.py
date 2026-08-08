@@ -125,8 +125,15 @@ def load_custom_patterns(folder: Path | str | None = None) -> list[str]:
 
 def save_custom_patterns(patterns: list[str],
                          folder: Path | str | None = None) -> None:
-    custom_patterns_path(folder).write_text(
-        json.dumps(patterns, indent=2), encoding="utf-8")
+    """Write the word list. Raises OSError if the location is not writable.
+
+    Callers are expected to handle that: the app directory can legitimately
+    be read-only (a system-wide install, a read-only container mount), and a
+    crash there would take the whole wizard down.
+    """
+    path = custom_patterns_path(folder)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(patterns, indent=2), encoding="utf-8")
 
 
 def _strip_keeping_content(pattern, s: str, flags: int = 0) -> str:

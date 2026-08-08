@@ -886,6 +886,22 @@ def run_custom_words() -> None:
     ``save_custom_patterns`` existed but nothing ever called it, so there was
     no way to add a word from the app and no way at all to take one back out.
     """
+    def store(updated: list[str]) -> bool:
+        """Persist the list, reporting rather than crashing the wizard.
+
+        The app directory can legitimately be read-only — a system-wide
+        install, a read-only container mount — and an unhandled OSError here
+        would unwind all the way out of the menu.
+        """
+        try:
+            save_custom_patterns(updated)
+            return True
+        except OSError as exc:
+            print(f"   [!] Could not write {custom_patterns_path()}: {exc}")
+            print("   Set MEDIAORG_PATTERNS to a writable location and "
+                  "try again.")
+            return False
+
     while True:
         patterns = load_custom_patterns()
         print("\n" + "-" * 60)
@@ -935,8 +951,8 @@ def run_custom_words() -> None:
                 print("   [!] That pattern matches whole names, so it would "
                       "never be applied. Not added.")
                 continue
-            save_custom_patterns(patterns + [word])
-            print(f"   [OK] Added: {word}")
+            if store(patterns + [word]):
+                print(f"   [OK] Added: {word}")
 
         elif action == 'r':
             if not patterns:
@@ -953,16 +969,16 @@ def run_custom_words() -> None:
             else:
                 print("   [!] No such entry.")
                 continue
-            save_custom_patterns(patterns)
-            print(f"   [OK] Removed: {gone}")
+            if store(patterns):
+                print(f"   [OK] Removed: {gone}")
 
         elif action == 'c':
             if not patterns:
                 print("   [!] Already empty.")
                 continue
             if ask_yes_no(f"Remove all {len(patterns)} entries?", default=False):
-                save_custom_patterns([])
-                print("   [OK] Cleared.")
+                if store([]):
+                    print("   [OK] Cleared.")
 
         elif action == 't':
             sample = prompt_input("Filename to test: ")
