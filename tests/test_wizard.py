@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from mediaorg import llm, wizard
+from mediaorg import llm, update, wizard
 from mediaorg.parse import load_custom_patterns, save_custom_patterns
 
 
@@ -392,3 +392,52 @@ def test_a_missing_parent_directory_is_created(tmp_path, monkeypatch):
     _drive(monkeypatch, ["a", "RARBG", "q"])
     wizard.run_custom_words()
     assert load_custom_patterns() == ["RARBG"]
+
+
+# --- Update notice in the menu -----------------------------------------------
+
+@pytest.fixture
+def quiet_update_check(monkeypatch):
+    """The menu kicks off a network check on entry; keep tests offline."""
+    monkeypatch.setattr(update, "begin_background_check", lambda **kw: None)
+    monkeypatch.setattr(update, "latest_status", lambda: None)
+
+
+def test_menu_is_silent_when_there_is_no_update(quiet_update_check, monkeypatch, capsys):
+    _drive(monkeypatch, ["0"])
+    wizard.run_wizard()
+    out = capsys.readouterr().out
+    assert "Update available" not in out
+    assert "[U] Update Media Organizer" in out      # the option is still offered
+
+
+def test_menu_shows_the_update_command_when_behind(quiet_update_check, monkeypatch, capsys):
+    monkeypatch.setattr(update, "latest_status", lambda: update.UpdateStatus(
+        state=update.BEHIND, behind=3, upstream="origin/main",
+        local="aaaaaaa", remote="bbbbbbb"))
+    _drive(monkeypatch, ["0"])
+    wizard.run_wizard()
+    out = capsys.readouterr().out
+    assert "3 commits behind origin/main" in out
+    assert "python run.py --update" in out
+
+
+def test_menu_u_runs_the_update_and_exits_when_it_pulled(quiet_update_check,
+                                                         monkeypatch, capsys):
+    """After a successful pull the files on disk no longer match the modules
+    this process imported, so the wizard must hand back to a fresh launch."""
+    monkeypatch.setattr(update, "check",
+                        lambda **kw: update.UpdateStatus(state=update.BEHIND, behind=1))
+    monkeypatch.setattr(update, "run_update", lambda **kw: 0)
+    _drive(monkeypatch, ["u"])                       # no "0" — it must exit itself
+    wizard.run_wizard()
+    assert "Exiting so the new version is loaded" in capsys.readouterr().out
+
+
+def test_menu_u_returns_to_the_menu_when_already_current(quiet_update_check,
+                                                         monkeypatch):
+    monkeypatch.setattr(update, "check",
+                        lambda **kw: update.UpdateStatus(state=update.CURRENT))
+    monkeypatch.setattr(update, "run_update", lambda **kw: 0)
+    _drive(monkeypatch, ["U", "0"])                  # must still be here for the "0"
+    wizard.run_wizard()
