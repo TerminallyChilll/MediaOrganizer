@@ -5,6 +5,7 @@ A cross-platform tool to scan media libraries, organize TV show structures, and 
 ## Features
 - **Clean file names:** `The.Matrix.1999.1080p.BluRay.x264-RARBG.mkv` → `The Matrix (1999) [1080p].mkv`. Handles the hard cases: `WALL-E`, `Se7en`, `Blade Runner 2049`, `1917`, multi-episode `S01E01E02`, date-based shows, `The Office (US)`.
 - **Organize TV structures:** loose `S01E01` files/folders are grouped into `Season X` folders; duplicate season folders (`S02` + `Season 2`) are merged; subtitles and `.nfo` files move (and rename) together with their episode.
+- **Handles nested libraries:** shows are found wherever they sit — `TV/Show`, `TV/Genre/Show`, `TV/Genre/SubGenre/Show` — and season folders are flattened however deep the episode is buried (`Season 1/Disc 1/ep.mkv`, `Season 1/Show.S01E01/Subs/ep.mkv`). Episodes dumped in a non-season subfolder (`Show/Downloads/Show.S01E01.mkv`) are routed into the right season folder, one season at a time. See [Nested folders](#nested-folders).
 - **Safe by design:** every change is planned first, previewed, and only applied after you confirm. Collisions are never overwritten — conflicting changes are skipped and reported. `--dry-run` shows the plan without touching anything. Scanning never modifies files. Nothing is ever deleted: the only destructive primitive is "remove this directory if it is empty".
 - **Journaled undo:** every applied change is recorded (with the actual paths, plus the file's size and mtime) in `mediaorg_journal.jsonl`, which lives **next to the app** — not in whatever directory you happened to launch from. `python run.py --list-runs` shows the history; `--undo` reverses the last run, `--undo-run <id>` a specific one, and `--undo-session` the whole of a `--action full`. An *intent* record is written before every change, so a crash or a half-finished copy across drives is detected and cleaned up rather than left to block future runs.
 - **Excel journal:** your library is written to an `.xlsx`. Edit the `… Fixed` columns to override any title/year/quality and the next rename pass uses your values.
@@ -68,6 +69,52 @@ Undo refuses to move a file back if it was modified or replaced after the fact,
 and refuses to reverse a run out of order when a newer run touched the same
 paths. `--force` overrides either check. The journal location can be pinned
 with the `MEDIAORG_JOURNAL` environment variable.
+
+### Nested folders
+A **show folder** is the shallowest folder that directly contains season
+folders (`Season 1`, `S01`, `Specials`) or `SxxEyy` episode files. Everything
+above it is treated as a wrapper and left alone, so `TV/Genre/SubGenre/Show`
+is organized in place rather than being flattened into the library root. The
+search descends four levels below the folder you select; shows nested deeper
+than that are not found.
+
+Inside a show, a season folder is expected to hold episodes and nothing else,
+so anything nested below one is lifted out and the emptied folders removed:
+
+```
+Show/Season 1/Disc 1/ep.mkv           ->  Show/Season 1/ep.mkv
+Show/Season 1/Show.S01E01/Subs/ep.mkv ->  Show/Season 1/ep.mkv
+Show/Downloads/Show.S02E03.mkv        ->  Show/Season 2/Show.S02E03.mkv
+```
+
+A file is only ever moved when something says where it goes — its own episode
+code, or the code in the name of the folder holding it. Nothing is placed by
+position alone, so `Artwork/poster.jpg` stays put, and `Season 1/Extras/
+Show.S02E05.mkv` goes to `Season 2`, not to the season folder it happened to
+be sitting in. Aspect-ratio names are not read as episode codes:
+`banner-16x9.jpg` is artwork, not season 16.
+
+These are left alone entirely, even when the files inside them carry episode
+codes: local-extras folders (`Specials`, `Extras`, `Trailers`, `Featurettes`,
+`Behind The Scenes`, `Deleted Scenes`, `Interviews`, `Bonus`, `Other`), and
+OS/NAS bookkeeping directories (`@eaDir`, `.trashes`, `$RECYCLE.BIN`, …). A
+folder is only removed once everything in it has been moved out.
+
+**Wrappers vs. shows.** A folder that contains a show is a wrapper and is left
+where it is. That is decided by what is on disk, not by the folder's name, so
+two flat shows under one bucket stay two shows:
+
+```
+Genre/ShowA/ShowA.S01E01.mkv   ->  Genre/ShowA/Season 1/…
+Genre/ShowB/ShowB.S01E01.mkv   ->  Genre/ShowB/Season 1/…
+```
+
+**One case the tool cannot resolve for you.** `Show/Downloads/Show.S01E01.mkv`
+and `Genre/Show/Show.S01E01.mkv` are the same shape on disk — nothing in the
+names says which folder is the show. The inner one always wins, so a show
+behind a wrapper is found correctly, and a dump folder is named as the show
+(`Downloads`, `Complete Series`). Fix those by typing the real name in the
+`Folder Fixed` column and re-running the rename.
 
 ### The Fixed-columns workflow
 1. Run a scan (`[5]`). Open the `.xlsx`.

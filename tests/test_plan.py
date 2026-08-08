@@ -7,7 +7,8 @@ from mediaorg.parse import ParsedName
 from mediaorg.plan import (
     NamingScheme, Op, build_episode_file_name, build_movie_file_name,
     build_movie_folder_name, check_collisions, companion_files, episode_code,
-    extract_season_episode, folder_has_episodes_or_seasons, plan_loose_movies,
+    extract_season_episode, find_show_roots, folder_has_episodes_or_seasons,
+    plan_loose_movies,
     plan_season_structure, sanitize,
 )
 
@@ -377,3 +378,369 @@ def test_hardlinked_target_is_not_waved_through(tmp_path):
         pytest.skip("filesystem does not support hardlinks")
     plan = check_collisions([Op("move", a, b)])
     assert plan.ops == [] and "already exists" in plan.skipped[0][1]
+
+
+# --- Nested layouts ----------------------------------------------------------
+#
+# Shows do not reliably sit one level below the library root, and season
+# folders do not reliably hold their episodes directly. Every case here was
+# either silently a no-op or produced a wrong result before show discovery
+# became recursive and flattening became depth-independent.
+
+def test_find_show_roots_at_the_top_level(tmp_path):
+    touch(tmp_path / "Show" / "Season 1" / "Show.S01E01.mkv")
+    assert find_show_roots(tmp_path) == [tmp_path / "Show"]
+
+
+def test_find_show_roots_through_a_wrapper_folder(tmp_path):
+    touch(tmp_path / "Genre" / "Show" / "Season 1" / "Show.S01E01.mkv")
+    assert find_show_roots(tmp_path) == [tmp_path / "Genre" / "Show"]
+
+
+def test_find_show_roots_through_two_wrapper_folders(tmp_path):
+    """The old two-level descent silently found nothing this deep."""
+    touch(tmp_path / "Genre" / "Sub" / "Show" / "Season 1" / "Show.S01E01.mkv")
+    assert find_show_roots(tmp_path) == [tmp_path / "Genre" / "Sub" / "Show"]
+
+
+def test_find_show_roots_stops_at_the_show(tmp_path):
+    """A season folder also looks episode-bearing; it must not become a show."""
+    touch(tmp_path / "Show" / "Season 1" / "Show.S01E01.mkv")
+    roots = find_show_roots(tmp_path)
+    assert roots == [tmp_path / "Show"]
+    assert tmp_path / "Show" / "Season 1" not in roots
+
+
+def test_find_show_roots_when_the_root_is_itself_the_show(tmp_path):
+    touch(tmp_path / "Season 1" / "Show.S01E01.mkv")
+    assert find_show_roots(tmp_path) == [tmp_path]
+
+
+def test_a_specials_only_folder_still_counts_as_a_show(tmp_path):
+    touch(tmp_path / "Show" / "Specials" / "Christmas.mkv")
+    assert find_show_roots(tmp_path) == [tmp_path / "Show"]
+
+
+def test_sibling_flat_shows_behind_a_wrapper_stay_separate(tmp_path):
+    """Two flat shows under one wrapper are two shows, not one.
+
+    An earlier rule credited the *parent* whenever an episode-bearing folder
+    turned up below the top level, to name "Show/Downloads" as "Show". Keyed
+    on depth alone it also fired here, resolving to [Genre] — which then
+    merged both shows into "Genre/Season 1" and removed both show folders.
+    Genre buckets over flat shows are mainstream, so the rule had to go.
+    """
+    touch(tmp_path / "Genre" / "ShowA" / "ShowA.S01E01.mkv")
+    touch(tmp_path / "Genre" / "ShowB" / "ShowB.S01E01.mkv")
+    assert find_show_roots(tmp_path) == [tmp_path / "Genre" / "ShowA",
+                                         tmp_path / "Genre" / "ShowB"]
+
+
+def test_a_dump_folder_is_named_as_the_show(tmp_path):
+    """The documented trade-off of dropping parent-crediting.
+
+    "Show/Downloads/ep.mkv" is the same shape on disk as "Genre/Show/ep.mkv",
+    so the inner folder wins. The user corrects it with Folder Fixed.
+    """
+    touch(tmp_path / "Show" / "Downloads" / "Show.S01E01.mkv")
+    assert find_show_roots(tmp_path) == [tmp_path / "Show" / "Downloads"]
+
+
+def test_stray_release_folder_does_not_make_the_library_one_show(tmp_path):
+    """A single SxxEyy-named folder in the root used to swallow the library.
+
+    folder_has_episodes_or_seasons(root) was True because of that folder's
+    name, so find_show_roots returned [root] and step 3b then planned every
+    real show's episodes into "root/Season N" and rmdir'd the show folders.
+    """
+    touch(tmp_path / "Breaking Bad" / "Season 1" / "BB.S01E01.mkv")
+    touch(tmp_path / "The Office" / "Season 1" / "TO.S01E01.mkv")
+    touch(tmp_path / "Show.S01E05.1080p.WEB" / "ep.mkv")
+    assert find_show_roots(tmp_path) == [tmp_path / "Breaking Bad",
+                                         tmp_path / "The Office"]
+
+
+def test_stray_extras_folder_does_not_make_the_library_one_show(tmp_path):
+    """Same hazard via the specials marker rather than an SxxEyy name."""
+    touch(tmp_path / "Breaking Bad" / "Season 1" / "BB.S01E01.mkv")
+    touch(tmp_path / "Extras" / "readme.txt")
+    assert find_show_roots(tmp_path) == [tmp_path / "Breaking Bad"]
+
+
+def test_a_show_keeps_a_stray_episode_bearing_subfolder(tmp_path):
+    """A show with its own seasons is a show, even next to a dump folder."""
+    touch(tmp_path / "Show" / "Season 1" / "Show.S01E01.mkv")
+    touch(tmp_path / "Show" / "Disc 1" / "Show.S01E02.mkv")
+    assert find_show_roots(tmp_path) == [tmp_path / "Show"]
+
+
+def test_show_search_depth_is_bounded(tmp_path):
+    deep = tmp_path.joinpath(*[f"w{i}" for i in range(8)])
+    touch(deep / "Season 1" / "Show.S01E01.mkv")
+    assert find_show_roots(tmp_path) == []
+
+
+def test_flatten_non_episode_subfolder_inside_season(tmp_path):
+    """"Season 1/Disc 1/ep.mkv" — only episode-NAMED folders used to flatten."""
+    touch(tmp_path / "Season 1" / "Disc 1" / "Show.S01E01.mkv")
+    plan = plan_season_structure(tmp_path)
+    apply_plan(plan)
+    assert (tmp_path / "Season 1" / "Show.S01E01.mkv").exists()
+    assert not (tmp_path / "Season 1" / "Disc 1").exists()
+
+
+def test_flatten_is_depth_independent(tmp_path):
+    """Two levels below the season folder, with a companion alongside."""
+    nested = tmp_path / "Season 1" / "Show.S01E01" / "Subs"
+    touch(nested / "Show.S01E01.mkv")
+    touch(tmp_path / "Season 1" / "Show.S01E01" / "Show.S01E01.en.srt")
+    plan = plan_season_structure(tmp_path)
+    apply_plan(plan)
+    assert sorted(p.name for p in (tmp_path / "Season 1").iterdir()) == \
+        ["Show.S01E01.en.srt", "Show.S01E01.mkv"]
+
+
+def test_flatten_keeps_a_directory_that_still_has_contents(tmp_path):
+    """rmdir is empty-only; planning one for a non-empty dir just fails."""
+    ep = tmp_path / "Season 1" / "Show.S01E01"
+    touch(ep / "Show.S01E01.mkv")
+    touch(ep / "keep-me.exe")
+    plan = plan_season_structure(tmp_path)
+    assert not any(o.kind == "rmdir" and o.dst == ep for o in plan.ops)
+    apply_plan(plan)
+    assert (tmp_path / "Season 1" / "Show.S01E01.mkv").exists()
+    assert (ep / "keep-me.exe").exists()
+
+
+def test_loose_episode_folder_is_unpacked_into_the_season(tmp_path):
+    """The folder used to be nested inside the season folder intact, leaving
+    "Season 1/Show.S01E01.1080p/Show.S01E01.1080p.mkv"."""
+    ep = tmp_path / "Show.S01E01.1080p"
+    touch(ep / "Show.S01E01.1080p.mkv")
+    touch(ep / "Show.S01E01.en.srt")
+    plan = plan_season_structure(tmp_path)
+    apply_plan(plan)
+    assert sorted(p.name for p in (tmp_path / "Season 1").iterdir()) == \
+        ["Show.S01E01.1080p.mkv", "Show.S01E01.en.srt"]
+    assert not ep.exists()
+
+
+def test_dump_folder_episodes_are_routed_per_season(tmp_path):
+    """One folder can hold several seasons; each file goes to its own."""
+    touch(tmp_path / "Downloads" / "Show.S01E01.mkv")
+    touch(tmp_path / "Downloads" / "Show.S02E03.mkv")
+    plan = plan_season_structure(tmp_path)
+    apply_plan(plan)
+    assert (tmp_path / "Season 1" / "Show.S01E01.mkv").exists()
+    assert (tmp_path / "Season 2" / "Show.S02E03.mkv").exists()
+    assert not (tmp_path / "Downloads").exists()
+
+
+def test_unrelated_subfolders_are_left_alone(tmp_path):
+    """An "Artwork" folder holds no episodes and must not be touched."""
+    touch(tmp_path / "Season 1" / "Show.S01E01.mkv")
+    touch(tmp_path / "Artwork" / "poster.jpg")
+    plan = plan_season_structure(tmp_path)
+    assert plan.ops == [] and plan.skipped == []
+
+
+def test_specials_folder_is_not_flattened_away(tmp_path):
+    touch(tmp_path / "Specials" / "Christmas.mkv")
+    plan = plan_season_structure(tmp_path)
+    assert plan.ops == []
+
+
+def test_files_without_an_episode_code_are_not_guessed_at(tmp_path):
+    """A dump folder's non-episode files stay put rather than landing in S01."""
+    touch(tmp_path / "Downloads" / "Show.S01E01.mkv")
+    touch(tmp_path / "Downloads" / "some-trailer.mkv")
+    plan = plan_season_structure(tmp_path)
+    apply_plan(plan)
+    assert (tmp_path / "Season 1" / "Show.S01E01.mkv").exists()
+    assert (tmp_path / "Downloads" / "some-trailer.mkv").exists()
+
+
+# --- Lifting is conservative -------------------------------------------------
+
+def test_local_extras_folders_inside_a_season_are_left_intact(tmp_path):
+    """Plex/Jellyfin local-extras folders must not be dissolved into the season.
+
+    Step 2 used to lift every media file out of every season subfolder with no
+    name or episode-code check, so these were flattened and rmdir'd and the
+    media server then indexed them as episodes.
+    """
+    touch(tmp_path / "Season 1" / "Show.S01E01.mkv")
+    for extras in ("Specials", "Trailers", "Behind The Scenes", "Deleted Scenes"):
+        touch(tmp_path / "Season 1" / extras / "clip.mkv")
+    plan = plan_season_structure(tmp_path)
+    assert plan.ops == [] and plan.skipped == []
+
+
+def test_cross_season_file_is_routed_to_its_own_season(tmp_path):
+    """A stray S02 file inside Season 1 goes to Season 2, not Season 1."""
+    touch(tmp_path / "Season 1" / "Show.S01E01.mkv")
+    touch(tmp_path / "Season 2" / "Show.S02E01.mkv")
+    touch(tmp_path / "Season 1" / "Disc 1" / "Show.S02E05.mkv")
+    plan = plan_season_structure(tmp_path)
+    apply_plan(plan)
+    assert (tmp_path / "Season 2" / "Show.S02E05.mkv").exists()
+
+
+def test_artwork_is_not_routed_by_an_aspect_ratio(tmp_path):
+    """"banner-16x9.jpg" is artwork, not season 16 — no "Season 16" folder."""
+    touch(tmp_path / "Season 1" / "Show.S01E01.mkv")
+    touch(tmp_path / "Artwork" / "banner-16x9.jpg")
+    plan = plan_season_structure(tmp_path)
+    assert plan.ops == []
+    apply_plan(plan)
+    assert not (tmp_path / "Season 16").exists()
+    assert (tmp_path / "Artwork" / "banner-16x9.jpg").exists()
+
+
+def test_junk_directory_contents_are_never_lifted(tmp_path):
+    """os.walk descends into junk dirs regardless, so pruning must be by path.
+
+    @eaDir thumbnails were being lifted into the library; the same hole let
+    .trashes / $recycle.bin content be resurrected.
+    """
+    touch(tmp_path / "Season 1" / "Show.S01E01.mkv")
+    touch(tmp_path / "Season 1" / "@eaDir" / "Show.S01E01.mkv" / "SYNOPHOTO_THUMB_L.jpg")
+    touch(tmp_path / "Season 1" / ".trashes" / "Show.S09E09.mkv")
+    plan = plan_season_structure(tmp_path)
+    assert plan.ops == []
+
+
+def test_colliding_lifts_leave_no_orphan_rmdir(tmp_path):
+    """A skipped move must take the rmdir that depended on it with it.
+
+    Otherwise the rmdir fails with "Directory not empty" on this run and every
+    run after it, with nothing the user can do about it.
+    """
+    touch(tmp_path / "Season 1" / "Disc 1" / "Show.S01E01.mkv")
+    touch(tmp_path / "Season 1" / "Disc 2" / "Show.S01E01.mkv")
+    plan = plan_season_structure(tmp_path)
+    assert [o for o in plan.ops if o.kind == "rmdir"] == []
+    apply_plan(plan)
+    assert (tmp_path / "Season 1" / "Disc 1" / "Show.S01E01.mkv").exists()
+    assert (tmp_path / "Season 1" / "Disc 2" / "Show.S01E01.mkv").exists()
+
+
+def test_duplicate_season_merge_flattens_in_one_pass(tmp_path):
+    """Step 1 used to move the subdirectory across, so step 2 — which planned
+    against the pre-merge layout — both missed it and ran against a stale
+    source."""
+    touch(tmp_path / "Season 2" / "Show.S02E02.mkv")
+    touch(tmp_path / "S02" / "Disc 1" / "Show.S02E01.mkv")
+    plan = plan_season_structure(tmp_path)
+    apply_plan(plan)
+    assert sorted(p.name for p in (tmp_path / "Season 2").iterdir()) == \
+        ["Show.S02E01.mkv", "Show.S02E02.mkv"]
+    assert not (tmp_path / "S02").exists()
+
+
+def test_stray_root_folder_with_shows_two_levels_down(tmp_path):
+    """The wrapper test has to search the whole subtree, not just children.
+
+    With shows at "TV/Drama/Breaking Bad", looking only one level down saw no
+    show directly under the root, so a single stray SxxEyy-named folder there
+    still made the root claim the entire library.
+    """
+    touch(tmp_path / "Drama" / "Breaking Bad" / "Season 1" / "BB.S01E01.mkv")
+    touch(tmp_path / "Drama" / "The Office" / "Season 1" / "TO.S01E01.mkv")
+    touch(tmp_path / "Stray.S01E05.WEB" / "ep.mkv")
+    assert find_show_roots(tmp_path) == [tmp_path / "Drama" / "Breaking Bad",
+                                         tmp_path / "Drama" / "The Office"]
+
+
+def test_root_that_is_a_show_still_finds_shows_beside_it(tmp_path):
+    """A library root can be a show *and* hold other shows.
+
+    Returning as soon as the root qualified dropped those siblings silently:
+    never organized, and no row in the spreadsheet either.
+    """
+    touch(tmp_path / "Show.S01E01.mkv")
+    touch(tmp_path / "Other Show" / "Season 1" / "Other.S01E01.mkv")
+    assert find_show_roots(tmp_path) == [tmp_path, tmp_path / "Other Show"]
+
+
+def test_a_show_with_a_dump_folder_is_not_split_in_two(tmp_path):
+    """The other side of that rule: only a child with season folders of its
+    own is a separate show. A child holding loose episodes is a dump folder."""
+    touch(tmp_path / "Show.S01E01.mkv")
+    touch(tmp_path / "Downloads" / "Show.S01E02.mkv")
+    assert find_show_roots(tmp_path) == [tmp_path]
+
+
+def test_a_bucket_named_other_does_not_hide_shows(tmp_path):
+    """"Other" is an ordinary catch-all bucket name, not a local-extras marker.
+
+    Treating it as one made the show search step over it, so every show
+    beneath "TV/Other/" was undiscoverable.
+    """
+    touch(tmp_path / "Other" / "Show" / "Season 1" / "Show.S01E01.mkv")
+    touch(tmp_path / "Drama" / "Show2" / "Season 1" / "S2.S01E01.mkv")
+    assert find_show_roots(tmp_path) == [tmp_path / "Drama" / "Show2",
+                                         tmp_path / "Other" / "Show"]
+
+
+def test_a_trailers_folder_is_still_not_a_show(tmp_path):
+    """The other names stay: a folder called Trailers holding an episode-coded
+    trailer must not be promoted to a show of its own."""
+    touch(tmp_path / "Show" / "Season 1" / "Show.S01E01.mkv")
+    touch(tmp_path / "Show" / "Trailers" / "Show.S01E01.Trailer.mkv")
+    assert find_show_roots(tmp_path) == [tmp_path / "Show"]
+    assert plan_season_structure(tmp_path / "Show").ops == []
+
+
+def test_one_unreadable_dir_does_not_suppress_unrelated_rmdirs(tmp_path, monkeypatch):
+    """A shared flag let one unreadable corner block every rmdir in the walk."""
+    season = tmp_path / "Season 1"
+    touch(season / "Disc 1" / "Show.S01E01.mkv")
+    (season / "Locked").mkdir()
+
+    real_scandir = os.scandir
+
+    def flaky_scandir(path=".", *args, **kwargs):
+        if os.path.basename(str(path)) == "Locked":
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", flaky_scandir)
+    plan = plan_season_structure(tmp_path)
+
+    rmdirs = {o.dst for o in plan.ops if o.kind == "rmdir"}
+    # "Disc 1" is emptied by this plan and is nowhere near the unreadable dir.
+    assert season / "Disc 1" in rmdirs
+    # The unreadable directory itself, and the season folder above it, are not
+    # known to be empty and must be left alone.
+    assert season / "Locked" not in rmdirs and season not in rmdirs
+
+
+def test_duplicate_season_rmdir_waits_until_it_is_really_empty(tmp_path):
+    """Step 1 emitted its rmdir unconditionally.
+
+    `place` only routes files it can identify, so a subdirectory holding a
+    placeable episode plus an unplaceable file survives the merge — and the
+    rmdir above it then fails with "Directory not empty", on this run and
+    every run after it.
+    """
+    touch(tmp_path / "Season 2" / "Show.S02E01.mkv")
+    touch(tmp_path / "S02" / "keep" / "Show.S02E02.mkv")
+    touch(tmp_path / "S02" / "keep" / "notes.txt")
+
+    plan = plan_season_structure(tmp_path)
+    assert [o.dst for o in plan.ops if o.kind == "rmdir"] == []
+    apply_plan(plan)
+    assert (tmp_path / "Season 2" / "Show.S02E02.mkv").exists()
+    assert (tmp_path / "S02" / "keep" / "notes.txt").exists()
+
+
+def test_duplicate_season_rmdir_still_happens_when_it_does_empty(tmp_path):
+    """The ordinary case must keep cleaning up after itself."""
+    touch(tmp_path / "Season 2" / "Show.S02E01.mkv")
+    touch(tmp_path / "S02" / "keep" / "Show.S02E02.mkv")
+
+    plan = plan_season_structure(tmp_path)
+    apply_plan(plan)
+    assert not (tmp_path / "S02").exists()
+    assert (tmp_path / "Season 2" / "Show.S02E02.mkv").exists()

@@ -13,7 +13,8 @@ from tqdm import tqdm
 
 from .parse import (VIDEO_EXTS, is_junk_dir, is_junk_name, is_media_file,
                     parse_name)
-from .plan import extract_season_episode
+from .plan import (SPECIALS_FOLDER_PATTERN, extract_season_episode,
+                   find_show_roots, has_season_structure)
 
 # Anchored. The old unanchored substring search matched "Seasoning Show",
 # "S1" and "s0", and since this pattern also drives show-folder re-parenting a
@@ -23,9 +24,9 @@ _SEASONISH_DIR = re.compile(
     r'^(?:season|series|saison|staffel)\s*\d{1,4}(?:\s*\(\d{4}\))?$'
     r'|^s\d{1,4}(?:\s*\(\d{4}\))?$', re.IGNORECASE)
 # Specials live outside the numbered seasons but are still episodes; without
-# this they were dropped from the scan entirely.
-_SPECIALS_DIR = re.compile(r'^(?:specials?|extras?|featurettes?|bonus)$',
-                           re.IGNORECASE)
+# this they were dropped from the scan entirely. Shared with the organizer's
+# show detection so the two can never disagree about what marks a show.
+_SPECIALS_DIR = SPECIALS_FOLDER_PATTERN
 
 
 def _is_seasonish(name: str) -> bool:
@@ -149,19 +150,87 @@ def _scan_show_episodes(show_path: Path,
                     'season': s, 'episode': ep,
                     'rel_path': _rel(full, show_path),
                     'size': round(full.stat().st_size / 1024 ** 3, 2)})
+
+    # Episodes dumped in a subfolder that is not season-ish at all — "Disc 1",
+    # "Downloads". The organizer lifts these into their season, so the scanner
+    # has to see them too: otherwise a scan-then-rename run (menu [1] or [5],
+    # with no organize step) silently skips them, and the two halves of the
+    # tool disagree about what the library contains. A subfolder with season
+    # folders of its own is a nested show and stays out of this show's rows,
+    # the same rule the organizer applies before lifting anything.
+    for entry in entries:
+        if not entry.is_dir(follow_symlinks=False):
+            continue
+        if _is_seasonish(entry.name) or is_junk_dir(entry.name):
+            continue
+        if has_season_structure(Path(entry.path)):
+            continue
+        for dirpath, _dirnames, filenames in _walk(Path(entry.path)):
+            for f in sorted(filenames):
+                if not is_media_file(f):
+                    continue
+                s, ep, _date = _episode_key(f, custom_patterns)
+                if s is None:
+                    continue
+                full = Path(dirpath) / f
+                episodes.append({
+                    'season': s, 'episode': ep,
+                    'rel_path': _rel(full, show_path),
+                    'size': round(full.stat().st_size / 1024 ** 3, 2)})
     return episodes
+
+
+def _unexplained_dirs(tv_root: Path, show_roots: list[Path]) -> list[Path]:
+    """Directories holding no discovered show, at or below them.
+
+    Descends only through directories that *do* lead to a show, so the result
+    is the shallowest directory of each subtree the show search could not
+    account for — one placeholder row per unexplained branch, rather than one
+    per orphaned leaf.
+    """
+    if tv_root in show_roots:
+        return []
+    roots = set(show_roots)
+
+    def leads_to_show(directory: Path) -> bool:
+        return any(r == directory or directory in r.parents for r in roots)
+
+    unexplained: list[Path] = []
+
+    def walk(directory: Path) -> None:
+        try:
+            children = sorted((Path(e.path) for e in os.scandir(directory)
+                               if e.is_dir(follow_symlinks=False)
+                               and not is_junk_dir(e.name)),
+                              key=lambda p: p.name)
+        except OSError:
+            return
+        for child in children:
+            if child in roots:
+                continue          # the show itself — already scanned
+            if leads_to_show(child):
+                walk(child)       # a wrapper on the way to a show
+            else:
+                unexplained.append(child)
+    walk(tv_root)
+    return unexplained
 
 
 def scan_tv(tv_root: Path, custom_patterns: list[str] = ()) -> list[dict]:
     tv_root = Path(tv_root)
     if not tv_root.is_dir():
         return []
-    folders = sorted(e.name for e in os.scandir(tv_root)
-                     if e.is_dir(follow_symlinks=False) and not is_junk_dir(e.name))
+
+    # Find shows however deeply they are nested, using the same rule the
+    # organizer uses. Scanning only the top level meant a "Genre/Show"
+    # library recorded the *genre* as the show — wrong title, and the
+    # episodes underneath were invisible.
+    show_roots = find_show_roots(tv_root)
     rows = []
-    for folder_name in tqdm(folders, desc="Scanning TV Shows", unit="show"):
-        show_path = tv_root / folder_name
-        p = parse_name(folder_name, custom_patterns=custom_patterns)
+    for show_path in tqdm(show_roots, desc="Scanning TV Shows", unit="show"):
+        folder_name = '.' if show_path == tv_root else _rel(show_path, tv_root)
+        # Parse the show's own directory name, never the path leading to it.
+        p = parse_name(show_path.name, custom_patterns=custom_patterns)
         episodes = _scan_show_episodes(show_path, custom_patterns)
         if not episodes:
             rows.append({
@@ -186,6 +255,24 @@ def scan_tv(tv_root: Path, custom_patterns: list[str] = ()) -> list[dict]:
                 'Quality': pf.quality or '', 'Quality Fixed': '',
                 'Size (GB)': ep['size'],
             })
+
+    # Every directory the show search could not explain gets a placeholder
+    # row. That is what tells run_scan to fall back to a full recursive walk
+    # for it, and what makes it visible in the sheet instead of silently
+    # absent. Keying this on the top-level folder alone was not enough: once
+    # one show was found under "Genre", the whole of "Genre" counted as
+    # covered, so any *other* unrecognised subtree beneath it lost both its
+    # row and its fallback and disappeared without a trace.
+    for unexplained in _unexplained_dirs(tv_root, show_roots):
+        p = parse_name(unexplained.name, custom_patterns=custom_patterns)
+        rows.append({
+            'Show Folder': _rel(unexplained, tv_root), 'Folder Fixed': '',
+            'Title': p.title, 'Title Fixed': '',
+            'Season': '', 'Season Year': '', 'Episode': '',
+            'Episode File': '', 'File Fixed': '',
+            'Quality': '', 'Quality Fixed': '',
+            'Size (GB)': folder_size_gb(unexplained),
+        })
     return rows
 
 

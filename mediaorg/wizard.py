@@ -17,7 +17,7 @@ from .execute import (execute, journal_path, last_run_ops, list_runs,
                       pending_runs, recover, undo_last, undo_last_run,
                       undo_run, undo_session)
 from .parse import load_custom_patterns, parse_name
-from .plan import (NamingScheme, Op, Plan, folder_has_episodes_or_seasons,
+from .plan import (NamingScheme, Op, Plan, find_show_roots,
                    plan_loose_movies, plan_season_structure)
 
 CONFIG_FILE = ".media_renamer_config.json"
@@ -276,24 +276,22 @@ def _journal_path() -> Path:
 def run_organize(tv_path: str, dry_run: bool = False, *,
                  session: str | None = None) -> None:
     root = Path(tv_path)
+    show_roots = find_show_roots(root)
+    if not show_roots:
+        print("\n   [!] No TV shows found under this folder.")
+        print("       A show folder is one that directly contains season "
+              "folders\n       (\"Season 1\", \"S01\") or SxxEyy episode files.")
+        return
+
+    print(f"\n   [OK] Found {len(show_roots)} show folder(s):")
+    for show in show_roots[:10]:
+        print(f"       {'.' if show == root else show.relative_to(root)}")
+    if len(show_roots) > 10:
+        print(f"       ... and {len(show_roots) - 10} more")
+
     plan = Plan()
-    if folder_has_episodes_or_seasons(root):
-        plan.merge(plan_season_structure(root))
-    else:
-        for entry in sorted(os.scandir(root), key=lambda e: e.name):
-            if entry.is_dir(follow_symlinks=False):
-                child = Path(entry.path)
-                if folder_has_episodes_or_seasons(child):
-                    plan.merge(plan_season_structure(child))
-                else:
-                    # Descend one more level for nested Show/Show/Season layouts.
-                    try:
-                        for sub in sorted(os.scandir(child), key=lambda e: e.name):
-                            if sub.is_dir(follow_symlinks=False) and \
-                                    folder_has_episodes_or_seasons(Path(sub.path)):
-                                plan.merge(plan_season_structure(Path(sub.path)))
-                    except OSError:
-                        pass
+    for show in show_roots:
+        plan.merge(plan_season_structure(show))
     confirm_and_execute(plan, _journal_path(), dry_run, "TV structure changes",
                         roots=[root], session=session)
 
@@ -417,11 +415,19 @@ def run_scan(movies_path, tv_path, excel_path: Path, dry_run: bool = False) -> N
                 tv_rows.extend(added_rows)
                 # Drop placeholder show rows now covered by recursive finds
                 # (same stale-parent-rename hazard as the movies side).
-                covered = {Path(rr['Show Folder']).parts[0] for rr in added_rows
+                # A structured Show Folder can now be a nested path
+                # ("Genre/Show"), so this needs a real ancestor test — the old
+                # first-component comparison left the placeholder in place, and
+                # plan_renames then renamed that parent ahead of the child ops
+                # it had just stranded.
+                covered = {Path(rr['Show Folder']) for rr in added_rows
                            if rr['Show Folder'] != '.'}
+                def _is_covered(folder: str) -> bool:
+                    here = Path(folder)
+                    return any(c == here or here in c.parents for c in covered)
                 tv_rows[:] = [r for r in tv_rows
                               if r.get('Episode File')
-                              or r['Show Folder'] not in covered]
+                              or not _is_covered(r['Show Folder'])]
                 print(f"   [OK] Recursive scan added {len(added_rows)} episode(s) "
                       f"(total {len(tv_rows)}).")
             elif not tv_rows:
