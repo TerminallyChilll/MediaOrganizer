@@ -5,6 +5,7 @@ ASCII markers only ([OK], [!], ->): no emoji, no cp1252 crashes.
 
 import argparse
 import dataclasses
+import enum
 import getpass
 import json
 import os
@@ -215,6 +216,19 @@ def _crosses_devices(plan: Plan) -> list[Op]:
     return crossing
 
 
+def _stdin_is_interactive() -> bool:
+    """Is there a human who could answer a prompt?
+
+    A cron job, a Docker service and a piped run all reach the same prompts an
+    interactive session does. Asking them a question produces an EOFError over
+    an already-mutated library, which is the worst of both worlds.
+    """
+    try:
+        return bool(sys.stdin) and sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False    # detached or closed stdin
+
+
 def _parse_item_numbers(arg: str, total: int) -> list[int] | None:
     """"3", "3,7", "3-5,9" -> zero-based indices. None if it doesn't parse.
 
@@ -226,35 +240,54 @@ def _parse_item_numbers(arg: str, total: int) -> list[int] | None:
         if not chunk:
             continue
         lo, sep, hi = chunk.partition('-')
-        if not lo.isdigit() or (sep and not hi.isdigit()):
+        # isdigit() is not a promise that int() will succeed: it is True for
+        # '²' and '①', and for decimal strings past CPython's conversion limit.
+        # An uncaught ValueError here would unwind past the accept gate.
+        try:
+            start, end = int(lo), int(hi) if sep else int(lo)
+        except ValueError:
             return None
-        start, end = int(lo), int(hi) if sep else int(lo)
         if start < 1 or end > total or start > end:
             return None
         picked.extend(range(start - 1, end))
     return picked or None
 
 
-def _review_lines(items: list["_ReviewItem"], crossing: set) -> list[str]:
-    """Two lines per change: where it is now, where it would end up."""
-    lines = []
+def _item_lines(item: "_ReviewItem", number: int, width: int,
+                crossing: set) -> list[str]:
+    """The one or two printed lines for a single change."""
+    num = f"[{number:>{width}}]"
+    tags = []
+    if not item.keep:
+        tags.append("EXCLUDED")
+    if item.op.dst != item.original.dst:
+        tags.append("edited")
+    # Keyed on the *original* op: Op is frozen and compared by value, so an
+    # edited item is a different value and would silently lose the warning —
+    # on exactly the item the user stopped to look at. Retyping a leaf name
+    # cannot change which filesystem it lands on.
+    if item.original in crossing:
+        tags.append("COPIED across drives")
+    tag = f"   ({', '.join(tags)})" if tags else ""
+    if item.op.kind == "move" and item.op.src:
+        return [f"  {num} BEFORE  {item.op.src}{tag}",
+                f"  {' ' * len(num)} AFTER   {item.op.dst}"]
+    verb = "NEW FOLDER" if item.op.kind == "mkdir" else "REMOVE EMPTY FOLDER"
+    return [f"  {num} {verb}  {item.op.dst}{tag}"]
+
+
+def _review_lines(items: list["_ReviewItem"], crossing: set,
+                  start: int = 0, end: int | None = None) -> list[str]:
+    """Render items[start:end]. Paging slices *items*, never rendered lines.
+
+    A move prints two lines and a folder op prints one, so a fixed line stride
+    puts the page break between a BEFORE and its AFTER as soon as an odd number
+    of folder ops precedes it — and plan_loose_movies interleaves exactly that.
+    """
     width = len(str(len(items)))
-    for i, item in enumerate(items, 1):
-        num = f"[{i:>{width}}]"
-        tags = []
-        if not item.keep:
-            tags.append("EXCLUDED")
-        if item.op.dst != item.original.dst:
-            tags.append("edited")
-        if item.op in crossing:
-            tags.append("copied across drives")
-        tag = f"   ({', '.join(tags)})" if tags else ""
-        if item.op.kind == "move" and item.op.src:
-            lines.append(f"  {num} BEFORE  {item.op.src}{tag}")
-            lines.append(f"  {' ' * len(num)} AFTER   {item.op.dst}")
-        else:
-            verb = "NEW FOLDER" if item.op.kind == "mkdir" else "REMOVE EMPTY FOLDER"
-            lines.append(f"  {num} {verb}  {item.op.dst}{tag}")
+    lines = []
+    for offset, item in enumerate(items[start:end], start + 1):
+        lines.extend(_item_lines(item, offset, width, crossing))
     return lines
 
 
@@ -266,8 +299,13 @@ class _ReviewItem:
 
 
 def _ask_new_name(current: str, what: str) -> str | None:
-    """Prompt for a replacement leaf name. None means "leave it alone"."""
-    typed = prompt_input(f"   New {what} name (blank to keep): ")
+    """Prompt for a replacement leaf name. None means "leave it alone".
+
+    Read with a plain input(): this is a value, not a menu step, so "b" has to
+    be a name you can give a file rather than a command that unwinds the whole
+    review.
+    """
+    typed = input(f"   New {what} name (blank to keep): ").strip()
     if not typed:
         return None
     if any(sep in typed for sep in ('/', '\\')) or typed in ('.', '..'):
@@ -302,16 +340,23 @@ def _edit_destination(items: list[_ReviewItem], index: int) -> None:
         return
 
     if is_file:
-        # Losing the extension turns a movie into a file no player will open,
-        # and it is easy to do when retyping a long name. Ask rather than
-        # silently re-adding it: a deliberate ".mkv" -> ".mp4" is legitimate.
-        src_ext = item.op.src.suffix
-        if src_ext and Path(safe).suffix.lower() != src_ext.lower():
+        # Compared against the *planned* suffix, not the source's. The planner
+        # often changes the suffix on purpose: plan_extension_convert turns
+        # ".ts" into ".mp4", and plan_extension_restore appends ".mkv" to a
+        # name whose "suffix" is really ".1080p". Judging by the source there
+        # made the default answer silently undo the very conversion that was
+        # asked for.
+        want_ext = old.suffix
+        if want_ext and Path(safe).suffix.lower() != want_ext.lower():
             got = Path(safe).suffix or "no extension"
-            if not ask_yes_no(f"   That gives {got}, but the file is "
-                              f"{src_ext}. Really change the extension?",
+            if not ask_yes_no(f"   That gives {got}, but this was going to be "
+                              f"{want_ext}. Really change the extension?",
                               default=False):
-                safe = Path(safe).stem + src_ext
+                # Append rather than restem. Media names are dot-delimited and
+                # Path.stem eats only the last segment, so restemming turned
+                # "Show.S01E01.1080p" into "Show.S01E01.mkv" — dropping the
+                # quality tag the user had just typed out.
+                safe = safe + want_ext
                 print(f"   Using: {safe}")
         if safe == old.name:
             return
@@ -320,24 +365,32 @@ def _edit_destination(items: list[_ReviewItem], index: int) -> None:
     # Renaming the video alone would leave them pointing at a name that no
     # longer exists — exactly the breakage the rename is meant to fix.
     #
-    # This flows one way only, video -> sidecar. Same-stem alone would make it
-    # symmetric, so renaming "Episode.srt" to "English.srt" would drag
-    # "Episode.mkv" to "English.mkv" — renaming the film because you retitled
-    # its subtitle track. A folder is excluded for a third reason: `Path.stem`
-    # of a dotted folder name ("Show.S01" -> "Show") matches unrelated files
-    # sitting beside it.
+    # Matched with startswith and carrying the tail, mirroring
+    # excel._companion_ops, which is what produced these destinations: it keeps
+    # ".en"/".fr" language tags, so "My Show S01E01.en.srt" never has the
+    # video's stem. Matching loosely *without* carrying the tail would be worse
+    # than the bug - ".en.srt" and ".fr.srt" would both target one name and
+    # check_collisions would drop both as a duplicate target.
+    #
+    # It flows one way only, video -> sidecar. Symmetric matching meant that
+    # renaming "Episode.srt" to "English.srt" dragged "Episode.mkv" with it.
     leads = is_file and old.suffix.lower() in VIDEO_EXTS
-    followers = [o for o in items
-                 if leads and o is not item and o.op.kind == "move"
-                 and o.op.dst.parent == old.parent
-                 and o.op.dst.stem == old.stem
-                 and o.op.dst.suffix.lower() in COMPANION_EXTS
-                 and o.op.src is not None and o.op.src.is_file()]
+    followers = []
+    if leads:
+        for o in items:
+            if (o is item or o.op.kind != "move" or o.op.src is None
+                    or not o.op.src.is_file()
+                    or o.op.dst.parent != old.parent
+                    or o.op.dst.suffix.lower() not in COMPANION_EXTS
+                    or not o.op.dst.stem.startswith(old.stem)):
+                continue
+            followers.append((o, o.op.dst.stem[len(old.stem):]))
     item.op = dataclasses.replace(item.op, dst=old.with_name(safe))
     print(f"   [OK] {safe}")
     new_stem = Path(safe).stem
-    for follower in followers:
-        renamed = follower.op.dst.with_name(new_stem + follower.op.dst.suffix)
+    for follower, tail in followers:
+        renamed = follower.op.dst.with_name(
+            new_stem + tail + follower.op.dst.suffix)
         follower.op = dataclasses.replace(follower.op, dst=renamed)
         print(f"   [OK] companion follows it: {renamed.name}")
 
@@ -351,25 +404,8 @@ def review_changes(plan: Plan, label: str = "changes") -> Plan | None:
     """
     crossing = set(_crosses_devices(plan))
     items = [_ReviewItem(op, op) for op in plan.ops]
-
-    while True:
-        kept = [i for i in items if i.keep]
-        print(f"\n{len(kept)} change(s) ready. Nothing has been touched yet.")
-        print("  [Y] apply them as listed")
-        print("  [R] review them one by one first (exclude or rename "
-              "individual items)")
-        print("  [Q] cancel - change nothing")
-        choice = prompt_input("Choice [Y]: ", default='Y').upper()
-        if choice == 'Q':
-            return None
-        if choice == 'Y':
-            break
-        if choice != 'R':
-            print("   [!] Y, R or Q.")
-            continue
-        if _review_items(items, crossing, label) is False:
-            return None
-        break
+    if _review_items(items, crossing, label, plan.skipped) is False:
+        return None
 
     keep = [i.op for i in items if i.keep]
     dropped = [i.op for i in items if not i.keep]
@@ -396,49 +432,78 @@ def review_changes(plan: Plan, label: str = "changes") -> Plan | None:
     return revalidated
 
 
-def _review_items(items: list[_ReviewItem], crossing: set,
-                  label: str, page_size: int = 10) -> bool:
-    """Page through the changes, editing them. False = abort the whole run."""
-    page = 0
+def _review_items(items: list[_ReviewItem], crossing: set, label: str,
+                  skipped=(), page_size: int = 10) -> bool:
+    """The review screen: a paged, numbered before/after list.
+
+    Every change is on screen before anything is asked, and Enter pages forward
+    rather than applying — a bare Enter must never be the thing that commits a
+    library-wide rename it has not shown you.
+
+    `R` turns on the editing commands so paging and editing are one screen.
+    Returns True to apply, False to abort the whole run.
+    """
+    page, editing = 0, False
     while True:
-        lines = _review_lines(items, crossing)
-        per_page = page_size * 2          # two printed lines per change
-        total_pages = max(1, (len(lines) + per_page - 1) // per_page)
+        total_pages = max(1, (len(items) + page_size - 1) // page_size)
         page = min(page, total_pages - 1)
+        start, end = page * page_size, min((page + 1) * page_size, len(items))
         kept = sum(1 for i in items if i.keep)
-        print(f"\n--- Reviewing {label}: page {page + 1}/{total_pages} "
-              f"({kept} of {len(items)} will be applied) ---")
-        for line in lines[page * per_page:(page + 1) * per_page]:
+        print(f"\n--- {label}: items {start + 1}-{end} of {len(items)}, "
+              f"page {page + 1}/{total_pages} "
+              f"({kept} will be applied) ---")
+        for line in _review_lines(items, crossing, start, end):
             print(line)
+        # The planner's own skips, with the per-file reasons. A bare count told
+        # the user something was dropped without ever saying what or why.
+        if skipped and page == total_pages - 1:
+            print(f"\n  {len(skipped)} change(s) the planner had to skip:")
+            for op, reason in list(skipped)[:10]:
+                print(f"    SKIPPED ({reason}): {op.src or op.dst}")
+            if len(skipped) > 10:
+                print(f"    ... and {len(skipped) - 10} more")
+
         nav = []
-        if page < total_pages - 1:
-            nav.append("[N]ext")
-        if page > 0:
-            nav.append("[P]rev")
         if total_pages > 1:
-            nav += ["[A]ll at once", "[G] go to page"]
-        nav += ["[x N] exclude", "[k N] keep", "[e N] rename",
-                "[Y]es apply", "[Q]uit"]
+            nav += ["[Enter/N]ext", "[P]rev", "[G] page", "[A]ll"]
+        if editing:
+            nav += ["[x N] exclude", "[k N] keep", "[e N] rename"]
+        else:
+            nav.append("[R] review & edit")
+        nav += ["[Y]es apply", "[Q]uit"]
         print("  " + "  ".join(nav))
-        print("  (x and k take ranges too: 'x 3,7-9')")
-        raw = prompt_input("Choice: ")
+        if editing:
+            print("  (x and k take ranges too: 'x 3,7-9')")
+        # Plain input(): 'b'/'back' must be an invalid choice here, not an
+        # exception that unwinds to the menu and silently discards every
+        # exclusion and rename made so far.
+        raw = input("Choice: ").strip()
         cmd, _, arg = raw.partition(' ')
         cmd, arg = cmd.strip().upper(), arg.strip()
 
         if cmd in ('N', '') and page < total_pages - 1:
             page += 1
+        elif cmd in ('N', '') and page == total_pages - 1:
+            print("   [!] That was the last page. [Y] applies, [Q] cancels.")
         elif cmd == 'P' and page > 0:
             page -= 1
         elif cmd == 'A':
-            for line in lines:
+            for line in _review_lines(items, crossing):
                 print(line)
         elif cmd == 'G':
-            target = arg or prompt_input(f"Go to page (1-{total_pages}): ")
-            if target.isdigit() and 1 <= int(target) <= total_pages:
-                page = int(target) - 1
+            target = arg or input(f"Go to page (1-{total_pages}): ").strip()
+            try:
+                pg = int(target)
+            except ValueError:
+                pg = -1
+            if 1 <= pg <= total_pages:
+                page = pg - 1
             else:
                 print("   [!] No such page.")
-        elif cmd in ('X', 'K'):
+        elif cmd == 'R':
+            editing = True
+            print("   [OK] Editing on: exclude with 'x N', rename with 'e N'.")
+        elif cmd in ('X', 'K') and editing:
             picked = _parse_item_numbers(arg, len(items))
             if picked is None:
                 print(f"   [!] Give an item number, 1-{len(items)} "
@@ -448,12 +513,14 @@ def _review_items(items: list[_ReviewItem], crossing: set,
                 items[i].keep = (cmd == 'K')
             verb = "excluded" if cmd == 'X' else "kept"
             print(f"   [OK] {len(picked)} item(s) {verb}.")
-        elif cmd == 'E':
+        elif cmd == 'E' and editing:
             picked = _parse_item_numbers(arg, len(items))
             if picked is None or len(picked) != 1:
                 print("   [!] Rename one item at a time, e.g. 'e 3'.")
                 continue
             _edit_destination(items, picked[0])
+        elif cmd in ('X', 'K', 'E'):
+            print("   [!] Press [R] first to turn on editing.")
         elif cmd == 'Y':
             return True
         elif cmd == 'Q':
@@ -470,11 +537,14 @@ def confirm_and_execute(plan: Plan, journal: Path, dry_run: bool = False,
 
     `accept_gate` False skips only the last question, never the review: the
     multi-phase flows ask it once for the whole session instead of once per
-    phase (so answering "no" puts back everything, not just the last step),
-    and `--action ...` skips it unless `--review` was passed, because a cron
-    job has nobody to answer it. The pre-apply review runs either way — no
-    path has ever applied changes without showing them first.
+    phase, so answering "no" puts back everything rather than the last step.
+
+    When stdin is not a terminal — a cron job, a Docker service, a piped run —
+    there is nobody to answer either question, so the whole plan is printed and
+    applied and the undo command is given. Interactively, nothing is ever
+    applied that has not been listed on screen first.
     """
+    interactive = _stdin_is_interactive()
     if not plan.ops:
         print(f"\n[OK] Nothing to do ({label}).")
         for op, reason in plan.skipped:
@@ -496,20 +566,37 @@ def confirm_and_execute(plan: Plan, journal: Path, dry_run: bool = False,
             print(f"  SKIPPED ({reason}): {op.src or op.dst}")
         print("\n[dry-run] No changes made.")
         return []
-    reviewed = review_changes(plan, label)
-    if reviewed is None:
-        print("Aborted. No changes made.")
-        return []
-    plan = reviewed
+    if interactive:
+        reviewed = review_changes(plan, label)
+        if reviewed is None:
+            print("Aborted. No changes made.")
+            return []
+        plan = reviewed
+    else:
+        # Unattended: still show every change, since the log is the only record
+        # anyone will read afterwards.
+        print("(stdin is not a terminal - applying without prompting.)")
+        for op in plan.ops:
+            print(f"  {op.kind.upper():6} {op.src if op.src else ''}  ->  "
+                  f"{op.dst}")
+        for op, reason in plan.skipped:
+            print(f"  SKIPPED ({reason}): {op.src or op.dst}")
     result = execute(plan, journal, roots=roots, label=label, session=session)
     print(f"\n[OK] {len(result.done)} operation(s) applied.")
     for op, err in result.failed:
         print(f"  [!] FAILED: {op.src or op.dst}: {err}")
-    if accept_gate:
-        if not accept_or_revert(result, journal, label=label):
+    if accept_gate and interactive:
+        outcome = accept_or_revert(result, journal, label=label)
+        # REVERT_FAILED deliberately falls through to the return below: the
+        # library is still renamed, so the caller must log it. Reporting
+        # nothing there would leave the audit trail blank for the one state
+        # that most needs one.
+        if outcome in (GateOutcome.REVERTED, GateOutcome.NOTHING):
             return []
     else:
-        print(f"Undo any time: menu option [9] or 'python run.py --undo' "
+        undo = (f"python run.py --undo-run {result.run_id}" if result.run_id
+                else "python run.py --undo")
+        print(f"Undo any time: menu option [9] or '{undo}' "
               f"(journal: {journal})")
     return [{'op': op.kind, 'src': str(op.src) if op.src else None,
              'dst': str(op.dst), 'ts': 0.0} for op in result.done]
@@ -523,10 +610,10 @@ def _print_capped(lines: list[str], cap: int = 30) -> None:
         print(f"  ... and {len(lines) - cap} more")
         try:
             more = ask_yes_no("Show the full list?", default=False)
-        except BackNavigation:
-            # This is a viewer, not a step. 'back' here must not unwind out of
-            # the accept gate that is about to be asked — that would leave the
-            # library changed with the question never put.
+        except (BackNavigation, EOFError):
+            # This is a viewer, not a step. Neither 'back' nor a closed stdin
+            # may unwind out of the accept gate that is about to be asked —
+            # that would leave the library changed with the question never put.
             more = False
         if more:
             for line in lines[cap:]:
@@ -542,11 +629,31 @@ def _session_ops(journal: Path, session: str) -> list[dict]:
     return ops
 
 
+def _undo_commands(journal: Path, session: str | None, run_id: str | None
+                   ) -> list[str]:
+    """The exact commands that reverse what just happened.
+
+    Not `--undo-session`: it takes no id and resolves to the *newest pending*
+    session, so advice meant for later can reverse a different batch entirely —
+    and a session that gets skipped over is then unreachable, since session ids
+    are never displayed anywhere. Run ids are addressable and are printed by
+    `--list-runs`, so name them.
+    """
+    if session:
+        ids = [r["id"] for r in pending_runs(journal)
+               if r["session"] == session and r["id"]]
+        if ids:
+            return [f"python run.py --undo-run {i}" for i in reversed(ids)]
+    if run_id:
+        return [f"python run.py --undo-run {run_id}"]
+    return ["python run.py --undo"]
+
+
 def _report_unaccepted(journal: Path, session: str) -> None:
     """Say what a session left on disk when its gate was never reached.
 
-    Only ever called on the way out of an interrupt, so it prints and returns
-    rather than asking anything.
+    Only ever called on the way out of an interrupt or a crash, so it prints
+    and returns rather than asking anything.
     """
     landed = _session_ops(journal, session)
     if not landed:
@@ -554,17 +661,31 @@ def _report_unaccepted(journal: Path, session: str) -> None:
     print(f"\n[!] {len(landed)} change(s) were already applied and you never "
           f"got the chance to accept them.")
     print("    They are still on disk. Put them back with:")
-    print("        python run.py --undo-session")
+    for cmd in _undo_commands(journal, session, None):
+        print(f"        {cmd}")
+
+
+class GateOutcome(str, enum.Enum):
+    """What the acceptance gate actually did.
+
+    A bool could not tell "reverted" from "the revert failed", and the caller
+    needs to: after a failed revert the library is still renamed, so the
+    changes must still be recorded in the spreadsheet.
+    """
+    KEPT = "kept"
+    REVERTED = "reverted"
+    REVERT_FAILED = "revert-failed"
+    NOTHING = "nothing"
 
 
 def accept_or_revert(result, journal: Path, *, label: str = "changes",
-                     session: str | None = None) -> bool:
+                     session: str | None = None) -> GateOutcome:
     """The last gate: keep what just happened, or put every file back.
 
-    Returns True only when the user positively accepted. Anything else — "n",
-    a bare Enter, or 'back' — reverses the change through the journal, using
-    the same code path as `--undo`. `session` reverses every run of a
-    multi-phase action rather than only its last phase.
+    Anything but a positive yes — "n", a bare Enter, 'back', or a closed
+    stdin — reverses the change through the journal, using the same code path
+    as `--undo`. `session` reverses every run of a multi-phase action rather
+    than only its last phase.
     """
     if session:
         entries = _session_ops(journal, session)
@@ -572,41 +693,47 @@ def accept_or_revert(result, journal: Path, *, label: str = "changes",
         total = len(entries)
     else:
         if result is None or not result.done:
-            return False    # nothing landed, so there is nothing to accept
+            return GateOutcome.NOTHING   # nothing landed, nothing to accept
         pairs = [(str(op.src), str(op.dst))
                  for op in result.done if op.kind == "move"]
         total = len(result.done)
     if not total:
-        return False
+        return GateOutcome.NOTHING
 
+    undo_cmds = _undo_commands(journal, session,
+                               result.run_id if result is not None else None)
+    hint = "\n".join(f"        {c}" for c in undo_cmds)
     folders = total - len(pairs)
-    print("\n" + "!" * 70)
-    print(f"  CHECK YOUR FILES NOW - {total} change(s) are already on disk.")
-    print("!" * 70)
-    print(f"  Open the folder in another window and make sure the {label} are")
-    print("  what you wanted. This is your last chance to have them undone")
-    print("  automatically.")
-    print("\n  Answering NO puts every one of these files back exactly where it")
-    print("  was. Answering YES keeps them (you can still undo later, but you")
-    print("  will have to ask for it).")
-    if pairs:
-        print(f"\n  What changed ({len(pairs)} file/folder rename(s)):")
-        _print_capped([f"  BEFORE  {src}\n  AFTER   {dst}\n" for src, dst in pairs])
-    if folders:
-        print(f"  ...plus {folders} folder(s) created or removed.")
-
-    if session:
-        undo_hint = "python run.py --undo-session"
-    elif result is not None and result.run_id:
-        undo_hint = f"python run.py --undo-run {result.run_id}"
-    else:
-        undo_hint = "python run.py --undo"
+    # Everything from the banner onwards is inside the try: _print_capped asks
+    # its own question, and an interrupt there used to escape with the library
+    # changed and nothing said about it.
     try:
+        print("\n" + "!" * 70)
+        print(f"  CHECK YOUR FILES NOW - {total} change(s) are already on disk.")
+        print("!" * 70)
+        print(f"  Open the folder in another window and make sure the {label} are")
+        print("  what you wanted. This is your last chance to have them undone")
+        print("  automatically.")
+        print("\n  Answering NO puts every one of these files back exactly where")
+        print("  it was. Answering YES keeps them (you can still undo later, but")
+        print("  you will have to ask for it).")
+        if pairs:
+            print(f"\n  What changed ({len(pairs)} file/folder rename(s)):")
+            _print_capped([f"  BEFORE  {src}\n  AFTER   {dst}\n"
+                           for src, dst in pairs])
+        if folders:
+            print(f"  ...plus {folders} folder(s) created or removed.")
         keep = ask_yes_no("\nKeep these changes?", default=False)
     except BackNavigation:
         # 'back' must not escape to the menu leaving the library changed and
         # the question unanswered. It is not a yes, so it is a no.
         print("   Taking that as 'no'.")
+        keep = False
+    except EOFError:
+        # stdin closed mid-gate (a pipe that ran dry). Same reasoning as
+        # 'back': not a yes, and a traceback over a mutated library is the
+        # worst possible answer.
+        print("\n   [!] No answer available - treating that as 'no'.")
         keep = False
     except KeyboardInterrupt:
         # Deliberately NOT treated as a rejection: reverting would start a
@@ -614,13 +741,15 @@ def accept_or_revert(result, journal: Path, *, label: str = "changes",
         # stop the program. Say plainly what is on disk and how to reverse it.
         print(f"\n[!] Interrupted before you answered - the {total} change(s) "
               f"are still on disk.")
-        print(f"    Put them back with: {undo_hint}")
+        print("    Put them back with:")
+        print(hint)
         raise
 
     if keep:
-        print(f"\n[OK] Kept. Undo later with: {undo_hint}")
+        print("\n[OK] Kept. Undo later with:")
+        print(hint)
         print(f"     or menu option [9]. (journal: {journal})")
-        return True
+        return GateOutcome.KEPT
 
     print(f"\nPutting {total} change(s) back...")
     if session:
@@ -628,15 +757,22 @@ def accept_or_revert(result, journal: Path, *, label: str = "changes",
     elif result.run_id:
         undone, err = undo_run(journal, result.run_id)
         if err:
+            # The likeliest error is the out-of-order refusal, whose remedy is
+            # --force. Printing the message without the remedy left the user
+            # with a mutated library and no next step.
             print(f"[!] Could not reverse the run: {err}")
-            return False
+            print(f"    The {total} change(s) are still in their new locations. "
+                  f"Force it with:")
+            print("\n".join(f"{c} --force" for c in hint.splitlines()))
+            return GateOutcome.REVERT_FAILED
     else:
         undone = undo_last_run(journal)
     _report_undo(undone)
     if not undone.ok:
-        print(f"    The rest are still in their new locations. Force it with: "
-              f"{undo_hint} --force")
-    return False
+        print("    The rest are still in their new locations. Force it with:")
+        print("\n".join(f"{c} --force" for c in hint.splitlines()))
+        return GateOutcome.REVERT_FAILED
+    return GateOutcome.REVERTED
 
 
 # --- Flows -------------------------------------------------------------------
@@ -982,6 +1118,21 @@ def _ask_llm_results(df_movies, df_tv, patterns) -> dict:
     return llm.clean_titles_with_llm(candidates, provider, api_key=key)
 
 
+def _warn_stale_spreadsheet(excel_path: Path) -> None:
+    """The scan ran between the organize and the revert, so the sheet lies.
+
+    A multi-phase action goes organize -> scan -> rename -> gate. Rejecting at
+    the gate reverses the organize as well, but the spreadsheet was written in
+    between and records the post-organize paths. Those paths no longer exist,
+    so a later rename would plan from sources that are gone.
+    """
+    if not excel_path.exists():
+        return
+    print(f"\n[!] {excel_path.name} was written before those changes were put "
+          f"back,\n    so it now describes a layout that no longer exists.")
+    print("    Run a scan again before renaming from it.")
+
+
 def log_changes(excel_path: Path, entries: list) -> None:
     """Record accepted renames in the spreadsheet's 'Changes' sheet.
 
@@ -1001,7 +1152,7 @@ def log_changes(excel_path: Path, entries: list) -> None:
 
 def run_rename(movies_path, tv_path, excel_path: Path, dry_run: bool = False,
                *, session: str | None = None,
-               accept_gate: bool = True) -> list:
+               accept_gate: bool = True, log: bool = True) -> list:
     """Plan and apply renames. Returns the entries that were applied.
 
     The caller gets the entries back so a multi-phase flow can hold off on
@@ -1026,7 +1177,13 @@ def run_rename(movies_path, tv_path, excel_path: Path, dry_run: bool = False,
     entries = confirm_and_execute(plan, _journal_path(), dry_run, "renames",
                                   roots=rename_roots, session=session,
                                   accept_gate=accept_gate)
-    if accept_gate:
+    # `log` is False only for the multi-phase flows, which log after their own
+    # session gate. It is NOT tied to accept_gate: doing that stopped
+    # `--action rename` writing the sheet at all, since it passes
+    # accept_gate=False. confirm_and_execute already returns [] when the user
+    # rejects, and returns the entries when a revert failed and the library is
+    # still renamed — which is exactly when the audit trail matters most.
+    if log:
         log_changes(excel_path, entries)
     return entries
 
@@ -1593,7 +1750,8 @@ Tip: type 'back' or 'b' at any prompt to return here.""")
                             # renaming.
                             entries = run_rename(
                                 movies, tv, xlsx, session=session,
-                                accept_gate=(choice != '4'))
+                                accept_gate=(choice != '4'),
+                                log=(choice != '4'))
                 except BackNavigation:
                     # 'back' anywhere after the organize phase would otherwise
                     # skip the gate below, leaving those moves applied and the
@@ -1602,19 +1760,30 @@ Tip: type 'back' or 'b' at any prompt to return here.""")
                         raise
                     print("\n(Going back - but the organizing already ran.)")
                 except KeyboardInterrupt:
-                    # Same hole as 'back' above, but an interrupt must not be
-                    # answered with a prompt: the user is trying to stop, and
-                    # reverting unasked is the one thing worse than not
-                    # reverting. Say what is on disk and how to reverse it,
-                    # then let the outer handler take it - silence here was
-                    # the actual defect, not the absence of a rollback.
+                    # An interrupt must not be answered with a prompt: the user
+                    # is trying to stop, and reverting unasked is the one thing
+                    # worse than not reverting. Say what is on disk and how to
+                    # reverse it, then let the outer handler take it - silence
+                    # was the actual defect, not the absence of a rollback.
+                    if session is not None:
+                        _report_unaccepted(_journal_path(), session)
+                    raise
+                except Exception:
+                    # Same guarantee, for everything else. run_scan and
+                    # excel.read_library can raise past their own handling, and
+                    # without this the process died with the organize phase
+                    # applied, no gate, and nothing said - the exact failure
+                    # this whole flow exists to prevent.
                     if session is not None:
                         _report_unaccepted(_journal_path(), session)
                     raise
                 if session is not None:
-                    if accept_or_revert(None, _journal_path(),
-                                        label="changes", session=session):
+                    outcome = accept_or_revert(None, _journal_path(),
+                                               label="changes", session=session)
+                    if outcome is GateOutcome.KEPT:
                         log_changes(xlsx, entries)
+                    elif outcome is GateOutcome.REVERTED:
+                        _warn_stale_spreadsheet(xlsx)
             else:
                 print("Invalid choice.")
         except BackNavigation:
@@ -1741,16 +1910,21 @@ def main() -> None:
         # With --review, one question covers every phase: answering "no" puts
         # the organize back too, not just the rename.
         entries = run_rename(movies, tv, xlsx, dry_run=args.dry_run,
-                             session=session, accept_gate=False)
+                             session=session, accept_gate=False, log=not gate)
         if args.dry_run:
             return
         if gate:
-            if accept_or_revert(None, _journal_path(), label="changes",
-                                session=session):
+            outcome = accept_or_revert(None, _journal_path(), label="changes",
+                                       session=session)
+            if outcome is GateOutcome.KEPT:
                 log_changes(xlsx, entries)
+            elif outcome is GateOutcome.REVERTED:
+                _warn_stale_spreadsheet(xlsx)
         else:
-            log_changes(xlsx, entries)
-            print("\nUndo this entire action: python run.py --undo-session")
+            # run_rename already logged (log=not gate), so just say how to undo.
+            print("\nUndo this entire action:")
+            for cmd in _undo_commands(_journal_path(), session, None):
+                print(f"    {cmd}")
 
 
 if __name__ == "__main__":

@@ -348,7 +348,8 @@ def _is_case_only_rename(src: Path, dst: Path) -> bool:
             and src.name.casefold() == dst.name.casefold())
 
 
-def check_collisions(ops: list[Op], *, dropped: list[Op] = ()) -> Plan:
+def check_collisions(ops: list[Op], *,
+                     dropped: tuple[Op, ...] | list[Op] = ()) -> Plan:
     """Split ops into safe vs skipped. Never overwrite, never auto-suffix.
 
     `dropped` is for re-validating a plan the *user* has trimmed: ops removed
@@ -416,6 +417,10 @@ def check_collisions(ops: list[Op], *, dropped: list[Op] = ()) -> Plan:
     # converse needs no handling, since excluding a mkdir while keeping a move
     # into it changes nothing: _do_move creates missing parents itself.
     orphaned = {op.dst.parent for op in dropped if op.kind == "move"}
+    # Same union as the rmdir rule above: a move this call skipped (source
+    # missing, path too long, duplicate target) is just as gone as one the user
+    # excluded, and leaving its mkdir behind creates the empty folder anyway.
+    orphaned |= {op.dst.parent for op, _ in plan.skipped if op.kind == "move"}
     if orphaned:
         wanted = {op.dst.parent for op in plan.ops if op.kind == "move"}
         surviving = []

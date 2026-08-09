@@ -92,9 +92,15 @@ def words(tmp_path, monkeypatch):
 
 
 def _drive(monkeypatch, answers):
-    """Feed the wizard a fixed sequence of prompt answers."""
+    """Feed the wizard a fixed sequence of prompt answers.
+
+    Feeding answers *is* simulating a terminal, so this also asserts the
+    interactive path. Under pytest stdin is not a tty, and without this the
+    wizard would correctly take its unattended branch and never read them.
+    """
     supplied = iter(answers)
     monkeypatch.setattr("builtins.input", lambda *a: next(supplied))
+    monkeypatch.setattr(wizard, "_stdin_is_interactive", lambda: True)
 
 
 def test_add_a_word(words, monkeypatch, capsys):
@@ -671,6 +677,7 @@ def test_an_interrupt_at_the_gate_keeps_and_says_how_to_undo(wired, monkeypatch,
         except StopIteration:
             raise KeyboardInterrupt
     monkeypatch.setattr("builtins.input", _input)
+    monkeypatch.setattr(wizard, "_stdin_is_interactive", lambda: True)
 
     with pytest.raises(KeyboardInterrupt):
         wizard.run_organize(str(tv))
@@ -845,7 +852,8 @@ def test_declining_reverses_every_phase_of_one_action(wired, monkeypatch):
     assert (show / "Season 2" / "Renamed.mkv").exists()
 
     _drive(monkeypatch, ["n"])
-    assert wizard.accept_or_revert(None, journal, session=session) is False
+    outcome = wizard.accept_or_revert(None, journal, session=session)
+    assert outcome is wizard.GateOutcome.REVERTED
 
     assert _tree(tv) == before
     assert all(r["undone"] for r in list_runs(journal))
@@ -943,6 +951,7 @@ def test_going_back_after_the_organize_phase_still_asks(wired, monkeypatch,
     """[4]: 'back' mid-flow must not strand the organize phase unquestioned."""
     tv, journal = wired
     before = _tree(tv)
+    monkeypatch.chdir(tv.parent)
     monkeypatch.setenv("MEDIAORG_CONFIG", str(tv.parent / "cfg.json"))
     monkeypatch.setenv("MEDIAORG_PATTERNS", str(tv.parent / "words.json"))
     monkeypatch.setattr(wizard, "browse_for_folder",
@@ -964,6 +973,7 @@ def test_going_back_after_the_organize_phase_still_asks(wired, monkeypatch,
 def test_the_step_counter_does_not_overcount(wired, monkeypatch, capsys):
     """"[3/4]" when there is no fourth step is a small lie, but it is a lie."""
     tv, _ = wired
+    monkeypatch.chdir(tv.parent)
     monkeypatch.setenv("MEDIAORG_CONFIG", str(tv.parent / "cfg.json"))
     monkeypatch.setenv("MEDIAORG_PATTERNS", str(tv.parent / "words.json"))
     monkeypatch.setattr(wizard, "browse_for_folder",
@@ -1073,6 +1083,7 @@ def test_an_interrupt_before_the_session_gate_says_what_is_on_disk(wired,
                                                                    capsys):
     """[4]: Ctrl-C mid-flow must not exit silently on an applied library."""
     tv, journal = wired
+    monkeypatch.chdir(tv.parent)
     monkeypatch.setenv("MEDIAORG_CONFIG", str(tv.parent / "cfg.json"))
     monkeypatch.setenv("MEDIAORG_PATTERNS", str(tv.parent / "words.json"))
     monkeypatch.setattr(wizard, "browse_for_folder",
@@ -1085,6 +1096,7 @@ def test_an_interrupt_before_the_session_gate_says_what_is_on_disk(wired,
         except StopIteration:
             raise KeyboardInterrupt          # interrupt at the word-list step
     monkeypatch.setattr("builtins.input", _input)
+    monkeypatch.setattr(wizard, "_stdin_is_interactive", lambda: True)
 
     wizard.run_wizard()          # the outer handler catches it and returns
 
@@ -1093,4 +1105,342 @@ def test_an_interrupt_before_the_session_gate_says_what_is_on_disk(wired,
     assert not any(r["undone"] for r in runs)      # not reverted behind their back
     out = capsys.readouterr().out
     assert "never got the chance to accept" in out
-    assert "--undo-session" in out
+    # Concrete run ids, not a bare --undo-session: that flag takes no argument
+    # and resolves to whichever session is newest whenever it is finally run.
+    for run in runs:
+        assert f"--undo-run {run['id']}" in out
+
+
+# --- Round 3: findings from the Kilo review ----------------------------------
+
+def test_the_changes_are_listed_before_anything_is_asked(wired, monkeypatch,
+                                                         capsys):
+    """The whole point of the feature: nothing is applied unseen.
+
+    The screen used to print only a count, so the default [Y] applied every
+    change without the before/after list ever appearing.
+    """
+    tv, _ = wired
+    _drive(monkeypatch, ["Q"])          # cancel at the very first prompt
+
+    wizard.run_organize(str(tv))
+
+    out = capsys.readouterr().out
+    assert "BEFORE" in out and "AFTER" in out
+    assert "My.Show.S01E01.mkv" in out
+
+
+def test_bare_enter_pages_rather_than_applying(wired, monkeypatch, capsys):
+    """Enter must never be the keystroke that commits a library-wide rename."""
+    tv, journal = wired
+    before = _tree(tv)
+    # Two bare Enters on a single-page plan, then quit. If Enter applied, the
+    # tree would change and the answers would run out.
+    _drive(monkeypatch, ["", "", "Q"])
+
+    wizard.run_organize(str(tv))
+
+    assert _tree(tv) == before
+    assert not journal.exists()
+    assert "last page" in capsys.readouterr().out
+
+
+def test_paging_never_splits_a_before_from_its_after(tmp_path, monkeypatch):
+    """Folder ops print one line and moves print two, so a line-stride pager
+    puts the page break in the middle of a change."""
+    root = tmp_path / "Movies"
+    root.mkdir()
+    items = []
+    for n in range(4):
+        (root / f"F{n}.mkv").write_text("v")
+        items.append(wizard._ReviewItem(Op("mkdir", None, root / f"F{n}"),
+                                        Op("mkdir", None, root / f"F{n}")))
+        mv = Op("move", root / f"F{n}.mkv", root / f"F{n}" / f"F{n}.mkv")
+        items.append(wizard._ReviewItem(mv, mv))
+
+    for page_start in (0, 3, 5):
+        lines = wizard._review_lines(items, set(), page_start, page_start + 3)
+        # Every BEFORE rendered in a slice is immediately followed by its AFTER.
+        for i, line in enumerate(lines):
+            if "BEFORE" in line:
+                assert i + 1 < len(lines) and "AFTER" in lines[i + 1]
+
+
+def test_an_unattended_run_applies_without_prompting(wired, monkeypatch,
+                                                     capsys):
+    """A cron job or Docker service has nobody to answer either question."""
+    tv, journal = wired
+    monkeypatch.setattr(wizard, "_stdin_is_interactive", lambda: False)
+    monkeypatch.setattr("builtins.input",
+                        lambda *a: pytest.fail("must not prompt"))
+
+    wizard.run_organize(str(tv))
+
+    assert (tv / "My Show" / "Season 1" / "My.Show.S01E01.mkv").exists()
+    out = capsys.readouterr().out
+    assert "not a terminal" in out
+    assert "--undo-run" in out
+    # The plan is still printed: the log is the only record anyone will read.
+    assert "My.Show.S01E01.mkv" in out
+
+
+def test_a_closed_stdin_at_the_gate_reverts_rather_than_tracebacks(wired,
+                                                                   monkeypatch):
+    tv, _ = wired
+    before = _tree(tv)
+    answers = iter(["Y"])
+
+    def _input(*a):
+        try:
+            return next(answers)
+        except StopIteration:
+            raise EOFError
+    monkeypatch.setattr("builtins.input", _input)
+    monkeypatch.setattr(wizard, "_stdin_is_interactive", lambda: True)
+
+    wizard.run_organize(str(tv))       # must not raise
+
+    assert _tree(tv) == before
+
+
+@pytest.mark.parametrize("token", ["b", "back"])
+def test_back_in_the_review_is_not_a_command(wired, monkeypatch, token):
+    """It used to raise BackNavigation and silently discard the whole review."""
+    tv, _ = wired
+    before = _tree(tv)
+    _drive(monkeypatch, [token, "Q"])
+
+    wizard.run_organize(str(tv))       # must not raise BackNavigation
+
+    assert _tree(tv) == before
+
+
+def test_a_file_can_be_named_back(tmp_path, monkeypatch):
+    """'back' has to be a name you can type, not a control word."""
+    monkeypatch.setattr("mediaorg.execute.RETRY_DELAYS", ())
+    journal = tmp_path / "journal.jsonl"
+    root = tmp_path / "Movies"
+    root.mkdir()
+    (root / "raw.mkv").write_text("v")
+    plan = Plan(ops=[Op("move", root / "raw.mkv", root / "Episode.mkv")])
+    _drive(monkeypatch, ["R", "e 1", "back.mkv", "Y", "y"])
+
+    wizard.confirm_and_execute(plan, journal, label="renames", roots=[root])
+
+    assert (root / "back.mkv").exists()
+
+
+@pytest.mark.parametrize("bad", ["²", "①", "9" * 5000])
+def test_unicode_digits_do_not_crash_the_review(bad):
+    """isdigit() is True for these; int() raises. The ValueError escaped."""
+    assert wizard._parse_item_numbers(bad, 10) is None
+
+
+def test_a_typed_name_keeps_its_dotted_segments(tmp_path, monkeypatch):
+    """Path.stem eats only the last dot, so restemming dropped '.1080p'."""
+    monkeypatch.setattr("mediaorg.execute.RETRY_DELAYS", ())
+    journal = tmp_path / "journal.jsonl"
+    root = tmp_path / "Movies"
+    root.mkdir()
+    (root / "raw.mkv").write_text("v")
+    plan = Plan(ops=[Op("move", root / "raw.mkv", root / "Episode.mkv")])
+    # Type a dotted name with no extension, then decline to change the ext.
+    _drive(monkeypatch, ["R", "e 1", "Show.S01E01.1080p", "n", "Y", "y"])
+
+    wizard.confirm_and_execute(plan, journal, label="renames", roots=[root])
+
+    assert (root / "Show.S01E01.1080p.mkv").exists()
+
+
+def test_the_extension_guard_follows_the_plan_not_the_source(tmp_path,
+                                                             monkeypatch):
+    """extfix converts .ts -> .mp4; judging by the source undid the conversion."""
+    monkeypatch.setattr("mediaorg.execute.RETRY_DELAYS", ())
+    journal = tmp_path / "journal.jsonl"
+    root = tmp_path / "Movies"
+    root.mkdir()
+    (root / "clip.ts").write_text("v")
+    plan = Plan(ops=[Op("move", root / "clip.ts", root / "clip.mp4")])
+    # Retype the name as .mp4. That matches the *plan*, so nothing is asked;
+    # no answer is supplied for an extension question, so one would fail here.
+    _drive(monkeypatch, ["R", "e 1", "Clip.mp4", "Y", "y"])
+
+    wizard.confirm_and_execute(plan, journal, label="extension fixes",
+                               roots=[root])
+
+    assert (root / "Clip.mp4").exists()
+    assert not (root / "Clip.ts").exists()
+
+
+def test_a_language_tagged_subtitle_still_follows_its_video(tmp_path,
+                                                            monkeypatch):
+    """_companion_ops preserves '.en'; exact-stem matching never saw those."""
+    monkeypatch.setattr("mediaorg.execute.RETRY_DELAYS", ())
+    journal = tmp_path / "journal.jsonl"
+    root = tmp_path / "TV"
+    root.mkdir()
+    for name in ("raw.mkv", "raw.en.srt", "raw.fr.srt"):
+        (root / name).write_text(name)
+    plan = Plan(ops=[
+        Op("move", root / "raw.mkv", root / "Episode.mkv"),
+        Op("move", root / "raw.en.srt", root / "Episode.en.srt"),
+        Op("move", root / "raw.fr.srt", root / "Episode.fr.srt"),
+    ])
+    _drive(monkeypatch, ["R", "e 1", "Pilot.mkv", "Y", "y"])
+
+    wizard.confirm_and_execute(plan, journal, label="renames", roots=[root])
+
+    assert (root / "Pilot.mkv").exists()
+    # Both tails survive: collapsing them onto one name would make
+    # check_collisions drop both subtitle tracks as a duplicate target.
+    assert (root / "Pilot.en.srt").read_text() == "raw.en.srt"
+    assert (root / "Pilot.fr.srt").read_text() == "raw.fr.srt"
+
+
+def test_the_cross_device_tag_survives_an_edit(tmp_path, monkeypatch):
+    """Op is frozen and compared by value, so an edit dropped it from the set."""
+    root = tmp_path / "Movies"
+    root.mkdir()
+    (root / "raw.mkv").write_text("v")
+    op = Op("move", root / "raw.mkv", root / "Episode.mkv")
+    items = [wizard._ReviewItem(op, op)]
+    _drive(monkeypatch, ["Pilot.mkv"])
+
+    wizard._edit_destination(items, 0)
+
+    assert items[0].op.dst.name == "Pilot.mkv"
+    # Keyed on .original, so the tag is still found after the replace().
+    assert "COPIED across drives" in "".join(
+        wizard._review_lines(items, {op}))
+
+
+def test_a_skipped_move_also_drops_its_folder(tmp_path):
+    """The sibling rmdir rule unions plan.skipped; this one must too."""
+    root = tmp_path / "Movies"
+    root.mkdir()
+    folder = root / "Film"
+    # The move's source does not exist, so check_collisions skips it itself.
+    ops = [Op("mkdir", None, folder),
+           Op("move", root / "gone.mkv", folder / "gone.mkv")]
+
+    plan = check_collisions(ops)
+
+    assert plan.ops == []
+    assert any("no longer needed" in reason for _, reason in plan.skipped)
+
+
+def test_a_failed_revert_still_records_what_is_on_disk(wired, monkeypatch,
+                                                       capsys):
+    """The library is still renamed, so the audit trail must not be blank."""
+    tv, journal = wired
+    _drive(monkeypatch, ["Y", "n"])
+    monkeypatch.setattr(wizard, "undo_run",
+                        lambda *a, **k: (None, "run is newer, use --force"))
+
+    entries = wizard.confirm_and_execute(
+        Plan(ops=[Op("move", tv / "My Show" / "My.Show.S01E01.mkv",
+                     tv / "My Show" / "Renamed.mkv")]),
+        journal, label="renames", roots=[tv])
+
+    assert entries, "a failed revert must still report what was applied"
+    out = capsys.readouterr().out
+    assert "--force" in out
+    assert "still in their new locations" in out
+
+
+def test_rejecting_a_session_warns_the_spreadsheet_is_stale(wired, monkeypatch,
+                                                            capsys, tmp_path):
+    """organize -> scan -> revert leaves the sheet describing a dead layout."""
+    tv, journal = wired
+    xlsx = tmp_path / "lib.xlsx"
+    xlsx.write_text("pretend spreadsheet")
+    session = "cafef00dbeef"
+
+    _drive(monkeypatch, ["Y"])
+    wizard.run_organize(str(tv), session=session, accept_gate=False)
+
+    _drive(monkeypatch, ["n"])
+    outcome = wizard.accept_or_revert(None, journal, session=session)
+    assert outcome is wizard.GateOutcome.REVERTED
+    wizard._warn_stale_spreadsheet(xlsx)
+
+    out = capsys.readouterr().out
+    assert "no longer exists" in out and "scan again" in out
+
+
+def test_the_undo_hint_names_real_run_ids(wired, monkeypatch, capsys):
+    """--undo-session takes no id and resolves to whichever is newest."""
+    tv, journal = wired
+    _drive(monkeypatch, ["Y", "y"])
+
+    wizard.run_organize(str(tv))
+
+    run_id = list_runs(journal)[-1]["id"]
+    assert f"--undo-run {run_id}" in capsys.readouterr().out
+
+
+def test_the_planners_skip_reasons_are_shown(tmp_path, monkeypatch, capsys):
+    """A bare count said something was dropped without saying what or why."""
+    monkeypatch.setattr("mediaorg.execute.RETRY_DELAYS", ())
+    journal = tmp_path / "journal.jsonl"
+    root = tmp_path / "Movies"
+    root.mkdir()
+    (root / "a.mkv").write_text("a")
+    (root / "taken.mkv").write_text("occupied")
+    plan = check_collisions([Op("move", root / "a.mkv", root / "taken.mkv")])
+    plan.ops.append(Op("move", root / "a.mkv", root / "b.mkv"))
+    _drive(monkeypatch, ["Q"])
+
+    wizard.confirm_and_execute(plan, journal, label="renames", roots=[root])
+
+    out = capsys.readouterr().out
+    assert "target already exists" in out
+
+
+def test_a_scripted_rename_still_writes_the_changes_sheet(tmp_path, monkeypatch):
+    """Regression guard: `--action rename` passes accept_gate=False, and
+    gating the log on that stopped the sheet being written at all."""
+    import pandas as pd
+
+    from mediaorg import excel, scan
+    monkeypatch.setattr("mediaorg.execute.RETRY_DELAYS", ())
+    monkeypatch.setenv("MEDIAORG_JOURNAL", str(tmp_path / "journal.jsonl"))
+    monkeypatch.setenv("MEDIAORG_CONFIG", str(tmp_path / "cfg.json"))
+    monkeypatch.setenv("MEDIAORG_PATTERNS", str(tmp_path / "words.json"))
+    movies = tmp_path / "Movies"
+    (movies / "the.matrix.1999.1080p").mkdir(parents=True)
+    (movies / "the.matrix.1999.1080p" / "the.matrix.1999.1080p.mkv").write_text("v")
+    xlsx = tmp_path / "lib.xlsx"
+    excel.write_library(xlsx, scan.scan_movies(movies), [], str(movies), None)
+
+    # The CLI's own arguments: no --review, so accept_gate is False.
+    _drive(monkeypatch, ["n", "n", "1", "Y"])
+    entries = wizard.run_rename(str(movies), None, xlsx, accept_gate=False)
+
+    assert entries, "nothing was renamed, so this proves nothing"
+    logged = pd.read_excel(xlsx, sheet_name='Changes')
+    assert len(logged) == len(entries)
+
+
+def test_a_multi_phase_rename_does_not_log_twice(tmp_path, monkeypatch):
+    """[4] logs after its own session gate, so run_rename must not also log."""
+    import pandas as pd
+
+    from mediaorg import excel, scan
+    monkeypatch.setattr("mediaorg.execute.RETRY_DELAYS", ())
+    monkeypatch.setenv("MEDIAORG_JOURNAL", str(tmp_path / "journal.jsonl"))
+    monkeypatch.setenv("MEDIAORG_CONFIG", str(tmp_path / "cfg.json"))
+    monkeypatch.setenv("MEDIAORG_PATTERNS", str(tmp_path / "words.json"))
+    movies = tmp_path / "Movies"
+    (movies / "the.matrix.1999.1080p").mkdir(parents=True)
+    (movies / "the.matrix.1999.1080p" / "the.matrix.1999.1080p.mkv").write_text("v")
+    xlsx = tmp_path / "lib.xlsx"
+    excel.write_library(xlsx, scan.scan_movies(movies), [], str(movies), None)
+
+    _drive(monkeypatch, ["n", "n", "1", "Y"])
+    entries = wizard.run_rename(str(movies), None, xlsx, session="s" * 12,
+                                accept_gate=False, log=False)
+    wizard.log_changes(xlsx, entries)
+
+    logged = pd.read_excel(xlsx, sheet_name='Changes')
+    assert len(logged) == len(entries)

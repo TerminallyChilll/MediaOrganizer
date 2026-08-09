@@ -74,7 +74,8 @@ class ExecResult:
     # The journal run this result came from, so a caller can reverse exactly
     # what it just did rather than guessing at "the newest pending run" — which
     # is a different run the moment anything else writes to the journal first.
-    # None for a dry run and for undo results, neither of which opens a run.
+    # None whenever no run was opened: a dry run, a plan with nothing to do,
+    # and undo results. Callers must check before passing it to undo_run().
     run_id: str | None = None
 
     @property

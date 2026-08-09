@@ -39,11 +39,12 @@ Features
     are skipped and reported. --dry-run shows the plan without touching
     anything. Scanning never modifies files. Nothing is ever deleted: the only
     destructive primitive is "remove this directory if it is empty".
-  * Review before, decide after: the preview is a working list, not a wall of
-    text -- exclude anything you don't want (x 3,7-9) or retype a name that
-    came out wrong (e 3, and its subtitles follow). Then, once the changes are
-    on disk, the wizard stops and asks you to go look at them. Say no and
-    every file goes straight back where it was. See Review and accept.
+  * Review before, decide after: the preview is a numbered, paged working
+    list, not a wall of text -- page through every change, exclude anything
+    you don't want (x 3,7-9), or retype a name that came out wrong (e 3, and
+    its subtitles follow). Enter pages; it never applies. Then, once the
+    changes are on disk, the wizard stops and asks you to go look at them. Say
+    no and every file goes straight back where it was. See Review and accept.
   * Journaled undo: every applied change is recorded (with the actual paths,
     plus the file's size and mtime) in mediaorg_journal.jsonl, which lives
     next to the app -- not in whatever directory you happened to launch from.
@@ -276,30 +277,37 @@ again. [6], [7] and [8] never touch your media at all.
 Review and accept
 ~~~~~~~~~~~~~~~~~
 
-Once a plan is ready you get three choices:
+Every change is on screen before anything is asked. The list is numbered and
+paged, the current path above the proposed one:
 
-    14 change(s) ready. Nothing has been touched yet.
-      [Y] apply them as listed
-      [R] review them one by one first (exclude or rename individual items)
-      [Q] cancel - change nothing
+    --- renames: items 1-10 of 14, page 1/2 (14 will be applied) ---
+      [ 1] BEFORE  /media/TV/My Show/My.Show.S01E01.mkv
+           AFTER   /media/TV/My Show/Season 1/My Show S01E01.mkv
+      [ 2] BEFORE  /media/TV/My Show/My.Show.S01E02.mkv
+           AFTER   /media/TV/My Show/Season 1/My Show S01E02.mkv
+      [Enter/N]ext  [P]rev  [G] page  [A]ll  [R] review & edit  [Y]es apply  [Q]uit
 
-[R] opens the same list as a working document -- every change numbered, the
-current path above the proposed one:
+Enter pages forward -- it never applies anything, so a stray keypress cannot
+commit a rename you have not read. [Y] applies, [Q] cancels.
 
-      [1] BEFORE  /media/TV/My Show/My.Show.S01E01.mkv
-          AFTER   /media/TV/My Show/Season 1/My Show S01E01.mkv
-      [x N] exclude  [k N] keep  [e N] rename  [Y]es apply  [Q]uit
+[R] turns on editing, on the same list:
+
+      [Enter/N]ext  [P]rev  [G] page  [A]ll  [x N] exclude  [k N] keep  [e N] rename  [Y]es apply  [Q]uit
       (x and k take ranges too: 'x 3,7-9')
 
   * x 3 drops a change; x 3,7-9 drops several; k 3 puts one back.
-  * e 3 lets you retype that one name. Subtitles and .nfo sidecars named after
-    the file follow it automatically, changing the extension is questioned
-    rather than done silently, and a name that isn't usable on every
-    filesystem is offered back cleaned up. You are editing the name, not the
-    folder it lands in, so slashes are refused.
+  * e 3 lets you retype that one name. Subtitles and .nfo sidecars follow the
+    video automatically, keeping any .en/.fr language tag; changing the
+    extension is questioned rather than done silently; and a name that isn't
+    usable on every filesystem is offered back cleaned up. You are editing the
+    name, not the folder it lands in, so slashes are refused. Renaming a
+    subtitle does not rename the film it belongs to.
   * Anything you change is re-checked for collisions before it runs, exactly
-    like a name the tool generated itself. A folder cleanup that your
-    exclusion made impossible is dropped rather than left to fail.
+    like a name the tool generated itself. A folder cleanup your exclusion
+    made impossible is dropped rather than left to fail, and so is a folder
+    that would now be created empty.
+  * Anything the planner had to skip is listed with the reason, so a conflict
+    is never just a number.
 
 After the changes are applied the wizard stops and tells you to go look:
 
@@ -333,12 +341,15 @@ Non-interactive use
     # add --dry-run to any of the above to preview without changing anything
     # add --review to be asked, afterwards, whether to keep the changes
 
-These still show you the full list and wait for a [Y] before applying anything
--- but they do not ask the keep-or-put-back question afterwards, because a
-cron job or a Docker service has nobody to answer it. They apply the changes
-and print the undo command instead. Pass --review to get the same
-accept-or-revert gate the wizard uses; with --action full it covers every
-phase at once.
+Run from a terminal, these behave like the wizard: the full list first, then a
+[Y]. They do not ask the keep-or-put-back question afterwards -- pass --review
+for that, and with --action full it covers every phase at once.
+
+When stdin is not a terminal -- cron, a Docker service, anything piped --
+there is nobody to answer either question, so the plan is printed to the log
+and applied without prompting. The journal is still written, and the exact
+--undo-run command is printed, so an unattended run is as reversible as any
+other. --dry-run still changes nothing at all.
 
 Two ways to list what you have
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
