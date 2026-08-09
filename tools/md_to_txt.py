@@ -81,11 +81,27 @@ def _transliterate(text: str) -> str:
 def _inline(text: str) -> str:
     """Strip inline markup from a line of prose.
 
-    Order matters: links are consumed before emphasis (so a bold link keeps
-    its URL), and code spans last, because an unstripped backtick is what
-    protects things like ``[U]`` and ``*.xlsx`` from the patterns above.
+    Code spans are lifted out first and put back last. Stripping their
+    backticks at the end instead would only protect a *lone* delimiter --
+    ``*.xlsx`` survives because the emphasis patterns need a closing ``*`` --
+    while a span with paired markup inside it, ``**x**`` or a link, would be
+    eaten by the patterns below before its backticks were ever removed. A
+    code span is content by definition, so nothing may rewrite it.
+
+    Among the rest, order matters: links are consumed before emphasis, so a
+    bold link keeps its URL.
     """
     text = _transliterate(text)
+
+    spans: list[str] = []
+
+    def stash(match: re.Match) -> str:
+        spans.append(match.group(1))
+        # NUL cannot occur in the source documents, so this cannot collide
+        # with text the patterns below are meant to see.
+        return f"\x00{len(spans) - 1}\x00"
+
+    text = re.sub(r"`([^`]+)`", stash, text)
     # Images and links. An anchor link ("#updating") has no address worth
     # printing on paper, so only its text survives.
     text = re.sub(r"!\[([^\]]*)\]\(([^)]+)\)", r"\1 (\2)", text)
@@ -102,7 +118,9 @@ def _inline(text: str) -> str:
     text = re.sub(r"(?<!\w)__([^_\n]+)__(?!\w)", r"\1", text)
     text = re.sub(r"(?<!\w)\*([^*\n]+)\*(?!\w)", r"\1", text)
     text = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"\1", text)
-    text = re.sub(r"`([^`]+)`", r"\1", text)
+
+    for index, span in enumerate(spans):
+        text = text.replace(f"\x00{index}\x00", span)
     return text
 
 

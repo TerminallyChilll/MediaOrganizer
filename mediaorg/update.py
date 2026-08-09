@@ -425,7 +425,9 @@ def check(*, fetch: bool = True) -> UpdateStatus:
             "    mediaorg_journal*.jsonl      (undo history)\n"
             "    custom_strip_patterns.json   (your word list)\n"
             "    .media_llm_config.json       (saved API key)\n"
-            "    .media_renamer_config.json   (remembered folders)")
+            "    .media_renamer_config.json   (remembered folders)\n"
+            "    *.xlsx                       (scans, with any Fixed-column\n"
+            "                                  edits you have made)")
 
     branch = _current_branch()
     upstream, reason = _resolve_upstream(branch)

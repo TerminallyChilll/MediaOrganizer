@@ -169,7 +169,11 @@ def test_re_clone_advice_names_the_files_that_do_not_come_with_it(
     hint = update.check(fetch=True).hint
 
     for untracked in ("mediaorg_journal", "custom_strip_patterns.json",
-                      ".media_llm_config.json", ".media_renamer_config.json"):
+                      ".media_llm_config.json", ".media_renamer_config.json",
+                      # The workbook holds the "... Fixed" columns the user
+                      # typed by hand, which exist nowhere else -- leave it
+                      # behind and the next scan writes a fresh one over them.
+                      "*.xlsx"):
         assert untracked in hint
     assert "nothing is lost" not in hint
 

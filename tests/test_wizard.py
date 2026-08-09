@@ -517,3 +517,64 @@ def test_the_launch_never_pays_the_update_budget_twice(monkeypatch):
     # The second wait gets what is left of the same budget, not a fresh one.
     assert waits[1] <= wizard.LAUNCH_CHECK_BUDGET - spent + 0.05
     assert _time.monotonic() - started < wizard.LAUNCH_CHECK_BUDGET
+
+
+# ── where the remembered folders live ────────────────────────────────────
+
+def test_remembered_folders_follow_the_app_not_the_cwd(tmp_path, monkeypatch):
+    """The config was the last state file still resolved against the cwd, so
+    launching from anywhere else silently forgot the folders you picked."""
+    monkeypatch.delenv("MEDIAORG_CONFIG", raising=False)
+    app = wizard.Path(wizard.__file__).resolve().parent.parent
+
+    monkeypatch.chdir(tmp_path)
+    assert wizard.config_path() == app / wizard.CONFIG_FILE
+
+
+def test_the_config_location_can_be_pinned(tmp_path, monkeypatch):
+    pinned = tmp_path / "elsewhere" / "cfg.json"
+    monkeypatch.setenv("MEDIAORG_CONFIG", str(pinned))
+    assert wizard.config_path() == pinned
+
+    pinned.parent.mkdir(parents=True)
+    wizard._save_config({"tv": "/media/TV"})
+    assert wizard._load_config() == {"tv": "/media/TV"}
+
+
+def test_an_existing_cwd_config_is_adopted_not_orphaned(tmp_path, monkeypatch):
+    """Upgrading users keep what they already have: a config written by an
+    older version sits in the launch directory, and is read rather than
+    replaced by an empty one next to the app."""
+    monkeypatch.delenv("MEDIAORG_CONFIG", raising=False)
+    app_dir = tmp_path / "app"
+    (app_dir / "mediaorg").mkdir(parents=True)
+    monkeypatch.setattr(wizard, "__file__", str(app_dir / "mediaorg" / "wizard.py"))
+
+    legacy = tmp_path / "launched-from"
+    legacy.mkdir()
+    (legacy / wizard.CONFIG_FILE).write_text('{"tv": "/old/TV"}', encoding="utf-8")
+    monkeypatch.chdir(legacy)
+
+    assert wizard.config_path() == legacy / wizard.CONFIG_FILE
+    assert wizard._load_config() == {"tv": "/old/TV"}
+
+
+def test_a_config_next_to_the_app_wins_over_one_in_the_cwd(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEDIAORG_CONFIG", raising=False)
+    app_dir = tmp_path / "app"
+    (app_dir / "mediaorg").mkdir(parents=True)
+    monkeypatch.setattr(wizard, "__file__", str(app_dir / "mediaorg" / "wizard.py"))
+    (app_dir / wizard.CONFIG_FILE).write_text('{"tv": "/new/TV"}', encoding="utf-8")
+
+    other = tmp_path / "somewhere-else"
+    other.mkdir()
+    (other / wizard.CONFIG_FILE).write_text('{"tv": "/stale/TV"}', encoding="utf-8")
+    monkeypatch.chdir(other)
+
+    assert wizard._load_config() == {"tv": "/new/TV"}
+
+
+def test_unreadable_config_is_not_fatal(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEDIAORG_CONFIG", str(tmp_path / "cfg.json"))
+    (tmp_path / "cfg.json").write_text("{not json", encoding="utf-8")
+    assert wizard._load_config() == {}

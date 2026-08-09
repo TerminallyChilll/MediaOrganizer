@@ -102,10 +102,25 @@ def test_emphasis_and_code_spans_are_stripped():
 
 
 def test_a_lone_asterisk_inside_code_survives():
-    """`*.xlsx` and `[U]` are content, not markup — the backticks protect them
-    from the emphasis and link patterns, so they must be stripped last."""
+    """`*.xlsx` and `[U]` are content, not markup."""
     out = convert("Press `[U]`, then open `*.xlsx`.\n")
     assert "Press [U], then open *.xlsx." in out
+
+
+def test_paired_markup_inside_a_code_span_survives_too():
+    """A code span is content by definition, so nothing may rewrite it.
+
+    Stripping backticks *after* the emphasis and link patterns protected only
+    a lone delimiter: `**x**` came out as "x" and `[a](b)` as "a (b)", which
+    is exactly wrong for a document explaining markdown or a shell glob.
+    """
+    out = convert("Write `**bold**`, `_under_`, `[a](b)` and `a * b * c`.\n")
+    assert "Write **bold**, _under_, [a](b) and a * b * c." in out
+
+
+def test_a_code_span_inside_a_link_still_reads_as_a_link():
+    out = convert("See [`run.py`](https://example.com/r) for details.\n")
+    assert "run.py (https://example.com/r)" in out
 
 
 def test_bullets_are_reflowed_with_a_hanging_indent():
@@ -174,6 +189,13 @@ def test_output_ends_with_exactly_one_newline():
 @pytest.mark.parametrize("source", md_to_txt.sources(),
                          ids=lambda p: p.name)
 def test_no_markdown_syntax_survives(source):
+    """Nothing here reaches the reader as syntax.
+
+    Read as "these documents contain no markup", not "these characters are
+    illegal": a code span is now preserved verbatim, so a doc that quotes
+    `**bold**` on purpose would trip this. If that day comes, the fix is to
+    exempt that document, not to start stripping code spans again.
+    """
     text = md_to_txt.target_for(source).read_text(encoding="utf-8")
     assert not re.search(r"^#{1,6} ", text, re.MULTILINE), "heading hashes"
     assert not re.search(r"\*\*", text), "bold markers"

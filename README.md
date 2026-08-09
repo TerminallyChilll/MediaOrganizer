@@ -130,11 +130,17 @@ cp ../MediaOrganizer/mediaorg_journal*.jsonl .      # undo history
 cp ../MediaOrganizer/custom_strip_patterns.json .   # your word list
 cp ../MediaOrganizer/.media_llm_config.json .       # saved API key
 cp ../MediaOrganizer/.media_renamer_config.json .   # remembered folders
+cp ../MediaOrganizer/*.xlsx .                       # scans + Fixed-column edits
 ```
 
 Skip any that don't exist. On Windows use `copy`, and note that the files
 starting with a dot are hidden in Explorer. Keep the old folder until the new
 one has run once.
+
+The `.xlsx` files matter more than they look: the `… Fixed` columns you typed
+live in the workbook and nowhere else, so leaving them behind means the next
+scan writes a fresh one and your corrections are gone. If you kept scans
+somewhere other than the app folder, copy them from there instead.
 
 **6. Check it worked.**
 
@@ -215,6 +221,11 @@ Every flow that changes anything follows the same shape: **plan → preview →
 confirm → apply → journal**. Nothing touches your files until you've seen the
 full list of changes and said yes. `[6]`, `[7]` and `[8]` never touch your
 media at all.
+
+The folders you pick are remembered between runs in
+`.media_renamer_config.json`, kept next to the app (override with
+`MEDIAORG_CONFIG`) so that launching from any directory offers the same
+defaults — like the journal and the word list.
 
 ### Non-interactive use
 ```bash

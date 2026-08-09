@@ -47,9 +47,34 @@ def ask_yes_no(message: str, default: bool = True) -> bool:
     return val.upper() in ('Y', 'YES')
 
 
+def config_path() -> Path:
+    """Where the remembered folders live, independent of the current directory.
+
+    Same reasoning as the undo journal and the word list: a cwd-relative file
+    meant that launching from anywhere but the app folder — `python
+    /opt/MediaOrganizer/run.py` from your home directory — silently forgot the
+    folders you picked last time and asked for them again, which looks like
+    the feature is broken. This was the last of the four state files still
+    resolved against the cwd; making it match the others is also what lets the
+    re-clone advice name a folder to copy it *from*.
+
+    Order: ``$MEDIAORG_CONFIG`` -> next to the app -> adopt a pre-existing file
+    in the cwd, so upgrading users keep the folders they already have.
+    """
+    env = os.environ.get("MEDIAORG_CONFIG")
+    if env:
+        return Path(env).expanduser()
+    app = Path(__file__).resolve().parent.parent / CONFIG_FILE
+    if not app.exists():
+        legacy = Path.cwd() / CONFIG_FILE
+        if legacy.exists() and legacy != app:
+            return legacy
+    return app
+
+
 def _load_config() -> dict:
     try:
-        with open(CONFIG_FILE, encoding='utf-8') as f:
+        with open(config_path(), encoding='utf-8') as f:
             data = json.load(f)
             return data if isinstance(data, dict) else {}
     except (OSError, json.JSONDecodeError):
@@ -58,7 +83,7 @@ def _load_config() -> dict:
 
 def _save_config(config: dict) -> None:
     try:
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        with open(config_path(), 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2)
     except OSError:
         pass
