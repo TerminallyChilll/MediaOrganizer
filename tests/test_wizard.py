@@ -1364,8 +1364,10 @@ def test_b_at_the_extension_prompt_keeps_the_review(tmp_path, monkeypatch):
     root.mkdir()
     for name in ("one.mkv", "two.mkv"):
         (root / name).write_text(name)
-    plan = Plan(ops=[Op("move", root / "one.mkv", root / "One.mkv"),
-                     Op("move", root / "two.mkv", root / "Two.mkv")])
+    # Names differ by more than case: on macOS and Windows a case-only rename
+    # is invisible to exists(), so "Two.mkv" would test nothing there.
+    plan = Plan(ops=[Op("move", root / "one.mkv", root / "Alpha.mkv"),
+                     Op("move", root / "two.mkv", root / "Beta.mkv")])
     # Exclude item 2, then type a name with no extension and answer 'b' to the
     # extension question. The exclusion must survive and [Y] must still apply.
     _drive(monkeypatch, ["R", "x 2", "e 1", "Pilot", "b", "Y", "y"])
@@ -1374,7 +1376,7 @@ def test_b_at_the_extension_prompt_keeps_the_review(tmp_path, monkeypatch):
 
     assert (root / "Pilot.mkv").exists()     # extension kept, not restemmed
     assert (root / "two.mkv").exists()       # the exclusion survived 'b'
-    assert not (root / "Two.mkv").exists()
+    assert not (root / "Beta.mkv").exists()
 
 
 def test_b_at_the_sanitize_prompt_cancels_only_that_rename(tmp_path,
@@ -1385,13 +1387,14 @@ def test_b_at_the_sanitize_prompt_cancels_only_that_rename(tmp_path,
     root = tmp_path / "Movies"
     root.mkdir()
     (root / "one.mkv").write_text("one")
-    plan = Plan(ops=[Op("move", root / "one.mkv", root / "One.mkv")])
+    # Not a case-only rename: those are invisible to exists() on macOS.
+    plan = Plan(ops=[Op("move", root / "one.mkv", root / "Planned.mkv")])
     # A colon does not survive sanitize(), so this asks "Use '...' instead?".
     _drive(monkeypatch, ["R", "e 1", "Pi:lot.mkv", "b", "Y", "y"])
 
     wizard.confirm_and_execute(plan, journal, label="renames", roots=[root])
 
-    assert (root / "One.mkv").exists()       # the planned name, rename cancelled
+    assert (root / "Planned.mkv").exists()   # the planned name, rename cancelled
     assert not (root / "one.mkv").exists()   # the review still applied
 
 
