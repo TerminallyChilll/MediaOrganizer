@@ -1297,6 +1297,92 @@ def test_a_language_tagged_subtitle_still_follows_its_video(tmp_path,
     assert (root / "Pilot.fr.srt").read_text() == "raw.fr.srt"
 
 
+def test_renaming_a_video_does_not_drag_a_numbered_sibling(tmp_path,
+                                                           monkeypatch):
+    """A prefix is only a sidecar match on a non-alphanumeric boundary.
+
+    "Episode10.en" starts with "Episode1", so a bare startswith renamed episode
+    ten's subtitle on top of episode one's - the bystander is what makes this
+    worse than an orphan, since it moves a file the user never selected.
+    """
+    monkeypatch.setattr("mediaorg.execute.RETRY_DELAYS", ())
+    journal = tmp_path / "journal.jsonl"
+    root = tmp_path / "TV"
+    root.mkdir()
+    for name in ("raw1.mkv", "raw1.en.srt", "raw10.en.srt"):
+        (root / name).write_text(name)
+    plan = Plan(ops=[
+        Op("move", root / "raw1.mkv", root / "Episode1.mkv"),
+        Op("move", root / "raw1.en.srt", root / "Episode1.en.srt"),
+        Op("move", root / "raw10.en.srt", root / "Episode10.en.srt"),
+    ])
+    _drive(monkeypatch, ["R", "e 1", "Pilot.mkv", "Y", "y"])
+
+    wizard.confirm_and_execute(plan, journal, label="renames", roots=[root])
+
+    assert (root / "Pilot.mkv").exists()
+    assert (root / "Pilot.en.srt").read_text() == "raw1.en.srt"
+    # Episode 10's subtitle keeps its own planned name and its own content.
+    assert (root / "Episode10.en.srt").read_text() == "raw10.en.srt"
+    assert not (root / "Pilot0.en.srt").exists()
+
+
+def test_ctrl_d_in_the_review_aborts_without_applying(tmp_path, monkeypatch):
+    """A closed stdin is a "no", not a traceback - and must not spin the loop."""
+    monkeypatch.setattr("mediaorg.execute.RETRY_DELAYS", ())
+    journal = tmp_path / "journal.jsonl"
+    root = tmp_path / "TV"
+    root.mkdir()
+    (root / "raw.mkv").write_text("video")
+    plan = Plan(ops=[Op("move", root / "raw.mkv", root / "Episode.mkv")])
+
+    def _eof(*a):
+        raise EOFError
+    monkeypatch.setattr("builtins.input", _eof)
+    monkeypatch.setattr(wizard, "_stdin_is_interactive", lambda: True)
+
+    entries = wizard.confirm_and_execute(plan, journal, label="renames",
+                                         roots=[root])
+
+    assert entries == []
+    assert (root / "raw.mkv").exists()          # untouched
+    assert not (root / "Episode.mkv").exists()
+
+
+def test_ctrl_d_at_the_go_to_page_prompt_aborts(tmp_path, monkeypatch):
+    """The sub-prompts are covered by the same handler, not just the main one."""
+    plan = Plan(ops=[Op("move", tmp_path / f"a{i}", tmp_path / f"b{i}")
+                     for i in range(25)])       # 3 pages, so [G] is offered
+    answers = iter(["G"])            # then the page prompt hits EOF
+
+    def _maybe_eof(*a):
+        try:
+            return next(answers)
+        except StopIteration:
+            raise EOFError
+    monkeypatch.setattr("builtins.input", _maybe_eof)
+
+    assert wizard.review_changes(plan, "renames") is None
+
+
+def test_ctrl_d_at_the_new_name_prompt_aborts(tmp_path, monkeypatch):
+    """_ask_new_name reads with a bare input() too."""
+    root = tmp_path / "TV"
+    root.mkdir()
+    (root / "raw.mkv").write_text("v")
+    plan = Plan(ops=[Op("move", root / "raw.mkv", root / "Episode.mkv")])
+    answers = iter(["R", "e 1"])     # then the name prompt hits EOF
+
+    def _maybe_eof(*a):
+        try:
+            return next(answers)
+        except StopIteration:
+            raise EOFError
+    monkeypatch.setattr("builtins.input", _maybe_eof)
+
+    assert wizard.review_changes(plan, "renames") is None
+
+
 def test_the_cross_device_tag_survives_an_edit(tmp_path, monkeypatch):
     """Op is frozen and compared by value, so an edit dropped it from the set."""
     root = tmp_path / "Movies"

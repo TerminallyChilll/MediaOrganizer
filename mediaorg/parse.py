@@ -52,6 +52,31 @@ def is_media_file(name: str, exts=None) -> bool:
     suffix = Path(name).suffix.lower()
     return suffix in (VIDEO_EXTS if exts is None else exts)
 
+
+def companion_tail(companion_stem: str, video_stem: str) -> str | None:
+    """The tail that makes `companion_stem` a sidecar of `video_stem`, else None.
+
+    Sidecars are matched on a prefix rather than an exact stem so that language
+    tags survive: "Episode1.en" against "Episode1" is ".en", and renaming the
+    video has to carry that tail or the subtitle is orphaned.
+
+    The boundary check is the whole point. A bare `startswith` also matches
+    "Episode10.en" against "Episode1", so renaming Episode1 captures Episode
+    *10*'s subtitle and renames it on top of a name it has no business touching.
+    A prefix only counts when what follows it is not alphanumeric.
+
+    Shared by the rename planner (`excel._companion_ops`) and the review screen
+    (`wizard._edit_destination`), which must agree: the planner emits the
+    destinations the review screen then has to recognise.
+    """
+    if not companion_stem.startswith(video_stem):
+        return None
+    tail = companion_stem[len(video_stem):]
+    if tail and tail[0].isalnum():
+        return None
+    return tail    # '' for an exact match: the plain "Episode1.srt" case
+
+
 CUSTOM_PATTERNS_FILE = "custom_strip_patterns.json"
 
 # Suffix of the scratch file a case-only rename passes through. Defined here,

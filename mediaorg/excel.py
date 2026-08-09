@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from .parse import (COMPANION_EXTS, VIDEO_EXTS, ParsedName, is_junk_name,
-                    parse_name)
+from .parse import (COMPANION_EXTS, VIDEO_EXTS, ParsedName, companion_tail,
+                    is_junk_name, parse_name)
 from .plan import (EPISODE_PATTERN, SEASON_FOLDER_PATTERN, NamingScheme, Op,
                    Plan, build_episode_file_name, build_movie_file_name,
                    build_movie_folder_name, build_season_folder_name,
@@ -149,6 +149,11 @@ def _companion_ops(video_path: Path, old_base: str, new_base: str) -> list[Op]:
     A companion belongs to the video when its stem starts with the video's
     old stem, or (for episodes) it carries the same SxxEyy code. Extra stem
     tail like a ".en" language tag is preserved.
+
+    The prefix test is `parse.companion_tail`, shared with the review screen
+    that has to recognise these destinations later. Its boundary check matters
+    here too: a bare `startswith` matches "Episode10.en" against "Episode1", so
+    renaming Episode1 would rename Episode 10's subtitle on top of it.
     """
     old_stem, new_stem = Path(old_base).stem, Path(new_base).stem
     code = extract_season_episode(old_base)
@@ -166,8 +171,9 @@ def _companion_ops(video_path: Path, old_base: str, new_base: str) -> list[Op]:
         # Normalise before the prefix test, or a subtitle stored NFD next to an
         # NFC video is orphaned instead of being renamed alongside it.
         normed_stem, normed_old = norm(p.stem), norm(old_stem)
-        if normed_stem.startswith(normed_old):
-            tail = normed_stem[len(normed_old):]
+        prefix_tail = companion_tail(normed_stem, normed_old)
+        if prefix_tail is not None:
+            tail = prefix_tail
         elif code != (None, None) and extract_season_episode(p.name) == code:
             # Keep whatever follows the episode code (e.g. ".en" language tag).
             m = EPISODE_PATTERN.search(p.stem)

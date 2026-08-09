@@ -122,6 +122,23 @@ def test_companions_renamed_with_their_episode(tmp_path):
     assert names["Show.S01E01.en.srt"] == "Show S01E01 [720p].en.srt"
 
 
+def test_a_numbered_sibling_is_not_a_companion(tmp_path):
+    """"Film10.en" starts with "Film1" but belongs to a different film.
+
+    Movies have no SxxEyy code to fall back on, so the prefix test is the only
+    thing standing between Film1's rename and Film10's subtitle.
+    """
+    root = tmp_path / "Movies"
+    root.mkdir()
+    for name in ("Film1.mkv", "Film1.en.srt", "Film10.en.srt"):
+        (root / name).write_text(name)
+
+    ops = excel._companion_ops(root / "Film1.mkv", "Film1.mkv", "Pilot.mkv")
+
+    assert {o.src.name: o.dst.name for o in ops} == {
+        "Film1.en.srt": "Pilot.en.srt"}
+
+
 def test_show_root_scan_does_not_rename_season_folders_as_shows(tmp_path):
     # Scanner pointed at a single show's root: "Show Folder" == "Season 1".
     root = tmp_path / "The Office"

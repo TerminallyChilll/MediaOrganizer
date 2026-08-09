@@ -20,9 +20,9 @@ from . import excel, extfix, llm, scan, update
 from .execute import (execute, journal_path, last_run_ops, list_runs,
                       pending_runs, recover, undo_last, undo_last_run,
                       undo_run, undo_session)
-from .parse import (COMPANION_EXTS, VIDEO_EXTS, custom_patterns_path,
-                    is_media_file, load_custom_patterns, parse_name, pre_clean,
-                    save_custom_patterns)
+from .parse import (COMPANION_EXTS, VIDEO_EXTS, companion_tail,
+                    custom_patterns_path, is_media_file, load_custom_patterns,
+                    parse_name, pre_clean, save_custom_patterns)
 from .plan import (NamingScheme, Op, Plan, check_collisions, find_show_roots,
                    plan_loose_movies, plan_season_structure, sanitize)
 
@@ -365,12 +365,16 @@ def _edit_destination(items: list[_ReviewItem], index: int) -> None:
     # Renaming the video alone would leave them pointing at a name that no
     # longer exists — exactly the breakage the rename is meant to fix.
     #
-    # Matched with startswith and carrying the tail, mirroring
-    # excel._companion_ops, which is what produced these destinations: it keeps
-    # ".en"/".fr" language tags, so "My Show S01E01.en.srt" never has the
-    # video's stem. Matching loosely *without* carrying the tail would be worse
-    # than the bug - ".en.srt" and ".fr.srt" would both target one name and
-    # check_collisions would drop both as a duplicate target.
+    # Matched with parse.companion_tail, the same helper excel._companion_ops
+    # uses to produce these destinations: it keeps ".en"/".fr" language tags, so
+    # "My Show S01E01.en.srt" never has the video's stem, and its boundary check
+    # is what stops "Episode1" from capturing "Episode10.en.srt". One helper
+    # rather than two copies of the rule, because a planner and the screen that
+    # reviews its output cannot be allowed to disagree about what a sidecar is.
+    #
+    # Carrying the tail is not optional: matching loosely *without* it would be
+    # worse than the bug - ".en.srt" and ".fr.srt" would both target one name
+    # and check_collisions would drop both as a duplicate target.
     #
     # It flows one way only, video -> sidecar. Symmetric matching meant that
     # renaming "Episode.srt" to "English.srt" dragged "Episode.mkv" with it.
@@ -381,10 +385,12 @@ def _edit_destination(items: list[_ReviewItem], index: int) -> None:
             if (o is item or o.op.kind != "move" or o.op.src is None
                     or not o.op.src.is_file()
                     or o.op.dst.parent != old.parent
-                    or o.op.dst.suffix.lower() not in COMPANION_EXTS
-                    or not o.op.dst.stem.startswith(old.stem)):
+                    or o.op.dst.suffix.lower() not in COMPANION_EXTS):
                 continue
-            followers.append((o, o.op.dst.stem[len(old.stem):]))
+            tail = companion_tail(o.op.dst.stem, old.stem)
+            if tail is None:
+                continue
+            followers.append((o, tail))
     item.op = dataclasses.replace(item.op, dst=old.with_name(safe))
     print(f"   [OK] {safe}")
     new_stem = Path(safe).stem
@@ -404,7 +410,16 @@ def review_changes(plan: Plan, label: str = "changes") -> Plan | None:
     """
     crossing = set(_crosses_devices(plan))
     items = [_ReviewItem(op, op) for op in plan.ops]
-    if _review_items(items, crossing, label, plan.skipped) is False:
+    # One handler for every prompt the review can put up — the choice line, the
+    # "go to page" sub-prompt, the new-name prompt. Ctrl-D means no further
+    # answers are coming, so abort; treating it as an invalid choice would spin
+    # the loop forever on a closed stdin. Nothing has been applied at this
+    # point, so backing out here costs nothing but the typing.
+    try:
+        if _review_items(items, crossing, label, plan.skipped) is False:
+            return None
+    except EOFError:
+        print("\n   [!] End of input. Nothing has been changed.")
         return None
 
     keep = [i.op for i in items if i.keep]
@@ -426,8 +441,12 @@ def review_changes(plan: Plan, label: str = "changes") -> Plan | None:
         if not revalidated.ops:
             print("Nothing left to do.")
             return None
-        if not ask_yes_no(f"Continue with the remaining "
-                          f"{len(revalidated.ops)}?", default=False):
+        try:
+            go_on = ask_yes_no(f"Continue with the remaining "
+                               f"{len(revalidated.ops)}?", default=False)
+        except EOFError:
+            go_on = False   # same reasoning as above; still nothing applied
+        if not go_on:
             return None
     return revalidated
 
