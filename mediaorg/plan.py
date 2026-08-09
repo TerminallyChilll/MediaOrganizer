@@ -348,8 +348,15 @@ def _is_case_only_rename(src: Path, dst: Path) -> bool:
             and src.name.casefold() == dst.name.casefold())
 
 
-def check_collisions(ops: list[Op]) -> Plan:
-    """Split ops into safe vs skipped. Never overwrite, never auto-suffix."""
+def check_collisions(ops: list[Op], *,
+                     dropped: tuple[Op, ...] | list[Op] = ()) -> Plan:
+    """Split ops into safe vs skipped. Never overwrite, never auto-suffix.
+
+    `dropped` is for re-validating a plan the *user* has trimmed: ops removed
+    by hand are gone from `ops`, so nothing below would know their directories
+    are no longer going to be emptied. Passing them here keeps the rmdir rule
+    at the bottom of this function the single place that decides that.
+    """
     plan = Plan()
     limit = max_path_length()
     by_dst: dict[str, list[Op]] = {}
@@ -388,6 +395,8 @@ def check_collisions(ops: list[Op]) -> Plan:
     # Drop those too, rather than reporting a failure the user cannot act on.
     blocked = {op.src.parent for op, _ in plan.skipped
                if op.kind == "move" and op.src}
+    blocked |= {op.src.parent for op in dropped
+                if op.kind == "move" and op.src}
     if blocked:
         surviving = []
         for op in plan.ops:
@@ -396,6 +405,32 @@ def check_collisions(ops: list[Op]) -> Plan:
                 plan.skipped.append(
                     (op, "directory will not be empty: a move out of it "
                          "was skipped"))
+                continue
+            surviving.append(op)
+        plan.ops = surviving
+
+    # The mirror image, and only ever reachable from a hand-trimmed plan: a
+    # planner emits mkdir for a directory it is about to move files into, so
+    # excluding those moves leaves a mkdir that would create an empty folder
+    # nobody asked for. Restricted to directories a *dropped* move was headed
+    # for, so a planner's own output is never second-guessed — and note the
+    # converse needs no handling, since excluding a mkdir while keeping a move
+    # into it changes nothing: _do_move creates missing parents itself.
+    orphaned = {op.dst.parent for op in dropped if op.kind == "move"}
+    # Same union as the rmdir rule above: a move this call skipped (source
+    # missing, path too long, duplicate target) is just as gone as one the user
+    # excluded, and leaving its mkdir behind creates the empty folder anyway.
+    orphaned |= {op.dst.parent for op, _ in plan.skipped if op.kind == "move"}
+    if orphaned:
+        wanted = {op.dst.parent for op in plan.ops if op.kind == "move"}
+        surviving = []
+        for op in plan.ops:
+            if (op.kind == "mkdir" and op.dst in orphaned
+                    and not any(w == op.dst or op.dst in w.parents
+                                for w in wanted)):
+                plan.skipped.append(
+                    (op, "folder no longer needed: every move into it "
+                         "was excluded"))
                 continue
             surviving.append(op)
         plan.ops = surviving

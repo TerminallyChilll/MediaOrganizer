@@ -12,6 +12,7 @@ A cross-platform tool to scan media libraries, organize TV show structures, and 
 - **Organize TV structures:** loose `S01E01` files/folders are grouped into `Season X` folders; duplicate season folders (`S02` + `Season 2`) are merged; subtitles and `.nfo` files move (and rename) together with their episode.
 - **Handles nested libraries:** shows are found wherever they sit — `TV/Show`, `TV/Genre/Show`, `TV/Genre/SubGenre/Show` — and season folders are flattened however deep the episode is buried (`Season 1/Disc 1/ep.mkv`, `Season 1/Show.S01E01/Subs/ep.mkv`). Episodes dumped in a non-season subfolder (`Show/Downloads/Show.S01E01.mkv`) are routed into the right season folder, one season at a time. See [Nested folders](#nested-folders).
 - **Safe by design:** every change is planned first, previewed, and only applied after you confirm. Collisions are never overwritten — conflicting changes are skipped and reported. `--dry-run` shows the plan without touching anything. Scanning never modifies files. Nothing is ever deleted: the only destructive primitive is "remove this directory if it is empty".
+- **Review before, decide after:** the preview is a numbered, paged working list, not a wall of text — page through every change, exclude anything you don't want (`x 3,7-9`), or retype a name that came out wrong (`e 3`, and its subtitles follow). Enter pages; it never applies. Then, once the changes are on disk, the wizard stops and asks you to go look at them. Say no and every file goes straight back where it was. See [Review and accept](#review-and-accept).
 - **Journaled undo:** every applied change is recorded (with the actual paths, plus the file's size and mtime) in `mediaorg_journal.jsonl`, which lives **next to the app** — not in whatever directory you happened to launch from. `python run.py --list-runs` shows the history; `--undo` reverses the last run, `--undo-run <id>` a specific one, and `--undo-session` the whole of a `--action full`. An *intent* record is written before every change, so a crash or a half-finished copy across drives is detected and cleaned up rather than left to block future runs.
 - **Excel journal:** your library is written to an `.xlsx`. Edit the `… Fixed` columns to override any title/year/quality and the next rename pass uses your values.
 - **Fix extensions:** restore stripped video extensions via magic-byte detection, or bulk-convert one extension to another.
@@ -217,10 +218,70 @@ Launching `python run.py` opens the interactive wizard:
 [0] Exit
 ```
 
-Every flow that changes anything follows the same shape: **plan → preview →
-confirm → apply → journal**. Nothing touches your files until you've seen the
-full list of changes and said yes. `[6]`, `[7]` and `[8]` never touch your
-media at all.
+Every flow that changes anything follows the same shape:
+
+**pick the folder → pick what to do → check the word list → choose the naming
+engine (guessit or an LLM) → see the full before/after list → review it →
+apply → keep it or have it all put back.**
+
+Nothing touches your files until you've seen the full list of changes and said
+yes, and nothing *stays* changed until you've looked at the result and said yes
+again. `[6]`, `[7]` and `[8]` never touch your media at all.
+
+### Review and accept
+
+Every change is on screen before anything is asked. The list is numbered and
+paged, the current path above the proposed one:
+
+```
+--- renames: items 1-10 of 14, page 1/2 (14 will be applied) ---
+  [ 1] BEFORE  /media/TV/My Show/My.Show.S01E01.mkv
+       AFTER   /media/TV/My Show/Season 1/My Show S01E01.mkv
+  [ 2] BEFORE  /media/TV/My Show/My.Show.S01E02.mkv
+       AFTER   /media/TV/My Show/Season 1/My Show S01E02.mkv
+  [Enter/N]ext  [P]rev  [G] page  [A]ll  [R] review & edit  [Y]es apply  [Q]uit
+```
+
+Enter pages forward — it never applies anything, so a stray keypress cannot
+commit a rename you have not read. `[Y]` applies, `[Q]` cancels.
+
+`[R]` turns on editing, on the same list:
+
+```
+  [Enter/N]ext  [P]rev  [G] page  [A]ll  [x N] exclude  [k N] keep  [e N] rename  [Y]es apply  [Q]uit
+  (x and k take ranges too: 'x 3,7-9')
+```
+
+- `x 3` drops a change; `x 3,7-9` drops several; `k 3` puts one back.
+- `e 3` lets you retype that one name. Subtitles and `.nfo` sidecars follow the
+  video automatically, keeping any `.en`/`.fr` language tag; changing the
+  extension is questioned rather than done silently; and a name that isn't
+  usable on every filesystem is offered back cleaned up. You are editing the
+  *name*, not the folder it lands in, so slashes are refused. Renaming a
+  subtitle does **not** rename the film it belongs to.
+- Anything you change is re-checked for collisions before it runs, exactly like
+  a name the tool generated itself. A folder cleanup your exclusion made
+  impossible is dropped rather than left to fail, and so is a folder that would
+  now be created empty.
+- Anything the planner had to skip is listed with the reason, so a conflict is
+  never just a number.
+
+After the changes are applied the wizard stops and tells you to go look:
+
+```
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+  CHECK YOUR FILES NOW - 14 change(s) are already on disk.
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+...
+Keep these changes? (y/n) [n]:
+```
+
+Answer **no** — or just press Enter, which is the default — and every file goes
+back exactly where it was, through the same journal `--undo` uses. Answer yes
+and they stay; you can still reverse them later, you just have to ask.
+
+`[4] Do it all` asks this **once, for the whole action**: saying no there puts
+back the TV organizing as well as the renaming, not only the last step.
 
 The folders you pick are remembered between runs in
 `.media_renamer_config.json`, kept next to the app (override with
@@ -236,7 +297,18 @@ python run.py --action rename          --output lib.xlsx
 python run.py --action full            --movies /media/Movies --tv /media/TV
 python run.py --action inventory       --path /media --output inventory.xlsx
 # add --dry-run to any of the above to preview without changing anything
+# add --review to be asked, afterwards, whether to keep the changes
 ```
+
+Run from a terminal, these behave like the wizard: the full list first, then a
+`[Y]`. They do **not** ask the keep-or-put-back question afterwards — pass
+`--review` for that, and with `--action full` it covers every phase at once.
+
+**When stdin is not a terminal** — cron, a Docker service, anything piped —
+there is nobody to answer either question, so the plan is printed to the log
+and applied without prompting. The journal is still written, and the exact
+`--undo-run` command is printed, so an unattended run is as reversible as any
+other. `--dry-run` still changes nothing at all.
 
 ### Two ways to list what you have
 Both are read-only.
@@ -251,6 +323,8 @@ Both are read-only.
   comparison.
 
 ### Custom word list
+The rename flows (`[1]`, `[4]`) and the scan (`[6]`) show you this list on the
+way past and offer to edit it, so you do not have to know to visit `[8]` first.
 `[8]` manages the words stripped out of a name before it is parsed — release
 groups, tracker tags, whatever your library is littered with. You can add
 entries, **remove them individually, or clear the list**, and test a pattern
@@ -273,6 +347,11 @@ Undo refuses to move a file back if it was modified or replaced after the fact,
 and refuses to reverse a run out of order when a newer run touched the same
 paths. `--force` overrides either check. The journal location can be pinned
 with the `MEDIAORG_JOURNAL` environment variable.
+
+These are for changes you accepted earlier and have since thought better of.
+For the run you just made, the wizard already offers to reverse it — see
+[Review and accept](#review-and-accept) — so you rarely need to reach for these
+in the same sitting.
 
 ### Nested folders
 A **show folder** is the shallowest folder that directly contains season

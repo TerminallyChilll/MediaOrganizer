@@ -12,8 +12,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from .parse import (COMPANION_EXTS, VIDEO_EXTS, ParsedName, is_junk_name,
-                    parse_name)
+from .parse import (COMPANION_EXTS, VIDEO_EXTS, ParsedName, companion_tail,
+                    is_junk_name, is_media_file, parse_name)
 from .plan import (EPISODE_PATTERN, SEASON_FOLDER_PATTERN, NamingScheme, Op,
                    Plan, build_episode_file_name, build_movie_file_name,
                    build_movie_folder_name, build_season_folder_name,
@@ -149,6 +149,14 @@ def _companion_ops(video_path: Path, old_base: str, new_base: str) -> list[Op]:
     A companion belongs to the video when its stem starts with the video's
     old stem, or (for episodes) it carries the same SxxEyy code. Extra stem
     tail like a ".en" language tag is preserved.
+
+    The prefix test is `parse.companion_tail`, shared with the review screen
+    that has to recognise these destinations later. Its boundary check matters
+    here too: a bare `startswith` matches "Episode10.en" against "Episode1", so
+    renaming Episode1 would rename Episode 10's subtitle on top of it.
+
+    Which video owns a sidecar is decided here rather than in the helper, since
+    only the folder knows what else is in it. See `video_stems` below.
     """
     old_stem, new_stem = Path(old_base).stem, Path(new_base).stem
     code = extract_season_episode(old_base)
@@ -157,6 +165,18 @@ def _companion_ops(video_path: Path, old_base: str, new_base: str) -> list[Op]:
         entries = list(os.scandir(video_path.parent))
     except OSError:
         return ops
+    # A sidecar can prefix-match more than one video: "Inception.2010.1080p.en"
+    # matches "Inception" and "Inception.2010.1080p" alike, and a repack's
+    # ".REPACK.en" matches the plain episode. companion_tail compares two bare
+    # strings and cannot know the other video is there, so the most specific
+    # video in the folder wins and shorter titles leave the sidecar alone.
+    #
+    # Not cosmetic: when both films are being renamed, each emits an op for the
+    # same src, and check_collisions groups by *destination*, so both survive
+    # planning. The first executes and the second fails at execute time with the
+    # subtitle already sitting under the wrong film's name.
+    video_stems = [norm(Path(e.name).stem) for e in entries
+                   if e.is_file(follow_symlinks=False) and is_media_file(e.name)]
     for e in entries:
         if not e.is_file(follow_symlinks=False) or is_junk_name(e.name):
             continue
@@ -166,8 +186,13 @@ def _companion_ops(video_path: Path, old_base: str, new_base: str) -> list[Op]:
         # Normalise before the prefix test, or a subtitle stored NFD next to an
         # NFC video is orphaned instead of being renamed alongside it.
         normed_stem, normed_old = norm(p.stem), norm(old_stem)
-        if normed_stem.startswith(normed_old):
-            tail = normed_stem[len(normed_old):]
+        prefix_tail = companion_tail(normed_stem, normed_old)
+        if prefix_tail is not None:
+            if any(len(v) > len(normed_old)
+                   and companion_tail(normed_stem, v) is not None
+                   for v in video_stems):
+                continue    # a more specific video in this folder owns it
+            tail = prefix_tail
         elif code != (None, None) and extract_season_episode(p.name) == code:
             # Keep whatever follows the episode code (e.g. ".en" language tag).
             m = EPISODE_PATTERN.search(p.stem)

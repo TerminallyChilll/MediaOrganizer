@@ -14,6 +14,23 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
+@pytest.fixture(autouse=True)
+def _no_update_check(monkeypatch):
+    """Keep the whole suite offline and out of the working tree.
+
+    ``run_wizard`` kicks off a background update check on entry, which shells
+    out to git and writes ``.mediaorg_update_check.json`` next to the app —
+    outside ``tmp_path``, in the repo. Individual tests remembering a fixture
+    is not enough: the one that forgets leaves a stray file behind and burns
+    the launch budget. Off by default, everywhere.
+
+    Note this does not cover tests/test_update.py, which drives the caching
+    machinery directly and so writes the real cache file on purpose; that is
+    pre-existing and wants a `cache_path()` override to fix properly.
+    """
+    monkeypatch.setenv("MEDIAORG_NO_UPDATE_CHECK", "1")
+
+
 @pytest.fixture
 def journal(tmp_path):
     return tmp_path / "journal.jsonl"

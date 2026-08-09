@@ -71,6 +71,12 @@ class ExecResult:
     done: list[Op] = field(default_factory=list)
     failed: list[tuple[Op, str]] = field(default_factory=list)
     dry_run: bool = False
+    # The journal run this result came from, so a caller can reverse exactly
+    # what it just did rather than guessing at "the newest pending run" — which
+    # is a different run the moment anything else writes to the journal first.
+    # None whenever no run was opened: a dry run, a plan with nothing to do,
+    # and undo results. Callers must check before passing it to undo_run().
+    run_id: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -384,6 +390,9 @@ def execute(plan: Plan, journal: Path, dry_run: bool = False, *,
 
     check_roots = _resolved_roots(roots) or _implicit_roots(plan.ops)
     run_id = uuid.uuid4().hex[:12]
+    # Stamped before the loop, not after it: a run whose ops all failed still
+    # opened a run in the journal, and the caller still needs to name it.
+    result.run_id = run_id
 
     with open(journal, "a", encoding="utf-8") as handle:
         jw = _Writer(handle)
