@@ -19,8 +19,8 @@ from . import excel, extfix, llm, scan, update
 from .execute import (execute, journal_path, last_run_ops, list_runs,
                       pending_runs, recover, undo_last, undo_last_run,
                       undo_run, undo_session)
-from .parse import (COMPANION_EXTS, custom_patterns_path, is_media_file,
-                    load_custom_patterns, parse_name, pre_clean,
+from .parse import (COMPANION_EXTS, VIDEO_EXTS, custom_patterns_path,
+                    is_media_file, load_custom_patterns, parse_name, pre_clean,
                     save_custom_patterns)
 from .plan import (NamingScheme, Op, Plan, check_collisions, find_show_roots,
                    plan_loose_movies, plan_season_structure, sanitize)
@@ -319,12 +319,19 @@ def _edit_destination(items: list[_ReviewItem], index: int) -> None:
     # Subtitles and .nfo sidecars are separate ops named after the video.
     # Renaming the video alone would leave them pointing at a name that no
     # longer exists — exactly the breakage the rename is meant to fix.
-    # Only files follow: `Path.stem` of a dotted *folder* name ("Show.S01" ->
-    # "Show") would otherwise match an unrelated file op sitting beside it.
+    #
+    # This flows one way only, video -> sidecar. Same-stem alone would make it
+    # symmetric, so renaming "Episode.srt" to "English.srt" would drag
+    # "Episode.mkv" to "English.mkv" — renaming the film because you retitled
+    # its subtitle track. A folder is excluded for a third reason: `Path.stem`
+    # of a dotted folder name ("Show.S01" -> "Show") matches unrelated files
+    # sitting beside it.
+    leads = is_file and old.suffix.lower() in VIDEO_EXTS
     followers = [o for o in items
-                 if is_file and o is not item and o.op.kind == "move"
+                 if leads and o is not item and o.op.kind == "move"
                  and o.op.dst.parent == old.parent
                  and o.op.dst.stem == old.stem
+                 and o.op.dst.suffix.lower() in COMPANION_EXTS
                  and o.op.src is not None and o.op.src.is_file()]
     item.op = dataclasses.replace(item.op, dst=old.with_name(safe))
     print(f"   [OK] {safe}")
@@ -533,6 +540,21 @@ def _session_ops(journal: Path, session: str) -> list[dict]:
         if run["session"] == session:
             ops.extend(run["ops"])
     return ops
+
+
+def _report_unaccepted(journal: Path, session: str) -> None:
+    """Say what a session left on disk when its gate was never reached.
+
+    Only ever called on the way out of an interrupt, so it prints and returns
+    rather than asking anything.
+    """
+    landed = _session_ops(journal, session)
+    if not landed:
+        return
+    print(f"\n[!] {len(landed)} change(s) were already applied and you never "
+          f"got the chance to accept them.")
+    print("    They are still on disk. Put them back with:")
+    print("        python run.py --undo-session")
 
 
 def accept_or_revert(result, journal: Path, *, label: str = "changes",
@@ -1579,6 +1601,16 @@ Tip: type 'back' or 'b' at any prompt to return here.""")
                     if session is None:
                         raise
                     print("\n(Going back - but the organizing already ran.)")
+                except KeyboardInterrupt:
+                    # Same hole as 'back' above, but an interrupt must not be
+                    # answered with a prompt: the user is trying to stop, and
+                    # reverting unasked is the one thing worse than not
+                    # reverting. Say what is on disk and how to reverse it,
+                    # then let the outer handler take it - silence here was
+                    # the actual defect, not the absence of a rollback.
+                    if session is not None:
+                        _report_unaccepted(_journal_path(), session)
+                    raise
                 if session is not None:
                     if accept_or_revert(None, _journal_path(),
                                         label="changes", session=session):

@@ -590,7 +590,7 @@ def test_unreadable_config_is_not_fatal(tmp_path, monkeypatch):
 from pathlib import Path
 
 from mediaorg.execute import list_runs
-from mediaorg.plan import Op, Plan
+from mediaorg.plan import Op, Plan, check_collisions
 
 
 @pytest.fixture
@@ -980,3 +980,117 @@ def test_the_step_counter_does_not_overcount(wired, monkeypatch, capsys):
     assert numbered, "no step banners were printed"
     total = numbered[0][1]
     assert max(n for n, _ in numbered) == total, numbered
+
+
+# --- Follow-ups from PR review -----------------------------------------------
+
+def test_renaming_a_subtitle_does_not_drag_its_video(tmp_path, monkeypatch):
+    """Companion coupling runs video -> sidecar, never the other way.
+
+    Same-stem alone made it symmetric, so retitling a subtitle track renamed
+    the film it belonged to.
+    """
+    monkeypatch.setattr("mediaorg.execute.RETRY_DELAYS", ())
+    journal = tmp_path / "journal.jsonl"
+    root = tmp_path / "Movies"
+    root.mkdir(parents=True)
+    (root / "raw.mkv").write_text("video")
+    (root / "raw.srt").write_text("subs")
+
+    plan = Plan(ops=[Op("move", root / "raw.mkv", root / "Episode.mkv"),
+                     Op("move", root / "raw.srt", root / "Episode.srt")])
+    # Item 2 is the subtitle. Renaming it must leave the video's plan alone.
+    _drive(monkeypatch, ["R", "e 2", "English.srt", "Y", "y"])
+
+    wizard.confirm_and_execute(plan, journal, label="renames", roots=[root])
+
+    assert (root / "Episode.mkv").exists()      # unchanged by the .srt edit
+    assert (root / "English.srt").exists()
+    assert not (root / "English.mkv").exists()
+
+
+def test_renaming_the_video_still_carries_the_subtitle(tmp_path, monkeypatch):
+    """The direction that should propagate still does."""
+    monkeypatch.setattr("mediaorg.execute.RETRY_DELAYS", ())
+    journal = tmp_path / "journal.jsonl"
+    root = tmp_path / "Movies"
+    root.mkdir(parents=True)
+    (root / "raw.mkv").write_text("video")
+    (root / "raw.srt").write_text("subs")
+
+    plan = Plan(ops=[Op("move", root / "raw.mkv", root / "Episode.mkv"),
+                     Op("move", root / "raw.srt", root / "Episode.srt")])
+    _drive(monkeypatch, ["R", "e 1", "Pilot.mkv", "Y", "y"])
+
+    wizard.confirm_and_execute(plan, journal, label="renames", roots=[root])
+
+    assert (root / "Pilot.mkv").exists()
+    assert (root / "Pilot.srt").exists()
+
+
+def test_excluding_a_move_drops_the_folder_it_was_going_into(tmp_path):
+    """plan_loose_movies emits mkdir + move; excluding the move orphans it."""
+    root = tmp_path / "Movies"
+    root.mkdir()
+    (root / "Film.mkv").write_text("v")
+    folder = root / "Film"
+    mkdir_op = Op("mkdir", None, folder)
+    move_op = Op("move", root / "Film.mkv", folder / "Film.mkv")
+
+    plan = check_collisions([mkdir_op], dropped=[move_op])
+
+    assert plan.ops == []
+    assert any("no longer needed" in reason for _, reason in plan.skipped)
+
+
+def test_a_folder_still_wanted_by_another_move_is_kept(tmp_path):
+    """Only fully-orphaned folders go; one surviving move is enough to keep it."""
+    root = tmp_path / "Movies"
+    root.mkdir()
+    (root / "Film.mkv").write_text("v")
+    (root / "Film.srt").write_text("s")
+    folder = root / "Film"
+    mkdir_op = Op("mkdir", None, folder)
+    kept = Op("move", root / "Film.srt", folder / "Film.srt")
+    gone = Op("move", root / "Film.mkv", folder / "Film.mkv")
+
+    plan = check_collisions([mkdir_op, kept], dropped=[gone])
+
+    assert mkdir_op in plan.ops
+
+
+def test_a_planners_own_mkdir_is_never_second_guessed(tmp_path):
+    """With nothing dropped, this rule must not fire at all."""
+    root = tmp_path / "Movies"
+    root.mkdir()
+    folder = root / "Empty On Purpose"
+    plan = check_collisions([Op("mkdir", None, folder)])
+    assert [op.kind for op in plan.ops] == ["mkdir"]
+
+
+def test_an_interrupt_before_the_session_gate_says_what_is_on_disk(wired,
+                                                                   monkeypatch,
+                                                                   capsys):
+    """[4]: Ctrl-C mid-flow must not exit silently on an applied library."""
+    tv, journal = wired
+    monkeypatch.setenv("MEDIAORG_CONFIG", str(tv.parent / "cfg.json"))
+    monkeypatch.setenv("MEDIAORG_PATTERNS", str(tv.parent / "words.json"))
+    monkeypatch.setattr(wizard, "browse_for_folder",
+                        lambda *a, **k: str(tv) if "TV" in a[0] else None)
+    answers = iter(["4", "media_library.xlsx", "Y"])
+
+    def _input(*a):
+        try:
+            return next(answers)
+        except StopIteration:
+            raise KeyboardInterrupt          # interrupt at the word-list step
+    monkeypatch.setattr("builtins.input", _input)
+
+    wizard.run_wizard()          # the outer handler catches it and returns
+
+    runs = list_runs(journal)
+    assert runs, "the organize phase never ran, so this proves nothing"
+    assert not any(r["undone"] for r in runs)      # not reverted behind their back
+    out = capsys.readouterr().out
+    assert "never got the chance to accept" in out
+    assert "--undo-session" in out

@@ -407,6 +407,28 @@ def check_collisions(ops: list[Op], *, dropped: list[Op] = ()) -> Plan:
                 continue
             surviving.append(op)
         plan.ops = surviving
+
+    # The mirror image, and only ever reachable from a hand-trimmed plan: a
+    # planner emits mkdir for a directory it is about to move files into, so
+    # excluding those moves leaves a mkdir that would create an empty folder
+    # nobody asked for. Restricted to directories a *dropped* move was headed
+    # for, so a planner's own output is never second-guessed — and note the
+    # converse needs no handling, since excluding a mkdir while keeping a move
+    # into it changes nothing: _do_move creates missing parents itself.
+    orphaned = {op.dst.parent for op in dropped if op.kind == "move"}
+    if orphaned:
+        wanted = {op.dst.parent for op in plan.ops if op.kind == "move"}
+        surviving = []
+        for op in plan.ops:
+            if (op.kind == "mkdir" and op.dst in orphaned
+                    and not any(w == op.dst or op.dst in w.parents
+                                for w in wanted)):
+                plan.skipped.append(
+                    (op, "folder no longer needed: every move into it "
+                         "was excluded"))
+                continue
+            surviving.append(op)
+        plan.ops = surviving
     return plan
 
 
