@@ -2,6 +2,11 @@
 
 A cross-platform tool to scan media libraries, organize TV show structures, and cleanly rename media files — powered by [guessit](https://github.com/guessit-io/guessit) (the same filename parser the Sonarr/Bazarr ecosystem relies on), with optional LLM help (Ollama, OpenAI, Gemini) for hopeless filenames.
 
+> **Prefer plain text?** [README.txt](README.txt) is this same document with the
+> formatting removed — double-click it and it opens in Notepad or any text
+> editor. ([REVIEW.txt](REVIEW.txt) likewise.) Both are generated; see
+> [Development](#development).
+
 ## Features
 - **Clean file names:** `The.Matrix.1999.1080p.BluRay.x264-RARBG.mkv` → `The Matrix (1999) [1080p].mkv`. Handles the hard cases: `WALL-E`, `Se7en`, `Blade Runner 2049`, `1917`, multi-episode `S01E01E02`, date-based shows, `The Office (US)`.
 - **Organize TV structures:** loose `S01E01` files/folders are grouped into `Season X` folders; duplicate season folders (`S02` + `Season 2`) are merged; subtitles and `.nfo` files move (and rename) together with their episode.
@@ -68,6 +73,84 @@ python run.py --update --yes       # skip the confirmation (required when
                                    #   run unattended - see below)
 ```
 
+### Coming from a pre-updater install
+Self-updating arrived in **v2.1.0**. An install older than that has no `[U]`
+key and no `--update` flag, so it cannot pull its own updater — catching up is
+a one-time manual step, after which everything above applies.
+
+**1. Find out which kind of install you have.** In the folder containing
+`run.py`:
+
+```bash
+cd path/to/MediaOrganizer
+git status
+```
+
+If that says `not a git repository`, you have a ZIP download — skip to step 5.
+Otherwise carry on.
+
+**2. Put back what the old launcher deleted.** Launchers before v2.0.0 ran
+`rm -f install_and_run.bat Dockerfile docker-compose.yml` (and the Windows
+equivalent) on every single run, to save a few KB. Those files have changed
+since, so git will not merge over the deletions and the pull fails before it
+starts. If `git status` lists deleted files:
+
+```bash
+git checkout -- .
+```
+
+If it still reports changes — or you edited something yourself and don't want
+to keep it — use `git reset --hard` instead. Both throw away local
+modifications, so read `git status` first if you might have changed something
+on purpose.
+
+**3. Pull.**
+
+```bash
+git pull
+```
+
+**4. Launch it once.** `run.py` installs anything missing or outdated:
+
+```bash
+python run.py        # Windows: py run.py
+```
+
+That's the whole thing — `[U]` and `--update` work from here on.
+
+**5. ZIP downloads only: re-clone.** Updating needs a real clone, so make one
+and bring your state across by hand. Your journal, settings and word list sit
+*inside* the old folder — they are untracked, which is why `git pull` never
+touches them, and also why a fresh clone doesn't have them:
+
+```bash
+git clone https://github.com/TerminallyChilll/MediaOrganizer.git MediaOrganizer-new
+cd MediaOrganizer-new
+cp ../MediaOrganizer/mediaorg_journal*.jsonl .      # undo history
+cp ../MediaOrganizer/custom_strip_patterns.json .   # your word list
+cp ../MediaOrganizer/.media_llm_config.json .       # saved API key
+cp ../MediaOrganizer/.media_renamer_config.json .   # remembered folders
+cp ../MediaOrganizer/*.xlsx .                       # scans + Fixed-column edits
+```
+
+Skip any that don't exist. On Windows use `copy`, and note that the files
+starting with a dot are hidden in Explorer. Keep the old folder until the new
+one has run once.
+
+The `.xlsx` files matter more than they look: the `… Fixed` columns you typed
+live in the workbook and nowhere else, so leaving them behind means the next
+scan writes a fresh one and your corrections are gone. If you kept scans
+somewhere other than the app folder, copy them from there instead.
+
+**6. Check it worked.**
+
+```bash
+python run.py --version        # 2.1.0 or newer
+python run.py --check-update   # should say you are up to date
+```
+
+If anything looks wrong: `python run.py --doctor --fix`.
+
 **What the update does:** fetches, fast-forwards your clone to the latest
 commit, and reinstalls dependencies only if `requirements.txt` changed. It
 never discards your work — if you have edited files locally, or made your own
@@ -93,7 +176,9 @@ For scripting, `--update` exits:
   is the clone itself. If you downloaded a ZIP instead — or dropped the folder
   inside some other project's repository, where it would otherwise update
   *that* project — the app says so and prints the `git clone` command to switch
-  to a real clone (your settings live outside the repo, so nothing is lost).
+  to a real clone. Your journal, settings and word list live in the folder you
+  are replacing, so copy them across as well — see [Coming from a pre-updater
+  install](#coming-from-a-pre-updater-install).
 - Updates follow the branch you are on. On `main` that is `origin/main`; on
   your own branch it is whatever that branch tracks. A branch that tracks
   nothing is reported as such rather than quietly fast-forwarded onto `main`.
@@ -136,6 +221,11 @@ Every flow that changes anything follows the same shape: **plan → preview →
 confirm → apply → journal**. Nothing touches your files until you've seen the
 full list of changes and said yes. `[6]`, `[7]` and `[8]` never touch your
 media at all.
+
+The folders you pick are remembered between runs in
+`.media_renamer_config.json`, kept next to the app (override with
+`MEDIAORG_CONFIG`) so that launching from any directory offers the same
+defaults — like the journal and the word list.
 
 ### Non-interactive use
 ```bash
@@ -304,3 +394,15 @@ python -m venv .venv
 ```
 `python run.py --doctor` diagnoses environment problems and reports any
 interrupted changes; `--doctor --fix` attempts repair.
+
+Every `.md` file at the repo root ships a generated plain-text twin, so anyone
+who does not know what a Markdown file is can still read the instructions. After
+editing a `.md`, regenerate:
+
+```bash
+python tools/md_to_txt.py           # rewrite the .txt copies
+python tools/md_to_txt.py --check   # verify they are current (CI does this)
+```
+
+Never edit a `.txt` by hand — the next regenerate discards it, and
+`tests/test_docs.py` fails the build if the two ever disagree.
