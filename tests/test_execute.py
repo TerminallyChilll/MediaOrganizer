@@ -525,3 +525,71 @@ def test_free_name_is_bounded(tmp_path):
     assert ex._free_name(base).name == "x.6.txt"
     with pytest.raises(OSError):
         ex._free_name(base, limit=3)
+
+
+# --- Naming the run that just happened ---------------------------------------
+
+def test_a_result_names_its_own_run(tmp_path, journal):
+    """Without this a caller can only guess at "the newest pending run"."""
+    a = touch(tmp_path / "a.mkv")
+    result = execute(Plan(ops=[Op("move", a, tmp_path / "out" / "a.mkv")]),
+                     journal)
+    begun = [json.loads(l) for l in journal.read_text().splitlines()
+             if json.loads(l)["op"] == "begin_run"]
+    assert result.run_id == begun[0]["id"]
+
+
+def test_a_run_is_named_even_when_every_op_failed(tmp_path, journal):
+    """An all-failed run still opened a run, so it still has an id to retire."""
+    missing = tmp_path / "never-existed.mkv"
+    result = execute(Plan(ops=[Op("move", missing, tmp_path / "out.mkv")]),
+                     journal, roots=[tmp_path])
+    assert not result.ok
+    assert result.run_id and journal.exists()
+
+
+def test_a_dry_run_names_no_run(tmp_path, journal):
+    a = touch(tmp_path / "a.mkv")
+    result = execute(Plan(ops=[Op("move", a, tmp_path / "b.mkv")]), journal,
+                     dry_run=True)
+    assert result.run_id is None
+    assert not journal.exists()
+
+
+def test_a_run_can_be_reversed_by_its_own_id(tmp_path, journal):
+    """The whole point of run_id: reverse exactly this run, not the last one."""
+    a = touch(tmp_path / "a.mkv")
+    first = execute(Plan(ops=[Op("move", a, tmp_path / "one" / "a.mkv")]),
+                    journal)
+    b = touch(tmp_path / "b.mkv")
+    execute(Plan(ops=[Op("move", b, tmp_path / "two" / "b.mkv")]), journal)
+
+    result, err = ex.undo_run(journal, first.run_id)
+    assert not err and result.ok, (err, result.failed)
+    assert (tmp_path / "a.mkv").exists()
+    assert not (tmp_path / "one").exists()
+    assert (tmp_path / "two" / "b.mkv").exists()   # the later run is untouched
+
+
+# --- Re-validating a plan the user trimmed by hand ---------------------------
+
+def test_dropping_a_move_also_drops_the_rmdir_that_needed_it(tmp_path):
+    """A folder the user kept a file in cannot then be removed as empty."""
+    stay = touch(tmp_path / "src" / "keep.mkv")
+    go = touch(tmp_path / "src" / "move.mkv")
+    ops = [Op("move", stay, tmp_path / "dst" / "keep.mkv"),
+           Op("move", go, tmp_path / "dst" / "move.mkv"),
+           Op("rmdir", None, tmp_path / "src")]
+    dropped = [ops[0]]
+
+    plan = check_collisions([ops[1], ops[2]], dropped=dropped)
+    assert [op.kind for op in plan.ops] == ["move"]
+    assert any(op.kind == "rmdir" for op, _ in plan.skipped)
+
+
+def test_dropping_nothing_leaves_the_rmdir_alone(tmp_path):
+    go = touch(tmp_path / "src" / "move.mkv")
+    ops = [Op("move", go, tmp_path / "dst" / "move.mkv"),
+           Op("rmdir", None, tmp_path / "src")]
+    plan = check_collisions(ops)
+    assert [op.kind for op in plan.ops] == ["move", "rmdir"]

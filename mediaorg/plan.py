@@ -348,8 +348,14 @@ def _is_case_only_rename(src: Path, dst: Path) -> bool:
             and src.name.casefold() == dst.name.casefold())
 
 
-def check_collisions(ops: list[Op]) -> Plan:
-    """Split ops into safe vs skipped. Never overwrite, never auto-suffix."""
+def check_collisions(ops: list[Op], *, dropped: list[Op] = ()) -> Plan:
+    """Split ops into safe vs skipped. Never overwrite, never auto-suffix.
+
+    `dropped` is for re-validating a plan the *user* has trimmed: ops removed
+    by hand are gone from `ops`, so nothing below would know their directories
+    are no longer going to be emptied. Passing them here keeps the rmdir rule
+    at the bottom of this function the single place that decides that.
+    """
     plan = Plan()
     limit = max_path_length()
     by_dst: dict[str, list[Op]] = {}
@@ -388,6 +394,8 @@ def check_collisions(ops: list[Op]) -> Plan:
     # Drop those too, rather than reporting a failure the user cannot act on.
     blocked = {op.src.parent for op, _ in plan.skipped
                if op.kind == "move" and op.src}
+    blocked |= {op.src.parent for op in dropped
+                if op.kind == "move" and op.src}
     if blocked:
         surviving = []
         for op in plan.ops:
