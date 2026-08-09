@@ -68,6 +68,12 @@ def companion_tail(companion_stem: str, video_stem: str) -> str | None:
     Shared by the rename planner (`excel._companion_ops`) and the review screen
     (`wizard._edit_destination`), which must agree: the planner emits the
     destinations the review screen then has to recognise.
+
+    Explicitly *not* handled here: a sidecar can match two different videos,
+    since "Inception.2010.1080p.en" is a valid tail of both "Inception" and
+    "Inception.2010.1080p". Two bare strings cannot say which film owns it —
+    that needs to know what else is in the folder, so both callers decide it
+    themselves by letting the longest matching video stem win.
     """
     if not companion_stem.startswith(video_stem):
         return None

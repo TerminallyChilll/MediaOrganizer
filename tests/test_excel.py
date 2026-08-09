@@ -139,6 +139,44 @@ def test_a_numbered_sibling_is_not_a_companion(tmp_path):
         "Film1.en.srt": "Pilot.en.srt"}
 
 
+def test_a_longer_title_keeps_its_own_sidecar(tmp_path):
+    """Two cuts of one film share a folder; the specific one owns the subtitle.
+
+    ".2010.1080p.en" is a valid tail of both "Inception" and
+    "Inception.2010.1080p", so without longest-match the plain film claims a
+    subtitle belonging to the other cut.
+    """
+    root = tmp_path / "Movies"
+    root.mkdir()
+    for name in ("Inception.mkv", "Inception.2010.1080p.mkv",
+                 "Inception.2010.1080p.en.srt"):
+        (root / name).write_text(name)
+
+    plain = excel._companion_ops(root / "Inception.mkv", "Inception.mkv",
+                                 "Inception (2010).mkv")
+    specific = excel._companion_ops(root / "Inception.2010.1080p.mkv",
+                                    "Inception.2010.1080p.mkv",
+                                    "Inception (2010) [1080p].mkv")
+
+    assert plain == []          # not this film's subtitle
+    assert {o.src.name: o.dst.name for o in specific} == {
+        "Inception.2010.1080p.en.srt": "Inception (2010) [1080p].en.srt"}
+
+
+def test_a_repack_sidecar_stays_with_the_repack(tmp_path):
+    """The episode-code fallback must not re-claim what longest-match rejected."""
+    root = tmp_path / "TV"
+    root.mkdir()
+    for name in ("Show.S01E01.mkv", "Show.S01E01.REPACK.mkv",
+                 "Show.S01E01.REPACK.en.srt"):
+        (root / name).write_text(name)
+
+    ops = excel._companion_ops(root / "Show.S01E01.mkv", "Show.S01E01.mkv",
+                               "Show S01E01.mkv")
+
+    assert ops == []
+
+
 def test_show_root_scan_does_not_rename_season_folders_as_shows(tmp_path):
     # Scanner pointed at a single show's root: "Show Folder" == "Season 1".
     root = tmp_path / "The Office"

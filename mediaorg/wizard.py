@@ -318,7 +318,14 @@ def _ask_new_name(current: str, what: str) -> str | None:
     safe = sanitize(typed)
     if safe != typed:
         print(f"   [!] '{typed}' is not usable on every filesystem.")
-        if not ask_yes_no(f"   Use '{safe}' instead?", default=True):
+        # 'b' here means "not this rename", not "throw away the review" —
+        # prompt_input raises BackNavigation, which would otherwise unwind all
+        # the way to the menu and discard every edit made so far, silently.
+        try:
+            use_it = ask_yes_no(f"   Use '{safe}' instead?", default=True)
+        except (EOFError, BackNavigation):
+            use_it = False
+        if not use_it:
             return None
     return None if safe == current else safe
 
@@ -349,9 +356,13 @@ def _edit_destination(items: list[_ReviewItem], index: int) -> None:
         want_ext = old.suffix
         if want_ext and Path(safe).suffix.lower() != want_ext.lower():
             got = Path(safe).suffix or "no extension"
-            if not ask_yes_no(f"   That gives {got}, but this was going to be "
-                              f"{want_ext}. Really change the extension?",
-                              default=False):
+            try:
+                change_ext = ask_yes_no(
+                    f"   That gives {got}, but this was going to be "
+                    f"{want_ext}. Really change the extension?", default=False)
+            except (EOFError, BackNavigation):
+                change_ext = False      # same reasoning as the prompt above
+            if not change_ext:
                 # Append rather than restem. Media names are dot-delimited and
                 # Path.stem eats only the last segment, so restemming turned
                 # "Show.S01E01.1080p" into "Show.S01E01.mkv" — dropping the
@@ -381,6 +392,15 @@ def _edit_destination(items: list[_ReviewItem], index: int) -> None:
     leads = is_file and old.suffix.lower() in VIDEO_EXTS
     followers = []
     if leads:
+        # Which video owns a sidecar is a question about the whole folder, not
+        # about two names, so it is settled here rather than in companion_tail:
+        # "New.2010.1080p.en.srt" is a valid tail of both "New" and
+        # "New.2010.1080p", and only the longer one should claim it. Same rule
+        # as excel._companion_ops, over planned destinations instead of the
+        # directory listing.
+        video_dsts = [o.op.dst for o in items
+                      if o.op.kind == "move" and o.op.dst.parent == old.parent
+                      and o.op.dst.suffix.lower() in VIDEO_EXTS]
         for o in items:
             if (o is item or o.op.kind != "move" or o.op.src is None
                     or not o.op.src.is_file()
@@ -390,6 +410,10 @@ def _edit_destination(items: list[_ReviewItem], index: int) -> None:
             tail = companion_tail(o.op.dst.stem, old.stem)
             if tail is None:
                 continue
+            if any(len(v.stem) > len(old.stem)
+                   and companion_tail(o.op.dst.stem, v.stem) is not None
+                   for v in video_dsts):
+                continue    # a more specific video in this plan owns it
             followers.append((o, tail))
     item.op = dataclasses.replace(item.op, dst=old.with_name(safe))
     print(f"   [OK] {safe}")
@@ -410,16 +434,22 @@ def review_changes(plan: Plan, label: str = "changes") -> Plan | None:
     """
     crossing = set(_crosses_devices(plan))
     items = [_ReviewItem(op, op) for op in plan.ops]
-    # One handler for every prompt the review can put up — the choice line, the
-    # "go to page" sub-prompt, the new-name prompt. Ctrl-D means no further
-    # answers are coming, so abort; treating it as an invalid choice would spin
-    # the loop forever on a closed stdin. Nothing has been applied at this
-    # point, so backing out here costs nothing but the typing.
+    # Backstop for anything the individual prompts did not already handle.
+    # Ctrl-D means no further answers are coming, so abort; treating it as an
+    # invalid choice would spin the loop forever on a closed stdin.
+    # BackNavigation should never arrive here — the sub-prompts inside
+    # _edit_destination catch their own, so 'b' cancels one rename instead of
+    # the review — but if a future prompt forgets, this makes the failure a
+    # message rather than every edit vanishing on the way to the menu.
+    #
+    # The wording is deliberately about *these* changes: review_changes also
+    # runs in the rename phase of [4], where the organize phase is already on
+    # disk, so "nothing has been changed" would be false there.
     try:
         if _review_items(items, crossing, label, plan.skipped) is False:
             return None
-    except EOFError:
-        print("\n   [!] End of input. Nothing has been changed.")
+    except (EOFError, BackNavigation):
+        print("\n   [!] End of input. None of these changes were applied.")
         return None
 
     keep = [i.op for i in items if i.keep]
@@ -444,8 +474,8 @@ def review_changes(plan: Plan, label: str = "changes") -> Plan | None:
         try:
             go_on = ask_yes_no(f"Continue with the remaining "
                                f"{len(revalidated.ops)}?", default=False)
-        except EOFError:
-            go_on = False   # same reasoning as above; still nothing applied
+        except (EOFError, BackNavigation):
+            go_on = False   # both mean "no" here; still nothing applied
         if not go_on:
             return None
     return revalidated

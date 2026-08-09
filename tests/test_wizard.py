@@ -1327,6 +1327,74 @@ def test_renaming_a_video_does_not_drag_a_numbered_sibling(tmp_path,
     assert not (root / "Pilot0.en.srt").exists()
 
 
+def test_a_longer_title_in_the_plan_keeps_its_own_sidecar(tmp_path,
+                                                          monkeypatch):
+    """The review screen settles sidecar ownership the same way the planner does."""
+    monkeypatch.setattr("mediaorg.execute.RETRY_DELAYS", ())
+    journal = tmp_path / "journal.jsonl"
+    root = tmp_path / "Movies"
+    root.mkdir()
+    for name in ("a.mkv", "b.mkv", "b.en.srt"):
+        (root / name).write_text(name)
+    plan = Plan(ops=[
+        Op("move", root / "a.mkv", root / "Film.mkv"),
+        Op("move", root / "b.mkv", root / "Film.2010.1080p.mkv"),
+        Op("move", root / "b.en.srt", root / "Film.2010.1080p.en.srt"),
+    ])
+    # Renaming item 1 ("Film") must not claim the subtitle planned for the
+    # longer "Film.2010.1080p", even though ".2010.1080p.en" is a valid tail.
+    _drive(monkeypatch, ["R", "e 1", "Pilot.mkv", "Y", "y"])
+
+    wizard.confirm_and_execute(plan, journal, label="renames", roots=[root])
+
+    assert (root / "Pilot.mkv").exists()
+    assert (root / "Film.2010.1080p.en.srt").read_text() == "b.en.srt"
+    assert not (root / "Pilot.2010.1080p.en.srt").exists()
+
+
+def test_b_at_the_extension_prompt_keeps_the_review(tmp_path, monkeypatch):
+    """'b' cancels the one rename, it does not discard every edit made so far.
+
+    prompt_input raises BackNavigation, which used to unwind past the review
+    all the way to the menu loop's `except BackNavigation: pass` - silently.
+    """
+    monkeypatch.setattr("mediaorg.execute.RETRY_DELAYS", ())
+    journal = tmp_path / "journal.jsonl"
+    root = tmp_path / "Movies"
+    root.mkdir()
+    for name in ("one.mkv", "two.mkv"):
+        (root / name).write_text(name)
+    plan = Plan(ops=[Op("move", root / "one.mkv", root / "One.mkv"),
+                     Op("move", root / "two.mkv", root / "Two.mkv")])
+    # Exclude item 2, then type a name with no extension and answer 'b' to the
+    # extension question. The exclusion must survive and [Y] must still apply.
+    _drive(monkeypatch, ["R", "x 2", "e 1", "Pilot", "b", "Y", "y"])
+
+    wizard.confirm_and_execute(plan, journal, label="renames", roots=[root])
+
+    assert (root / "Pilot.mkv").exists()     # extension kept, not restemmed
+    assert (root / "two.mkv").exists()       # the exclusion survived 'b'
+    assert not (root / "Two.mkv").exists()
+
+
+def test_b_at_the_sanitize_prompt_cancels_only_that_rename(tmp_path,
+                                                           monkeypatch):
+    """Same for the other ask_yes_no _edit_destination can reach."""
+    monkeypatch.setattr("mediaorg.execute.RETRY_DELAYS", ())
+    journal = tmp_path / "journal.jsonl"
+    root = tmp_path / "Movies"
+    root.mkdir()
+    (root / "one.mkv").write_text("one")
+    plan = Plan(ops=[Op("move", root / "one.mkv", root / "One.mkv")])
+    # A colon does not survive sanitize(), so this asks "Use '...' instead?".
+    _drive(monkeypatch, ["R", "e 1", "Pi:lot.mkv", "b", "Y", "y"])
+
+    wizard.confirm_and_execute(plan, journal, label="renames", roots=[root])
+
+    assert (root / "One.mkv").exists()       # the planned name, rename cancelled
+    assert not (root / "one.mkv").exists()   # the review still applied
+
+
 def test_ctrl_d_in_the_review_aborts_without_applying(tmp_path, monkeypatch):
     """A closed stdin is a "no", not a traceback - and must not spin the loop."""
     monkeypatch.setattr("mediaorg.execute.RETRY_DELAYS", ())
@@ -1347,6 +1415,29 @@ def test_ctrl_d_in_the_review_aborts_without_applying(tmp_path, monkeypatch):
     assert entries == []
     assert (root / "raw.mkv").exists()          # untouched
     assert not (root / "Episode.mkv").exists()
+
+
+def test_the_abort_message_does_not_claim_the_disk_is_untouched(tmp_path,
+                                                                monkeypatch,
+                                                                capsys):
+    """review_changes also runs mid-session, after organize is already applied.
+
+    "Nothing has been changed" would be a lie there, and the session gate a
+    moment later contradicts it by name.
+    """
+    root = tmp_path / "TV"
+    root.mkdir()
+    (root / "raw.mkv").write_text("v")
+    plan = Plan(ops=[Op("move", root / "raw.mkv", root / "Episode.mkv")])
+
+    def _eof(*a):
+        raise EOFError
+    monkeypatch.setattr("builtins.input", _eof)
+
+    assert wizard.review_changes(plan, "renames") is None
+    out = capsys.readouterr().out
+    assert "None of these changes were applied" in out
+    assert "Nothing has been changed" not in out
 
 
 def test_ctrl_d_at_the_go_to_page_prompt_aborts(tmp_path, monkeypatch):
