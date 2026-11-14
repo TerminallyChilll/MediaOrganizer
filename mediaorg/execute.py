@@ -234,23 +234,37 @@ def _move_across(src: Path, dst: Path) -> None:
         if exc.errno != errno.EXDEV:
             raise
 
+    if os.path.lexists(dst):
+        raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), str(dst))
+
     if src.is_dir() and not src.is_symlink():
-        shutil.copytree(src, dst, symlinks=True)
-        shutil.rmtree(src)
+        try:
+            shutil.copytree(src, dst, symlinks=True)
+        except BaseException:
+            shutil.rmtree(dst, ignore_errors=True)
+            raise
+        _retrying(lambda: shutil.rmtree(src))
         return
 
     # lstat on both sides: copy2 is told not to follow symlinks, so for a
     # symlinked file it copies the link itself. stat() would compare the
     # target's size against the link's and fail a perfectly good copy.
     expected = src.lstat().st_size
-    shutil.copy2(src, dst, follow_symlinks=False)
-    _fsync_path(dst)
-    actual = dst.lstat().st_size
-    if actual != expected:
-        raise OSError(errno.EIO,
-                      f"copy verification failed: {dst} is {actual} bytes, "
-                      f"expected {expected}")
-    os.unlink(src)
+    try:
+        shutil.copy2(src, dst, follow_symlinks=False)
+        _fsync_path(dst)
+        actual = dst.lstat().st_size
+        if actual != expected:
+            raise OSError(errno.EIO,
+                          f"copy verification failed: {dst} is {actual} bytes, "
+                          f"expected {expected}")
+    except BaseException:
+        try:
+            os.unlink(dst)
+        except OSError:
+            pass
+        raise
+    _retrying(lambda: os.unlink(src))
 
 
 def _do_move(src: Path, dst: Path, on_tmp=None) -> None:
@@ -416,16 +430,20 @@ def execute(plan: Plan, journal: Path, dry_run: bool = False, *,
                     # without this flag recovery would mistake that innocent
                     # file for a partial copy of ours and delete it.
                     dst_existed = os.path.lexists(dst)
+                    src_is_dir = src.is_dir() and not src.is_symlink()
 
                     def on_tmp(tmp: Path, _seq=seq, _src=src, _dst=dst,
-                               _existed=dst_existed) -> None:
+                               _existed=dst_existed,
+                               _is_dir=src_is_dir) -> None:
                         jw.log({"op": "intent", "kind": "move", "seq": _seq,
                                 "src": str(_src), "dst": str(_dst),
-                                "tmp": str(tmp), "dst_existed": _existed})
+                                "tmp": str(tmp), "dst_existed": _existed,
+                                **({"dir": True} if _is_dir else {})})
 
                     jw.log({"op": "intent", "kind": "move", "seq": seq,
                             "src": str(src), "dst": str(dst),
-                            "dst_existed": dst_existed})
+                            "dst_existed": dst_existed,
+                            **({"dir": True} if src_is_dir else {})})
                     _retrying(lambda: _do_move(src, dst, on_tmp=on_tmp))
                     entry = {"op": "move", "src": str(src), "dst": str(dst),
                              "seq": seq, **_stat_fields(dst)}
@@ -462,9 +480,11 @@ def execute(plan: Plan, journal: Path, dry_run: bool = False, *,
                             jw.seq += 1
                             jseq = jw.seq
                             jdst = _free_name(trash / j.name)
+                            is_j_dir = j.is_dir() and not j.is_symlink()
                             jw.log({"op": "intent", "kind": "move", "seq": jseq,
                                     "src": str(j), "dst": str(jdst),
-                                    "dst_existed": False})
+                                    "dst_existed": False,
+                                    **({"dir": True} if is_j_dir else {})})
                             _retrying(lambda a=j, b=jdst: _move_across(a, b))
                             jw.log({"op": "move", "src": str(j),
                                     "dst": str(jdst), "seq": jseq,
@@ -595,6 +615,8 @@ def recover(journal: Path, dry_run: bool = False) -> list[str]:
 
             if (kind == "move" and src is not None and dst is not None
                     and os.path.lexists(src) and os.path.lexists(dst)
+                    and not intent.get("dir")
+                    and (not dst.is_dir() or dst.is_symlink())
                     # ONLY when we positively recorded that the destination did
                     # not exist when we started — i.e. anything there now was
                     # created by us. A failed move onto a pre-existing file
@@ -602,6 +624,11 @@ def recover(journal: Path, dry_run: bool = False) -> list[str]:
                     # destroys a file we never owned. Journals without the
                     # flag (v1, or v2 before this was added) fall through to
                     # "leave it alone", which is the safe default.
+                    # Directories are excluded too: _move_across cleans up a
+                    # failed copytree itself, so if both src and dst directories
+                    # exist here, copytree may have finished and rmtree(src)
+                    # failed partway — deleting dst would lose the only intact
+                    # copy.
                     and intent.get("dst_existed") is False):
                 # The move never completed and the source is intact, so what
                 # sits at dst is a partial copy we created. Removing it also
@@ -610,10 +637,7 @@ def recover(journal: Path, dry_run: bool = False) -> list[str]:
                 notes.append(f"remove incomplete copy: {dst}")
                 if not dry_run:
                     try:
-                        if dst.is_dir() and not dst.is_symlink():
-                            shutil.rmtree(dst)
-                        else:
-                            os.unlink(dst)
+                        os.unlink(dst)
                     except OSError as exc:
                         notes[-1] = f"could not remove incomplete copy {dst}: {exc}"
                 continue

@@ -851,6 +851,8 @@ def test_companion_files_tolerates_flaky_entry_oserror(tmp_path, monkeypatch):
 
     vid = touch(tmp_path / "Film.2020.mkv")
     sub = touch(tmp_path / "Film.2020.en.srt")
+    touch(tmp_path / "Film.2020.Extended.mkv")
+    touch(tmp_path / "Film.2020.Extended.en.srt")
     real_scandir = os.scandir
 
     class FlakyEntry:
@@ -860,7 +862,7 @@ def test_companion_files_tolerates_flaky_entry_oserror(tmp_path, monkeypatch):
             self.path = real.path
 
         def is_file(self, follow_symlinks=False):
-            if self.name == "stale.srt":
+            if self.name in ("stale.srt", "Film.2020.Extended.mkv"):
                 raise OSError(116, "Stale file handle")
             return self._real.is_file(follow_symlinks=follow_symlinks)
 
@@ -872,3 +874,43 @@ def test_companion_files_tolerates_flaky_entry_oserror(tmp_path, monkeypatch):
 
     monkeypatch.setattr(os, "scandir", flaky_scandir)
     assert companion_files(vid) == [sub]
+
+
+def test_loose_movies_wraps_titles_containing_support_words(tmp_path):
+    from mediaorg.plan import plan_loose_movies
+
+    bucket = tmp_path / "Comedy"
+    touch(bucket / "The.Interview.2014.mkv")
+    touch(bucket / "Proof.2005.mkv")
+    touch(bucket / "Trailer.Park.Boys.1080p.mkv")
+
+    plan = plan_loose_movies(tmp_path)
+    apply_plan(plan)
+
+    assert (bucket / "The.Interview.2014" / "The.Interview.2014.mkv").exists()
+    assert (bucket / "Proof.2005" / "Proof.2005.mkv").exists()
+    assert (bucket / "Trailer.Park.Boys.1080p" / "Trailer.Park.Boys.1080p.mkv").exists()
+
+
+def test_is_movie_wrapper_dir_short_circuits_and_dir_has_video_bounds_and_oserror(tmp_path, monkeypatch):
+    from mediaorg import plan as plan_mod
+
+    sub = tmp_path / "Sub"
+    sub.mkdir()
+    monkeypatch.setattr(plan_mod, "_dir_has_video",
+                        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should not walk")))
+    assert plan_mod._is_movie_wrapper_dir(tmp_path, [sub], []) is False
+    monkeypatch.undo()
+
+    deep = tmp_path / "d0" / "d1" / "d2"
+    touch(deep / "film.mkv")
+    assert plan_mod._dir_has_video(tmp_path / "d0", max_depth=1) is False
+    assert plan_mod._dir_has_video(tmp_path / "d0", max_depth=2) is True
+
+    def broken_walk(directory, onerror=None, **kwargs):
+        if onerror is not None:
+            onerror(OSError(13, "Permission denied"))
+        return iter(())
+
+    monkeypatch.setattr(os, "walk", broken_walk)
+    assert plan_mod._dir_has_video(tmp_path / "d0") is False

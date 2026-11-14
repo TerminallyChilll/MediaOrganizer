@@ -1740,16 +1740,19 @@ def test_yes_flag_appends_and_preserves_fixed_columns(tmp_path, monkeypatch):
     xlsx = tmp_path / "lib.xlsx"
     excel.write_library(
         xlsx,
-        [{"Folder Name": "ManualEntry", "Title": "Manual", "Title Fixed": "KeepMe",
-          "Video Files": "Manual.mkv"}],
+        [{"Folder Name": "ManualEntry", "Title": "Manual",
+          "Video Files": "Manual.mkv"},
+         {"Folder Name": "Alpha (2020)", "Title": "Alpha", "Title Fixed": "KeepMe",
+          "Video Files": "Alpha.2020.mkv"}],
         [], str(movies), None, append=False,
     )
 
+    monkeypatch.setattr(wizard, "_stdin_is_interactive", lambda: True)
     monkeypatch.setattr("builtins.input", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("prompted")))
     wizard.run_scan(str(movies), None, xlsx, assume_yes=True)
     df_m, _, _ = excel.read_library(xlsx)
     assert set(df_m["Folder Name"]) == {"ManualEntry", "Alpha (2020)"}
-    assert df_m.loc[df_m["Folder Name"] == "ManualEntry", "Title Fixed"].iloc[0] == "KeepMe"
+    assert df_m.loc[df_m["Folder Name"] == "Alpha (2020)", "Title Fixed"].iloc[0] == "KeepMe"
 
 
 def test_doctor_check_configs_does_not_import_wizard(tmp_path, monkeypatch):

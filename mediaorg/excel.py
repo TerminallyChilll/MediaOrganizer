@@ -21,7 +21,7 @@ from .plan import (EPISODE_PATTERN, SEASON_FOLDER_PATTERN, NamingScheme, Op,
                    check_collisions, extract_season_episode, norm, sanitize)
 
 _MULTI_EP_PATTERN = re.compile(
-    r'(?:[Ss]\d{1,4}[Ee]\d{1,3}(?:[-_.][Ee]\d{1,3})*|\d{1,2}[xX]\d{1,2})'
+    r'(?:[Ss]\d{1,4}[Ee]\d{1,3}(?:[-_.]?[Ee]\d{1,3})*|\d{1,2}[xX]\d{1,2})'
 )
 
 
@@ -223,9 +223,13 @@ def _companion_ops(video_path: Path, old_base: str, new_base: str, *,
     # planning. The first executes and the second fails at execute time with the
     # subtitle already sitting under the wrong film's name.
     video_stems = [norm(Path(e.name).stem) for e in entries
-                   if e.is_file(follow_symlinks=False) and is_media_file(e.name)]
+                   if is_media_file(e.name)]
     for e in sorted(entries, key=lambda x: x.name):
-        if not e.is_file(follow_symlinks=False) or is_junk_name(e.name):
+        try:
+            is_regular = e.is_file(follow_symlinks=False)
+        except OSError:
+            continue
+        if not is_regular or is_junk_name(e.name):
             continue
         p = Path(e.path)
         if claimed is not None and p in claimed:
@@ -342,7 +346,7 @@ def _fixed_video_files(row, count: int) -> tuple[list[str], str | None]:
     if not raw or count <= 0:
         return [], None
     if '|' in raw:
-        parts = [v.strip() for v in raw.split('|') if v.strip()]
+        parts = [v.strip() for v in raw.split('|')]
     elif count > 1 and ',' in raw:
         parts = [v.strip() for v in raw.split(',') if v.strip()]
     else:

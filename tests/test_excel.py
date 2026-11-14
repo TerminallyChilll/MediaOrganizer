@@ -713,8 +713,9 @@ def test_companion_ops_multi_episode_tail_and_boundary_and_zero_size(tmp_path):
     assert p.ops == []
 
 
-def test_companion_ops_multi_ep_mismatch_and_preserve_fixed_on_append(tmp_path):
-    # Prefix fails (video has 1080p), episode code fallback must strip full S01E01-E02.
+def test_companion_ops_multi_ep_mismatch_and_preserve_fixed_on_append(tmp_path, monkeypatch):
+    # Prefix fails (video has 1080p), episode code fallback must strip full S01E01-E02
+    # and contiguous S01E01E02 alike.
     d = tmp_path / "Show" / "Season 1"
     d.mkdir(parents=True)
     vid = d / "Show.S01E01-E02.1080p.mkv"
@@ -724,7 +725,48 @@ def test_companion_ops_multi_ep_mismatch_and_preserve_fixed_on_append(tmp_path):
     ops = excel._companion_ops(vid, vid.name, "Show S01E01-E02 [1080p].mkv")
     assert [op.dst.name for op in ops] == ["Show S01E01-E02 [1080p].en.srt"]
 
-    # Files Fixed comma support & mismatched count skipped reason
+    d_contig = tmp_path / "Show" / "Season 2"
+    d_contig.mkdir(parents=True)
+    vid_c = d_contig / "Show.S01E01E02.1080p.mkv"
+    sub_c = d_contig / "Show.S01E01E02.en.srt"
+    vid_c.write_text("v")
+    sub_c.write_text("s")
+    ops_c = excel._companion_ops(vid_c, vid_c.name, "Show S01E01-E02 [1080p].mkv")
+    assert [op.dst.name for op in ops_c] == ["Show S01E01-E02 [1080p].en.srt"]
+
+    # _companion_ops tolerates OSError on e.is_file() and still sees flaky longer video stems
+    import os
+    m_flaky = tmp_path / "FlakyMovie"
+    m_flaky.mkdir(parents=True)
+    short_vid = m_flaky / "Film.2020.mkv"
+    long_vid = m_flaky / "Film.2020.Extended.mkv"
+    short_sub = m_flaky / "Film.2020.en.srt"
+    long_sub = m_flaky / "Film.2020.Extended.en.srt"
+    stale_sub = m_flaky / "stale.srt"
+    for p in (short_vid, long_vid, short_sub, long_sub, stale_sub):
+        p.write_text("x")
+    real_scandir = os.scandir
+
+    class FlakyEntry:
+        def __init__(self, real):
+            self._real = real
+            self.name = real.name
+            self.path = real.path
+
+        def is_file(self, follow_symlinks=False):
+            if self.name in ("stale.srt", "Film.2020.Extended.mkv"):
+                raise OSError(116, "Stale file handle")
+            return self._real.is_file(follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(
+        os, "scandir",
+        lambda path=".", *a, **kw: [FlakyEntry(e) for e in real_scandir(path, *a, **kw)]
+    )
+    flaky_ops = excel._companion_ops(short_vid, short_vid.name, "Film (2020).mkv")
+    assert [op.dst.name for op in flaky_ops] == ["Film (2020).en.srt"]
+    monkeypatch.setattr(os, "scandir", real_scandir)
+
+    # Files Fixed comma support, partial pipe override, & mismatched count skipped reason
     movies = tmp_path / "Movies"
     make_movie(movies, "Dune (2021)", ["Dune.1080p.mkv", "Dune.2160p.mkv"])
     rows = scan_movies(movies)
@@ -734,6 +776,16 @@ def test_companion_ops_multi_ep_mismatch_and_preserve_fixed_on_append(tmp_path):
     assert {"Dune One.mkv", "Dune Two.mkv"}.issubset(
         {op.dst.name for op in plan_comma.ops}
     )
+
+    movies3 = tmp_path / "Movies3"
+    make_movie(movies3, "Trilogy (2021)",
+               ["FilmA.2021.1080p.mkv", "FilmB.2021.1080p.mkv", "FilmC.2021.1080p.mkv"])
+    rows3 = scan_movies(movies3)
+    df_m3 = pd.DataFrame(rows3)
+    df_m3.loc[0, 'Files Fixed'] = "New One | | New Three"
+    plan_partial = plan_renames(df_m3, str(movies3), None, None, NamingScheme())
+    partial_dsts = {op.dst.name for op in plan_partial.ops}
+    assert {"New One.mkv", "FilmB (2021) [1080p].mkv", "New Three.mkv"}.issubset(partial_dsts)
 
     df_m.loc[0, 'Files Fixed'] = "Only One Override"
     plan_bad = plan_renames(df_m, str(movies), None, None, NamingScheme())

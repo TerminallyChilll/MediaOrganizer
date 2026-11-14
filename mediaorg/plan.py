@@ -344,9 +344,11 @@ def companion_files(video: Path) -> list[Path]:
             continue
 
     # Sibling video stems so e.g. "Movie.2020.mkv" does not steal
-    # "Movie.2020.Extended.srt" from "Movie.2020.Extended.mkv".
+    # "Movie.2020.Extended.srt" from "Movie.2020.Extended.mkv". Built from
+    # `entries` by name so a transient stat failure on a sibling video does
+    # not hide it from the longest-stem specificity check.
     other_video_stems = [
-        norm(Path(e.name).stem) for e in file_entries
+        norm(Path(e.name).stem) for e in entries
         if Path(e.path) != video and is_media_file(e.name)
     ]
 
@@ -776,19 +778,30 @@ _MOVIE_SUPPORT_DIRS = re.compile(
     re.IGNORECASE,
 )
 _SUPPORT_VIDEO_NAME = re.compile(
-    r'(?:^|[.\s_-])(?:sample|trailer|teaser|preview|featurette|bonus|proof'
-    r'|deleted[ ._-]?scenes?|behind[ ._-]?the[ ._-]?scenes?|interviews?)'
-    r'(?:$|[.\s_-])',
+    r'(?:^|[.\s_-])(?:sample|trailer|teaser|featurette|bonus'
+    r'|deleted[ ._-]?scenes?|behind[ ._-]?the[ ._-]?scenes?)'
+    r'(?:[.\s_-]?\d{1,2})?'
+    r'(?:[.\s_-]+(?:(?:480|576|720|1080|2160)[pi]|4k|uhd|hd))?$',
     re.IGNORECASE,
 )
 
 
-def _dir_has_video(directory: Path) -> bool:
+def _raise_walk_error(err: OSError) -> None:
+    raise err
+
+
+def _dir_has_video(directory: Path,
+                   max_depth: int = SHOW_SEARCH_MAX_DEPTH) -> bool:
     try:
-        for _dirpath, dirnames, filenames in os.walk(directory):
-            dirnames[:] = [d for d in dirnames if not is_junk_dir(d)]
+        for dirpath, dirnames, filenames in os.walk(
+                directory, onerror=_raise_walk_error):
             if any(is_media_file(f) for f in filenames):
                 return True
+            rel_parts = Path(dirpath).relative_to(directory).parts
+            if len(rel_parts) >= max_depth:
+                dirnames[:] = []
+            else:
+                dirnames[:] = [d for d in dirnames if not is_junk_dir(d)]
     except OSError:
         return False
     return False
@@ -803,6 +816,8 @@ def _is_movie_wrapper_dir(directory: Path, child_dirs: list[Path],
     when it contains non-extras child directories that hold media or 2+
     distinct feature movie titles (excluding sample/trailer clips).
     """
+    if not loose_videos:
+        return False
     real_subdirs = [
         d for d in child_dirs
         if not SPECIALS_FOLDER_PATTERN.match(d.name.strip())
