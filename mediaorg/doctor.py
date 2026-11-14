@@ -117,11 +117,11 @@ def check_configs() -> list[tuple[str, str, str]]:
     """
     from .llm import llm_config_path
     from .parse import custom_patterns_path
-    # The LLM config and the word list are resolved the same way the journal
-    # is (app directory, or an adopted legacy file), so check where they will
-    # actually be read from rather than assuming the current directory.
+    from .wizard import config_path
+    # All config files are resolved the same way the journal is (app directory,
+    # or an adopted legacy file), so check where they will actually be read.
     results = []
-    for path in (Path(".media_renamer_config.json"),
+    for path in (config_path(),
                  Path(llm_config_path()),
                  custom_patterns_path()):
         results.append(_validate_json(path))

@@ -13,19 +13,13 @@ from tqdm import tqdm
 
 from .parse import (VIDEO_EXTS, is_junk_dir, is_junk_name, is_media_file,
                     parse_name)
-from .plan import (SPECIALS_FOLDER_PATTERN, extract_season_episode,
-                   find_show_roots, has_season_structure)
+from .plan import (SEASON_FOLDER_PATTERN, SPECIALS_FOLDER_PATTERN,
+                   extract_season_episode, find_show_roots,
+                   has_season_structure)
 
-# Anchored. The old unanchored substring search matched "Seasoning Show",
-# "S1" and "s0", and since this pattern also drives show-folder re-parenting a
-# false positive recorded the *parent* as the show — wrong title, wrong
-# destination.
-_SEASONISH_DIR = re.compile(
-    r'^(?:season|series|saison|staffel)\s*\d{1,4}(?:\s*\(\d{4}\))?$'
-    r'|^s\d{1,4}(?:\s*\(\d{4}\))?$', re.IGNORECASE)
-# Specials live outside the numbered seasons but are still episodes; without
-# this they were dropped from the scan entirely. Shared with the organizer's
-# show detection so the two can never disagree about what marks a show.
+# Shared with plan.py so the scanner and the organizer always agree on what
+# counts as a season folder.
+_SEASONISH_DIR = SEASON_FOLDER_PATTERN
 _SPECIALS_DIR = SPECIALS_FOLDER_PATTERN
 
 
@@ -406,7 +400,7 @@ def scan_recursive_tv(root: Path, custom_patterns: list[str] = (),
         # (e.g. "Season 1", "s01"), use its parent as the show folder
         # so nested layouts such as Genre/Show/Season 1/file.mkv
         # correctly record Show Folder = Genre/Show.
-        if _is_seasonish(show_path.name):
+        if show_path != base and _is_seasonish(show_path.name):
             try:
                 show_folder = _rel(show_path.parent, base)
             except ValueError:

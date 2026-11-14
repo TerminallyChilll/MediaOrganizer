@@ -29,12 +29,11 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .parse import TMP_SUFFIX, is_junk_dir, is_junk_name
+from .parse import TMP_SUFFIX, TRASH_DIR, is_junk_dir, is_junk_name
 from .plan import Op, Plan
 
 JOURNAL_FILE = "mediaorg_journal.jsonl"
 JOURNAL_VERSION = 2
-TRASH_DIR = ".mediaorg_trash"
 
 # Backoff for files held open by another program (Plex/Jellyfin/VLC streaming
 # an episode is the single most common real-world failure). Tests set this to
@@ -403,7 +402,6 @@ def execute(plan: Plan, journal: Path, dry_run: bool = False, *,
             jw.seq += 1
             seq = jw.seq
             created: list[Path] = []
-            quarantined: list[tuple[Path, Path]] = []
             try:
                 if op.kind == "move":
                     src, dst = _op_path(op.src), _op_path(op.dst)
@@ -462,11 +460,10 @@ def execute(plan: Plan, journal: Path, dry_run: bool = False, *,
                                     "seq": seq})
                         for j in junk:
                             jdst = _free_name(trash / j.name)
-                            _retrying(lambda a=j, b=jdst: os.rename(a, b))
+                            _retrying(lambda a=j, b=jdst: _move_across(a, b))
                             jw.log({"op": "move", "src": str(j),
                                     "dst": str(jdst), "seq": seq,
                                     **_stat_fields(jdst)})
-                            quarantined.append((j, jdst))
                     jw.log({"op": "intent", "kind": "rmdir", "seq": seq,
                             "dst": str(dst)})
                     _retrying(dst.rmdir)

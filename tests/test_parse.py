@@ -175,3 +175,27 @@ def test_custom_pattern_file_is_anchored_to_the_app(tmp_path, monkeypatch):
     assert load_custom_patterns() == ["RARBG", r"YTS\.MX"]
     save_custom_patterns([])
     assert load_custom_patterns() == []
+
+
+def test_trash_dir_is_treated_as_junk_dir():
+    from mediaorg.parse import TRASH_DIR, is_junk_dir
+    assert is_junk_dir(TRASH_DIR)
+
+
+def test_numeric_year_title_preserved_with_tags():
+    p = parse_name("1917.1080p.BluRay.mkv", kind_hint="movie")
+    assert p.title == "1917"
+    assert p.year is None
+    assert p.quality == "1080p"
+
+    p2 = parse_name("1917.2019.1080p.BluRay.mkv", kind_hint="movie")
+    assert p2.title == "1917"
+    assert p2.year == 2019
+
+
+def test_episode_title_strips_trailing_release_group():
+    p = parse_name("Show.Name.S01E01.Pilot-TBS.mkv", kind_hint="episode")
+    assert p.title == "Show Name"
+    assert p.season == 1
+    assert p.episodes == [1]
+    assert p.episode_title == "Pilot"

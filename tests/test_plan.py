@@ -744,3 +744,90 @@ def test_duplicate_season_rmdir_still_happens_when_it_does_empty(tmp_path):
     apply_plan(plan)
     assert not (tmp_path / "S02").exists()
     assert (tmp_path / "Season 2" / "Show.S02E02.mkv").exists()
+
+
+def test_series_and_dotted_season_folders_are_normalized(tmp_path):
+    show = tmp_path / "Show"
+    touch(show / "Series 1" / "Show.S01E01.mkv")
+    touch(show / "Season.02" / "Show.S02E01.mkv")
+
+    assert find_show_roots(tmp_path) == [show]
+    plan = plan_season_structure(show)
+    apply_plan(plan)
+    assert (show / "Season 1" / "Show.S01E01.mkv").exists()
+    assert (show / "Season 2" / "Show.S02E01.mkv").exists()
+
+
+def test_step3_keeps_extras_and_cross_season_routing_and_ancestor_season(tmp_path):
+    """Cross-season stray folders route via place(), Extras stay untouched, and
+    videos without SxxEyy nested inside Season N inherit Season N."""
+    touch(tmp_path / "Season 1" / "Ep01Dir" / "pilot.mkv")
+    touch(tmp_path / "Show.S01E01.Dir" / "Show.S02E01.mkv")
+    touch(tmp_path / "Extras" / "behind_the_scenes.mkv")
+
+    plan = plan_season_structure(tmp_path)
+    apply_plan(plan)
+    assert (tmp_path / "Season 1" / "pilot.mkv").exists()
+    assert (tmp_path / "Season 2" / "Show.S02E01.mkv").exists()
+    assert (tmp_path / "Extras" / "behind_the_scenes.mkv").exists()
+
+
+def test_check_collisions_flags_duplicate_src_and_broken_symlink(tmp_path):
+    from mediaorg.plan import Op, check_collisions
+
+    src = touch(tmp_path / "a.mkv")
+    d1 = tmp_path / "d1.mkv"
+    d2 = tmp_path / "d2.mkv"
+    plan1 = check_collisions([Op("move", src, d1), Op("move", src, d2)])
+    assert plan1.ops == []
+    assert len(plan1.skipped) == 2
+
+    src2 = touch(tmp_path / "b.mkv")
+    broken_dst = tmp_path / "broken.mkv"
+    broken_dst.symlink_to(tmp_path / "nonexistent_target.mkv")
+    plan2 = check_collisions([Op("move", src2, broken_dst)])
+    assert plan2.ops == []
+    assert len(plan2.skipped) == 1
+
+
+def test_plan_loose_movies_handles_dots_nested_wrappers_without_double_wrapping(tmp_path):
+    from mediaorg.plan import plan_loose_movies
+
+    touch(tmp_path / "A..B.2020.mkv")
+    touch(tmp_path / "Action" / "First.Film.2020.mkv")
+    touch(tmp_path / "Action" / "Second.Film.2021.mkv")
+    touch(tmp_path / "MultiPart (2022)" / "MultiPart.CD1.mkv")
+    touch(tmp_path / "MultiPart (2022)" / "MultiPart.CD2.mkv")
+
+    plan = plan_loose_movies(tmp_path)
+    apply_plan(plan)
+
+    assert (tmp_path / "A..B.2020" / "A..B.2020.mkv").exists()
+    assert (tmp_path / "Action" / "First.Film.2020" / "First.Film.2020.mkv").exists()
+    assert (tmp_path / "Action" / "Second.Film.2021" / "Second.Film.2021.mkv").exists()
+    # Single-title multi-part movie folder must NOT be double-wrapped.
+    assert (tmp_path / "MultiPart (2022)" / "MultiPart.CD1.mkv").exists()
+    assert (tmp_path / "MultiPart (2022)" / "MultiPart.CD2.mkv").exists()
+
+
+def test_extfix_rejects_m4a_heic_ico_and_same_extension_case(tmp_path):
+    from mediaorg.extfix import detect_extension, plan_extension_convert
+
+    m4a = tmp_path / "audio"
+    m4a.write_bytes(b"\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00")
+    assert detect_extension(m4a) is None
+
+    heic = tmp_path / "photo"
+    heic.write_bytes(b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00")
+    assert detect_extension(heic) is None
+
+    ico = tmp_path / "favicon"
+    ico.write_bytes(b"\x00\x00\x01\x00\x01\x00\x10\x10")
+    assert detect_extension(ico) is None
+
+    vid = tmp_path / "Movie.mkv"
+    vid.write_bytes(b"\x1a\x45\xdf\xa3" + b"\x00" * 32)
+    assert plan_extension_convert(tmp_path, ".mkv", ".mkv").ops == []
+    vid_upper = tmp_path / "Upper.MKV"
+    vid_upper.write_bytes(b"\x1a\x45\xdf\xa3" + b"\x00" * 32)
+    assert [o.dst.name for o in plan_extension_convert(tmp_path, ".mkv", ".mkv").ops] == ["Upper.mkv"]

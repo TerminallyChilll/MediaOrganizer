@@ -1624,3 +1624,108 @@ def test_a_multi_phase_rename_does_not_log_twice(tmp_path, monkeypatch):
 
     logged = pd.read_excel(xlsx, sheet_name='Changes')
     assert len(logged) == len(entries)
+
+
+def test_config_path_is_anchored_via_env_and_app(tmp_path, monkeypatch):
+    target = tmp_path / "renamer.json"
+    monkeypatch.setenv("MEDIAORG_CONFIG", str(target))
+    monkeypatch.chdir(tmp_path)
+    wizard._save_config({"scheme": {"include_quality": False}})
+    monkeypatch.chdir(tmp_path.parent)
+    assert wizard._load_config() == {"scheme": {"include_quality": False}}
+
+
+def test_non_interactive_scan_overwrites_without_prompt(tmp_path, monkeypatch):
+    movies = tmp_path / "Movies"
+    (movies / "Alpha (2020)").mkdir(parents=True)
+    (movies / "Alpha (2020)" / "Alpha.2020.mkv").write_text("v")
+    xlsx = tmp_path / "lib.xlsx"
+    xlsx.write_text("stale placeholder")
+
+    def boom(*a, **kw):
+        raise AssertionError("should not prompt when overwrite_excel=True")
+
+    monkeypatch.setattr("builtins.input", boom)
+    m_rows, t_rows = wizard.run_scan(
+        str(movies), None, xlsx, overwrite_excel=True
+    )
+    assert len(m_rows) == 1 and t_rows == []
+    assert xlsx.stat().st_size > 100
+
+
+def test_cli_full_dry_run_works_without_existing_xlsx(tmp_path, monkeypatch, capsys):
+    import sys
+
+    movies = tmp_path / "Movies"
+    movies.mkdir()
+    (movies / "Inception.2010.1080p.mkv").write_text("v")
+    tv = tmp_path / "TV"
+    (tv / "Dark" / "Dark.S01E01.mkv").mkdir(parents=True, exist_ok=True)
+    # Replace directory with file for Dark.S01E01.mkv
+    (tv / "Dark" / "Dark.S01E01.mkv").rmdir()
+    (tv / "Dark" / "Dark.S01E01.mkv").write_text("v")
+    xlsx = tmp_path / "nonexistent.xlsx"
+
+    monkeypatch.setattr(
+        sys, "argv",
+        ["run.py", "--action", "full", "--movies", str(movies),
+         "--tv", str(tv), "--output", str(xlsx), "--dry-run"],
+    )
+    wizard.main()
+    out = capsys.readouterr().out
+    assert "Planned loose-file moves" in out
+    assert "Planned renames" in out or "[OK] Nothing to do (renames)." in out
+    assert not xlsx.exists()
+
+
+def test_run_scan_scopes_movie_recursive_walk_to_gap_folders(tmp_path, monkeypatch):
+    from mediaorg import scan
+
+    movies = tmp_path / "Movies"
+    (movies / "Ready (2020)").mkdir(parents=True)
+    (movies / "Ready (2020)" / "Ready.2020.mkv").write_text("v")
+    (movies / "NestedGroup" / "Deep (2021)").mkdir(parents=True)
+    (movies / "NestedGroup" / "Deep (2021)" / "Deep.2021.mkv").write_text("v")
+
+    visited = []
+    real_rec = scan.scan_recursive
+
+    def spy_rec(root, patterns=(), base=None):
+        visited.append(root)
+        return real_rec(root, patterns, base=base)
+
+    monkeypatch.setattr(scan, "scan_recursive", spy_rec)
+    xlsx = tmp_path / "lib.xlsx"
+    m_rows, _ = wizard.run_scan(str(movies), None, xlsx, dry_run=True)
+    assert visited == [movies / "NestedGroup"]
+    assert sorted(r["Folder Name"] for r in m_rows) == [
+        "NestedGroup/Deep (2021)", "Ready (2020)"
+    ]
+
+
+def test_clean_all_includes_video_and_episode_filenames(monkeypatch):
+    import pandas as pd
+
+    df_m = pd.DataFrame([{"Folder Name": "Film (2020)", "Video Files": "Film.2020.mkv"}])
+    df_t = pd.DataFrame([{"Show Folder": "Show", "Episode File": "Season 1/Show.S01E01.mkv"}])
+
+    captured = {}
+
+    monkeypatch.setattr(llm, "load_llm_config", lambda: {"ollama_url": "http://localhost:11434"})
+    monkeypatch.setattr(llm, "list_ollama_models", lambda url: ["llama3", "qwen2.5"])
+    monkeypatch.setattr(llm, "save_llm_config", lambda cfg: None)
+    monkeypatch.setenv("OLLAMA_MODEL", "qwen2.5")
+
+    def fake_clean(names, provider, **kw):
+        captured["names"] = names
+        captured["model"] = kw.get("model")
+        return {}
+
+    monkeypatch.setattr(llm, "clean_titles_with_llm", fake_clean)
+    # 1) choice '2' (Ollama), 2) Clean ALL 'y', 3) URL '' (default), 4) Model '' (env default -> 2: qwen2.5)
+    _drive(monkeypatch, ["2", "y", "", ""])
+    wizard._ask_llm_results(df_m, df_t, [])
+    assert captured["names"] == [
+        "Film (2020)", "Film.2020.mkv", "Show", "Show.S01E01.mkv"
+    ]
+    assert captured["model"] == "qwen2.5"
