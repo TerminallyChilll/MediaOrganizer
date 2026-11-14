@@ -199,3 +199,12 @@ def test_episode_title_strips_trailing_release_group():
     assert p.season == 1
     assert p.episodes == [1]
     assert p.episode_title == "Pilot"
+
+
+def test_hyphenated_episode_titles_are_not_truncated():
+    for fname, ep_title in [
+        ("Show.S01E01.WALL-E.mkv", "WALL-E"),
+        ("Show.S01E01.Spider-Man.mkv", "Spider-Man"),
+    ]:
+        p = parse_name(fname, kind_hint="episode")
+        assert p.episode_title == ep_title

@@ -711,3 +711,41 @@ def test_companion_ops_multi_episode_tail_and_boundary_and_zero_size(tmp_path):
     scheme.movie_file_include_size = True
     p = plan_renames(pd.DataFrame(rows), str(m2), None, None, scheme)
     assert p.ops == []
+
+
+def test_companion_ops_multi_ep_mismatch_and_preserve_fixed_on_append(tmp_path):
+    # Prefix fails (video has 1080p), episode code fallback must strip full S01E01-E02.
+    d = tmp_path / "Show" / "Season 1"
+    d.mkdir(parents=True)
+    vid = d / "Show.S01E01-E02.1080p.mkv"
+    sub = d / "Show.S01E01-E02.en.srt"
+    vid.write_text("v")
+    sub.write_text("s")
+    ops = excel._companion_ops(vid, vid.name, "Show S01E01-E02 [1080p].mkv")
+    assert [op.dst.name for op in ops] == ["Show S01E01-E02 [1080p].en.srt"]
+
+    # Files Fixed comma support & mismatched count skipped reason
+    movies = tmp_path / "Movies"
+    make_movie(movies, "Dune (2021)", ["Dune.1080p.mkv", "Dune.2160p.mkv"])
+    rows = scan_movies(movies)
+    df_m = pd.DataFrame(rows)
+    df_m.loc[0, 'Files Fixed'] = "Dune One, Dune Two"
+    plan_comma = plan_renames(df_m, str(movies), None, None, NamingScheme())
+    assert {"Dune One.mkv", "Dune Two.mkv"}.issubset(
+        {op.dst.name for op in plan_comma.ops}
+    )
+
+    df_m.loc[0, 'Files Fixed'] = "Only One Override"
+    plan_bad = plan_renames(df_m, str(movies), None, None, NamingScheme())
+    assert any("Files Fixed" in reason for _, reason in plan_bad.skipped)
+
+    # write_library(..., append=True) preserves hand-edited '... Fixed' columns
+    xlsx = tmp_path / "lib.xlsx"
+    excel.write_library(xlsx, rows, [], str(movies), None, append=False)
+    df_saved, _, _ = excel.read_library(xlsx)
+    df_saved['Title Fixed'] = 'Hand Edited Dune'
+    with pd.ExcelWriter(xlsx, engine='openpyxl', mode='a', if_sheet_exists='replace') as w:
+        df_saved.to_excel(w, sheet_name='Movies', index=False)
+    excel.write_library(xlsx, rows, [], str(movies), None, append=True)
+    df_after, _, _ = excel.read_library(xlsx)
+    assert df_after.loc[0, 'Title Fixed'] == 'Hand Edited Dune'

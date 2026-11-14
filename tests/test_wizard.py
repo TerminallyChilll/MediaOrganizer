@@ -1729,3 +1729,36 @@ def test_clean_all_includes_video_and_episode_filenames(monkeypatch):
         "Film (2020)", "Film.2020.mkv", "Show", "Show.S01E01.mkv"
     ]
     assert captured["model"] == "qwen2.5"
+
+
+def test_yes_flag_appends_and_preserves_fixed_columns(tmp_path, monkeypatch):
+    from mediaorg import excel
+
+    movies = tmp_path / "Movies"
+    (movies / "Alpha (2020)").mkdir(parents=True)
+    (movies / "Alpha (2020)" / "Alpha.2020.mkv").write_text("v")
+    xlsx = tmp_path / "lib.xlsx"
+    excel.write_library(
+        xlsx,
+        [{"Folder Name": "ManualEntry", "Title": "Manual", "Title Fixed": "KeepMe",
+          "Video Files": "Manual.mkv"}],
+        [], str(movies), None, append=False,
+    )
+
+    monkeypatch.setattr("builtins.input", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("prompted")))
+    wizard.run_scan(str(movies), None, xlsx, assume_yes=True)
+    df_m, _, _ = excel.read_library(xlsx)
+    assert set(df_m["Folder Name"]) == {"ManualEntry", "Alpha (2020)"}
+    assert df_m.loc[df_m["Folder Name"] == "ManualEntry", "Title Fixed"].iloc[0] == "KeepMe"
+
+
+def test_doctor_check_configs_does_not_import_wizard(tmp_path, monkeypatch):
+    import sys
+    from mediaorg import doctor
+
+    cfg = tmp_path / "renamer.json"
+    cfg.write_text('{"scheme": {}}', encoding="utf-8")
+    monkeypatch.setenv("MEDIAORG_CONFIG", str(cfg))
+    monkeypatch.setitem(sys.modules, "mediaorg.wizard", None)
+    results = doctor.check_configs()
+    assert results[0][0] == "OK"

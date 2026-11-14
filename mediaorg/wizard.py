@@ -31,19 +31,6 @@ CONFIG_FILE = ".media_renamer_config.json"
 LAUNCH_CHECK_BUDGET = 2.0
 
 
-def config_path() -> Path:
-    """Where the naming-scheme config lives, independent of the cwd."""
-    env = os.environ.get("MEDIAORG_CONFIG")
-    if env:
-        return Path(env).expanduser()
-    app = Path(__file__).resolve().parent.parent / CONFIG_FILE
-    if not app.exists():
-        legacy = Path.cwd() / CONFIG_FILE
-        if legacy.exists() and legacy != app:
-            return legacy
-    return app
-
-
 class BackNavigation(Exception):
     pass
 
@@ -1089,10 +1076,13 @@ def run_scan(movies_path, tv_path, excel_path: Path, dry_run: bool = False, *,
 
     append = False
     if excel_path.exists():
-        if overwrite_excel is True or assume_yes:
-            append = False
-        elif overwrite_excel is False:
+        if overwrite_excel is not None:
+            append = not overwrite_excel
+        elif assume_yes or not _stdin_is_interactive():
+            # Prompt defaults to append=True; unattended runs must not truncate
+            # existing sheets or discard hand-edited '... Fixed' columns.
             append = True
+            print(f"   [i] '{excel_path.name}' exists — appending scan results.")
         else:
             append = ask_yes_no(f"'{excel_path.name}' exists. Append to it? "
                                 f"(no = overwrite)", default=True)
@@ -1263,7 +1253,7 @@ def run_rename(movies_path, tv_path, excel_path: Path, dry_run: bool = False,
     patterns = load_custom_patterns()
 
     config = _load_config()
-    interactive = not dry_run and not assume_yes
+    interactive = _stdin_is_interactive() and not dry_run and not assume_yes
     scheme = _ask_scheme(config) if interactive else \
         NamingScheme.from_dict(config.get('scheme', {}))
     llm_results = _ask_llm_results(df_movies, df_tv, patterns) if interactive else {}
@@ -1844,8 +1834,7 @@ Tip: type 'back' or 'b' at any prompt to return here.""")
                     confirm_word_list()
                     step += 1
                     print(f"\n[{step}/{steps}] Scanning library...")
-                    run_scan(movies, tv, xlsx,
-                             overwrite_excel=(True if choice == '4' else None))
+                    run_scan(movies, tv, xlsx)
                     step += 1
                     if choice in ('1', '4'):
                         print(f"\n[{step}/{steps}] Renaming "
@@ -1976,7 +1965,6 @@ def main() -> None:
         run_wizard()
         return
 
-    is_non_tty = not sys.stdin.isatty()
     movies = str(Path(args.movies).resolve()) if args.movies else None
     tv = str(Path(args.tv).resolve()) if args.tv else None
     xlsx = Path(args.output or "media_library.xlsx").resolve()
@@ -2002,9 +1990,7 @@ def main() -> None:
         run_organize_movies(movies, dry_run=args.dry_run, accept_gate=gate,
                             assume_yes=args.yes)
     elif args.action == 'scan':
-        overwrite = True if (args.yes or is_non_tty) else None
-        run_scan(movies, tv, xlsx, dry_run=args.dry_run,
-                 overwrite_excel=overwrite, assume_yes=args.yes)
+        run_scan(movies, tv, xlsx, dry_run=args.dry_run, assume_yes=args.yes)
     elif args.action == 'rename':
         run_rename(movies, tv, xlsx, dry_run=args.dry_run, accept_gate=gate,
                    assume_yes=args.yes)
@@ -2023,7 +2009,7 @@ def main() -> None:
                                     session=session, accept_gate=False,
                                     assume_yes=args.yes)
         m_rows, t_rows = run_scan(movies, tv, xlsx, dry_run=args.dry_run,
-                                  overwrite_excel=True, assume_yes=args.yes)
+                                  assume_yes=args.yes)
         if args.dry_run:
             import pandas as pd
             df_m = pd.DataFrame(m_rows) if m_rows else None

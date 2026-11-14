@@ -459,11 +459,18 @@ def execute(plan: Plan, journal: Path, dry_run: bool = False, *,
                             jw.log({"op": "mkdir", "src": None, "dst": str(d),
                                     "seq": seq})
                         for j in junk:
+                            jw.seq += 1
+                            jseq = jw.seq
                             jdst = _free_name(trash / j.name)
+                            jw.log({"op": "intent", "kind": "move", "seq": jseq,
+                                    "src": str(j), "dst": str(jdst),
+                                    "dst_existed": False})
                             _retrying(lambda a=j, b=jdst: _move_across(a, b))
                             jw.log({"op": "move", "src": str(j),
-                                    "dst": str(jdst), "seq": seq,
+                                    "dst": str(jdst), "seq": jseq,
                                     **_stat_fields(jdst)})
+                        jw.seq += 1
+                        seq = jw.seq
                     jw.log({"op": "intent", "kind": "rmdir", "seq": seq,
                             "dst": str(dst)})
                     _retrying(dst.rmdir)

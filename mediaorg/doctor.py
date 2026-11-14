@@ -103,6 +103,19 @@ def _validate_json(path: Path) -> tuple[str, Path, str]:
         return ("FAIL", path, f"{path} is corrupted: {e}")
 
 
+def _config_path() -> Path:
+    """Resolve .media_renamer_config.json using stdlib only (no wizard import)."""
+    env = os.environ.get("MEDIAORG_CONFIG")
+    if env:
+        return Path(env).expanduser()
+    app = _pkg_dir() / ".media_renamer_config.json"
+    if not app.exists():
+        legacy = Path.cwd() / ".media_renamer_config.json"
+        if legacy.exists() and legacy != app:
+            return legacy
+    return app
+
+
 def check_configs() -> list[tuple[str, str, str]]:
     """Validate every JSON state file in the working directory.
 
@@ -117,11 +130,10 @@ def check_configs() -> list[tuple[str, str, str]]:
     """
     from .llm import llm_config_path
     from .parse import custom_patterns_path
-    from .wizard import config_path
     # All config files are resolved the same way the journal is (app directory,
     # or an adopted legacy file), so check where they will actually be read.
     results = []
-    for path in (config_path(),
+    for path in (_config_path(),
                  Path(llm_config_path()),
                  custom_patterns_path()):
         results.append(_validate_json(path))

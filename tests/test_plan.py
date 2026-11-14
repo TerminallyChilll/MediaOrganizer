@@ -831,3 +831,44 @@ def test_extfix_rejects_m4a_heic_ico_and_same_extension_case(tmp_path):
     vid_upper = tmp_path / "Upper.MKV"
     vid_upper.write_bytes(b"\x1a\x45\xdf\xa3" + b"\x00" * 32)
     assert [o.dst.name for o in plan_extension_convert(tmp_path, ".mkv", ".mkv").ops] == ["Upper.mkv"]
+
+
+def test_loose_movies_ignores_artwork_subdirs_and_sample_clips(tmp_path):
+    from mediaorg.plan import plan_loose_movies
+
+    movie_dir = tmp_path / "Movie (2020)"
+    touch(movie_dir / "Movie.2020.mkv")
+    touch(movie_dir / "sample.mkv")
+    touch(movie_dir / "Artwork" / "poster.jpg")
+    touch(movie_dir / "CustomThumbs" / "thumb.png")
+
+    plan = plan_loose_movies(tmp_path)
+    assert plan.ops == []
+
+
+def test_companion_files_tolerates_flaky_entry_oserror(tmp_path, monkeypatch):
+    from mediaorg.plan import companion_files
+
+    vid = touch(tmp_path / "Film.2020.mkv")
+    sub = touch(tmp_path / "Film.2020.en.srt")
+    real_scandir = os.scandir
+
+    class FlakyEntry:
+        def __init__(self, real):
+            self._real = real
+            self.name = real.name
+            self.path = real.path
+
+        def is_file(self, follow_symlinks=False):
+            if self.name == "stale.srt":
+                raise OSError(116, "Stale file handle")
+            return self._real.is_file(follow_symlinks=follow_symlinks)
+
+    touch(tmp_path / "stale.srt")
+
+    def flaky_scandir(path=".", *args, **kwargs):
+        entries = list(real_scandir(path, *args, **kwargs))
+        return [FlakyEntry(e) for e in entries]
+
+    monkeypatch.setattr(os, "scandir", flaky_scandir)
+    assert companion_files(vid) == [sub]

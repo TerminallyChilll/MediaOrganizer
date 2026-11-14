@@ -268,10 +268,17 @@ def parse_name(name: str, kind_hint: str | None = None,
     if isinstance(episode_title, str) and '-' in episode_title:
         # Excluding release_group prevents hyphenated titles like WALL-E from
         # breaking, but can leave a trailing "-GROUP" attached to episode_title.
+        # Validate that the stripped release group actually matches the suffix
+        # so genuinely hyphenated episode titles cannot be altered.
         g_with_rg = guessit(cleaned, {'type': kind_hint} if kind_hint else {})
-        if g_with_rg.get('release_group') and g_with_rg.get('episode_title'):
-            rg_ep_title = g_with_rg['episode_title']
-            episode_title = rg_ep_title[0] if isinstance(rg_ep_title, list) else rg_ep_title
+        rg = g_with_rg.get('release_group')
+        rg_str = rg[0] if isinstance(rg, list) and rg else (rg if isinstance(rg, str) else '')
+        rg_ep = g_with_rg.get('episode_title')
+        rg_ep_str = rg_ep[0] if isinstance(rg_ep, list) and rg_ep else (rg_ep if isinstance(rg_ep, str) else '')
+        if (rg_str and rg_ep_str
+                and episode_title.casefold().endswith(f"-{rg_str.casefold()}")
+                and rg_ep_str.strip() == episode_title[:-len(rg_str) - 1].strip()):
+            episode_title = rg_ep_str
 
     screen_size = _first('screen_size')
     date_val = _first('date')

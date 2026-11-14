@@ -335,18 +335,22 @@ def companion_files(video: Path) -> list[Path]:
     except OSError:
         return out
 
+    file_entries = []
+    for entry in entries:
+        try:
+            if entry.is_file(follow_symlinks=False):
+                file_entries.append(entry)
+        except OSError:
+            continue
+
     # Sibling video stems so e.g. "Movie.2020.mkv" does not steal
     # "Movie.2020.Extended.srt" from "Movie.2020.Extended.mkv".
     other_video_stems = [
-        norm(Path(e.name).stem) for e in entries
-        if e.is_file(follow_symlinks=False)
-        and Path(e.path) != video
-        and is_media_file(e.name)
+        norm(Path(e.name).stem) for e in file_entries
+        if Path(e.path) != video and is_media_file(e.name)
     ]
 
-    for entry in entries:
-        if not entry.is_file(follow_symlinks=False):
-            continue
+    for entry in file_entries:
         p = Path(entry.path)
         if p == video:
             continue
@@ -767,7 +771,27 @@ def plan_season_structure(show_path: Path) -> Plan:
 
 # --- Loose movie files planner ----------------------------------------------
 
-_MOVIE_SUPPORT_DIRS = re.compile(r'^(?:subs?|subtitles|samples?)$', re.IGNORECASE)
+_MOVIE_SUPPORT_DIRS = re.compile(
+    r'^(?:subs?|subtitles|samples?|artwork|screens?|proof|extrafanart|making[ ._-]?of)$',
+    re.IGNORECASE,
+)
+_SUPPORT_VIDEO_NAME = re.compile(
+    r'(?:^|[.\s_-])(?:sample|trailer|teaser|preview|featurette|bonus|proof'
+    r'|deleted[ ._-]?scenes?|behind[ ._-]?the[ ._-]?scenes?|interviews?)'
+    r'(?:$|[.\s_-])',
+    re.IGNORECASE,
+)
+
+
+def _dir_has_video(directory: Path) -> bool:
+    try:
+        for _dirpath, dirnames, filenames in os.walk(directory):
+            dirnames[:] = [d for d in dirnames if not is_junk_dir(d)]
+            if any(is_media_file(f) for f in filenames):
+                return True
+    except OSError:
+        return False
+    return False
 
 
 def _is_movie_wrapper_dir(directory: Path, child_dirs: list[Path],
@@ -776,20 +800,25 @@ def _is_movie_wrapper_dir(directory: Path, child_dirs: list[Path],
 
     A single loose video inside a subfolder looks identical on disk to
     ``Movies/Movie Name/file.mkv``, so a subfolder only qualifies as a wrapper
-    when it contains non-extras child directories or 2+ distinct movie titles.
+    when it contains non-extras child directories that hold media or 2+
+    distinct feature movie titles (excluding sample/trailer clips).
     """
     real_subdirs = [
         d for d in child_dirs
         if not SPECIALS_FOLDER_PATTERN.match(d.name.strip())
         and not _MOVIE_SUPPORT_DIRS.match(d.name.strip())
+        and _dir_has_video(d)
     ]
     if real_subdirs:
         return True
-    if len(loose_videos) < 2:
+    feature_videos = [
+        v for v in loose_videos if not _SUPPORT_VIDEO_NAME.search(v.stem)
+    ]
+    if len(feature_videos) < 2:
         return False
     titles = {
         norm(parse_name(v.name, kind_hint="movie").title).casefold()
-        for v in loose_videos
+        for v in feature_videos
     }
     titles.discard('')
     return len(titles) >= 2
@@ -808,14 +837,17 @@ def plan_loose_movies(movies_root: Path) -> Plan:
         except OSError:
             return
 
-        child_dirs = [
-            Path(e.path) for e in entries
-            if e.is_dir(follow_symlinks=False) and not is_junk_dir(e.name)
-        ]
-        loose_videos = [
-            Path(e.path) for e in entries
-            if e.is_file(follow_symlinks=False) and is_media_file(e.name)
-        ]
+        child_dirs: list[Path] = []
+        loose_videos: list[Path] = []
+        for e in entries:
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    if not is_junk_dir(e.name):
+                        child_dirs.append(Path(e.path))
+                elif e.is_file(follow_symlinks=False) and is_media_file(e.name):
+                    loose_videos.append(Path(e.path))
+            except OSError:
+                continue
 
         should_wrap = (
             depth == 0

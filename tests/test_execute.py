@@ -593,3 +593,24 @@ def test_dropping_nothing_leaves_the_rmdir_alone(tmp_path):
            Op("rmdir", None, tmp_path / "src")]
     plan = check_collisions(ops)
     assert [op.kind for op in plan.ops] == ["move", "rmdir"]
+
+
+def test_junk_quarantine_logs_intent_and_recovers_partial_copy(tmp_path, journal, monkeypatch):
+    lib = tmp_path / "lib"
+    d = lib / "Season 1"
+    touch(d / ".DS_Store")
+
+    def crash_move(src, dst):
+        dst.write_text("partial junk")
+        raise OSError("EXDEV copy interrupted")
+
+    monkeypatch.setattr(ex, "_move_across", crash_move)
+    result = execute(Plan(ops=[Op("rmdir", None, d)]), journal, roots=[lib])
+    assert not result.ok
+    junk_in_trash = lib / ".mediaorg_trash" / ".DS_Store"
+    assert junk_in_trash.exists()
+
+    notes = ex.recover(journal)
+    assert any("remove incomplete copy" in n for n in notes)
+    assert not junk_in_trash.exists()
+    assert (d / ".DS_Store").exists()
