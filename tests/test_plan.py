@@ -892,6 +892,8 @@ def test_loose_movies_wraps_titles_containing_support_words(tmp_path):
     touch(alien / "Alien.1979.mkv")
     touch(alien / "Aliens.1986.mkv")
 
+    # Same year on purpose: only a shared year makes the len(dated_titles)
+    # guard decide the outcome, so keep both films at 1995.
     same_year = tmp_path / "Heat"
     touch(same_year / "Heat.1995.mkv")
     touch(same_year / "Collateral.1995.mkv")
