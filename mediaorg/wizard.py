@@ -1129,10 +1129,12 @@ def _all_candidate_names(df_movies, df_tv) -> list[str]:
     return list(dict.fromkeys(names))
 
 
-def _llm_candidates(df_movies, df_tv, patterns) -> list[str]:
+def _llm_candidates(df_movies, df_tv, patterns, *,
+                    use_catalog: bool = True) -> list[str]:
     """Names guessit couldn't confidently parse (source == 'raw')."""
     return [n for n in _all_candidate_names(df_movies, df_tv)
-            if parse_name(n, custom_patterns=patterns).source == "raw"]
+            if parse_name(n, custom_patterns=patterns,
+                          use_catalog=use_catalog).source == "raw"]
 
 
 def _ask_llm_results(df_movies, df_tv, patterns) -> dict:
@@ -1152,7 +1154,9 @@ def _ask_llm_results(df_movies, df_tv, patterns) -> dict:
                 return {}
             if not run_update_catalog():
                 return {}
-        candidates = _llm_candidates(df_movies, df_tv, patterns)
+        candidates = _llm_candidates(
+            df_movies, df_tv, patterns, use_catalog=False
+        )
         if ask_yes_no(f"{len(candidates)} name(s) look hard to parse. Match ALL "
                       f"names against the offline catalog instead of just those?",
                       default=False):
@@ -1725,7 +1729,6 @@ def run_catalog_menu() -> None:
                 parsed.title,
                 parsed.year,
                 kind_hint="episode" if parsed.kind == "episode" else None,
-                allow_any_tail=(parsed.source == "raw"),
             )
             print(f"   parsed title : {parsed.title} "
                   f"(year: {parsed.year or '-'}, source: {parsed.source})")

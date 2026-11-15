@@ -200,7 +200,8 @@ def _strip_video_ext(name: str) -> str:
 
 def parse_name(name: str, kind_hint: str | None = None,
                custom_patterns: list[str] = (),
-               catalog_db: Path | None = None) -> ParsedName:
+               catalog_db: Path | None = None, *,
+               use_catalog: bool = True) -> ParsedName:
     """Parse a file or folder name into its media parts.
 
     Fallback chain: guessit -> bare-number title ("1917.mkv") -> raw stem
@@ -297,6 +298,8 @@ def parse_name(name: str, kind_hint: str | None = None,
         edition=str(edition) if edition else None,
         part=part,
     )
+    if not use_catalog:
+        return parsed
     from .catalog import refine_parsed
     effective_hint = kind_hint or ("episode" if parsed.kind == "episode" else None)
     return refine_parsed(parsed, kind_hint=effective_hint, db_path=catalog_db)

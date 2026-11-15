@@ -1,6 +1,7 @@
 """Tests for the offline Movie & TV Show catalog (mediaorg.catalog)."""
 
 import gzip
+import hashlib
 from pathlib import Path
 
 import pandas as pd
@@ -22,6 +23,8 @@ tt0903747\t9.5\t2100000
 tt0472954\t8.8\t250000
 tt0386676\t9.0\t700000
 tt0211915\t8.3\t790000
+tt0084787\t8.2\t460000
+tt0905372\t6.2\t145000
 tt9990001\t5.0\t10
 tt9990002\t6.5\t5000
 tt9990003\t7.0\t5000
@@ -42,6 +45,8 @@ tt0903747\ttvSeries\tBreaking Bad\tBreaking Bad\t0\t2008\t2013\t49\tCrime,Drama
 tt0472954\ttvSeries\tIt's Always Sunny in Philadelphia\tIt's Always Sunny in Philadelphia\t0\t2005\t\\N\t22\tComedy
 tt0386676\ttvSeries\tThe Office\tThe Office\t0\t2005\t2013\t22\tComedy
 tt0211915\tmovie\tAmélie\tLe Fabuleux Destin d'Amélie Poulain\t0\t2001\t\\N\t122\tComedy,Romance
+tt0084787\tmovie\tThe Thing\tThe Thing\t0\t1982\t\\N\t109\tHorror,Sci-Fi
+tt0905372\tmovie\tThe Thing\tThe Thing\t0\t2011\t\\N\t103\tHorror,Sci-Fi
 tt9990001\tmovie\tToo Few Votes\tToo Few Votes\t0\t2020\t\\N\t90\tDrama
 tt9990002\tmovie\tAdult Film\tAdult Film\t1\t2020\t\\N\t90\tAdult
 tt9990003\tshort\tSome Short\tSome Short\t0\t2020\t\\N\t15\tShort
@@ -89,8 +94,14 @@ def test_normalize_title_handles_punctuation_accents_and_apostrophes():
 def test_build_catalog_filters_and_deduplicates(sample_catalog):
     stats = catalog.catalog_stats(sample_catalog)
     assert stats is not None
-    assert stats["movie_count"] == 9  # 8 unique + 1 duplicate norm_title/year merged
+    # 10 unique movie primary titles + 1 French originalTitle alias for Amélie = 11 movie rows
+    assert stats["movie_count"] == 11
     assert stats["tv_count"] == 3
+    assert stats["total"] == 14
+
+    # Doctor count matches catalog_stats()['total'] exactly.
+    doc_status, doc_msg = doctor.check_catalog()
+    assert doc_status == "OK" and "14 title entries" in doc_msg
 
     # Low votes, adult titles, and shorts must be excluded.
     assert catalog.lookup_title("Too Few Votes") is None
@@ -102,6 +113,52 @@ def test_build_catalog_filters_and_deduplicates(sample_catalog):
     assert m is not None
     assert m.votes == 2050000
     assert m.match_type == "exact"
+
+
+def test_build_catalog_refuses_empty_build_and_verifies_sha256(sample_catalog, tmp_path):
+    empty_ratings = tmp_path / "empty_ratings.tsv"
+    empty_basics = tmp_path / "empty_basics.tsv"
+    empty_ratings.write_text("tconst\taverageRating\tnumVotes\n", encoding="utf-8")
+    empty_basics.write_text(
+        "tconst\ttitleType\tprimaryTitle\toriginalTitle\tisAdult\tstartYear\n",
+        encoding="utf-8",
+    )
+
+    # An empty dataset must raise and leave the existing sample_catalog intact.
+    with pytest.raises(RuntimeError, match="0 qualifying catalog entries"):
+        catalog.build_catalog(
+            sample_catalog,
+            basics_source=empty_basics,
+            ratings_source=empty_ratings,
+        )
+    assert catalog.lookup_title("Inception", 2010, db_path=sample_catalog) is not None
+
+    # SHA-256 verification succeeds with matching digest and fails on mismatch.
+    r_Plain = tmp_path / "ratings.tsv"
+    b_Plain = tmp_path / "basics.tsv"
+    r_Plain.write_text(SAMPLE_RATINGS, encoding="utf-8")
+    b_Plain.write_text(SAMPLE_BASICS, encoding="utf-8")
+    r_sha = hashlib.sha256(r_Plain.read_bytes()).hexdigest()
+    b_sha = hashlib.sha256(b_Plain.read_bytes()).hexdigest()
+
+    out_db = tmp_path / "verified.db"
+    catalog.build_catalog(
+        out_db,
+        basics_source=b_Plain,
+        ratings_source=r_Plain,
+        basics_sha256=b_sha,
+        ratings_sha256=r_sha,
+    )
+    assert out_db.exists()
+
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        catalog.build_catalog(
+            out_db,
+            basics_source=b_Plain,
+            ratings_source=r_Plain,
+            basics_sha256="0" * 64,
+            ratings_sha256=r_sha,
+        )
 
 
 def test_original_title_alias_and_fuzzy_year(sample_catalog):
@@ -127,19 +184,29 @@ def test_prefix_lookup_strips_junk_but_never_truncates_real_titles(sample_catalo
     assert m.match_type == "prefix"
 
     # A real title ("It Comes at Night") whose first word matches another 2017
-    # movie ("It") must NOT be truncated when the tail words are not junk.
+    # movie ("It") must NOT be truncated, even when parsed as source="raw".
     assert catalog.lookup_title("It Comes at Night", 2017, kind_hint="movie") is None
+    p_raw = parse_name("[It Comes at Night].2017.1080p.mkv", kind_hint="movie")
+    assert p_raw.title != "It"
 
-    # Sequel numbers and markers must never be stripped to match the original,
-    # even when allow_any_tail=True and multiple words are in the tail.
+    # Sequel numbers and markers must never be stripped to match the original.
     assert catalog.lookup_title("Inception 2", 2010, kind_hint="movie") is None
     assert catalog.lookup_title("Inception Part II", 2010, kind_hint="movie") is None
-    assert catalog.lookup_title(
-        "It Chapter 2", 2017, kind_hint="movie", allow_any_tail=True
-    ) is None
-    assert catalog.lookup_title(
-        "It Story 2", 2017, kind_hint="movie", allow_any_tail=True
-    ) is None
+    assert catalog.lookup_title("It Chapter 2", 2017, kind_hint="movie") is None
+
+
+def test_ambiguous_same_name_movies_do_not_guess_year(sample_catalog):
+    # "The Thing" exists in both 1982 and 2011; without a year, lookup returns
+    # match_type="ambiguous" and year=None so an undated file is not stamped 1982.
+    m_no_year = catalog.lookup_title("The Thing", kind_hint="movie")
+    assert m_no_year is not None
+    assert m_no_year.title == "The Thing"
+    assert m_no_year.year is None
+    assert m_no_year.match_type == "ambiguous"
+
+    # With an explicit year, exact match resolves the right release.
+    m_2011 = catalog.lookup_title("The Thing", 2011, kind_hint="movie")
+    assert m_2011 is not None and m_2011.year == 2011 and m_2011.match_type == "exact"
 
 
 def test_parse_name_uses_catalog_as_backup(sample_catalog):
@@ -190,8 +257,11 @@ def test_clean_titles_with_catalog_returns_canonical_titles(sample_catalog):
         "year": "2019",
         "quality": "1080p",
     }
-    # Country suffix ("(US)") must be preserved in both lookup_title and clean_titles_with_catalog.
-    assert catalog.lookup_title("The Office (US)", kind_hint="episode").title == "The Office (US)"
+    # Country suffix ("(US)") is preserved and lookup_title retains the catalog year.
+    m_office = catalog.lookup_title("The Office (US)", kind_hint="episode")
+    assert m_office is not None
+    assert m_office.title == "The Office (US)"
+    assert m_office.year == 2005
     assert cleaned["The.Office.US.S01E01.mkv"]["title"] == "The Office (US)"
     assert cleaned["The.Office.US.S01E01.mkv"]["year"] == ""
     # Episode lookup does not cross-match a movie ("It" 2017) when kind_hint="episode".
@@ -211,13 +281,21 @@ def test_wizard_renaming_engine_option_4_uses_catalog(sample_catalog, monkeypatc
     df_m = pd.DataFrame([{"Folder Name": "[REC].2007", "Video Files": "[REC].2007.1080p.mkv"}])
     df_t = pd.DataFrame([{"Show Folder": "Its Always Sunny in Philadelphia",
                           "Episode File": "Season 1/Its.Always.Sunny.in.Philadelphia.S01E01.mkv"}])
-    answers = iter(["4", "y"])
-    monkeypatch.setattr("builtins.input", lambda *a: next(answers))
-    monkeypatch.setattr(wizard, "_stdin_is_interactive", lambda: True)
 
-    res = wizard._ask_llm_results(df_m, df_t, [])
-    assert res["[REC].2007"]["title"] == "REC"
-    assert res["Its Always Sunny in Philadelphia"]["title"] == (
+    # Default 'n' (raw candidates only, computed with use_catalog=False):
+    answers_n = iter(["4", "n"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(answers_n))
+    monkeypatch.setattr(wizard, "_stdin_is_interactive", lambda: True)
+    res_n = wizard._ask_llm_results(df_m, df_t, [])
+    assert res_n["[REC].2007"]["title"] == "REC"
+    assert "Its Always Sunny in Philadelphia" not in res_n
+
+    # 'y' (all names):
+    answers_y = iter(["4", "y"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(answers_y))
+    res_y = wizard._ask_llm_results(df_m, df_t, [])
+    assert res_y["[REC].2007"]["title"] == "REC"
+    assert res_y["Its Always Sunny in Philadelphia"]["title"] == (
         "It's Always Sunny in Philadelphia"
     )
 

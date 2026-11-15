@@ -215,7 +215,10 @@ def fix_interrupted() -> tuple[str, str]:
 def check_catalog() -> tuple[str, str]:
     """Validate the optional offline SQLite catalog if present on disk."""
     import sqlite3
-    from .catalog import catalog_path
+    try:
+        from .catalog import catalog_path
+    except ImportError as exc:
+        return _err(f"catalog module unavailable: {exc}")
     cp = catalog_path()
     if not cp.exists():
         return _ok(f"Not downloaded (optional — build with: python run.py --update-catalog)")
@@ -236,7 +239,10 @@ def check_catalog() -> tuple[str, str]:
 
 def fix_catalog() -> tuple[str, str]:
     """Back up a corrupted offline catalog DB so it stops failing lookups."""
-    from .catalog import _close_cached, catalog_path
+    try:
+        from .catalog import _close_cached, catalog_path
+    except ImportError as exc:
+        return _err(f"catalog module unavailable: {exc}")
     _close_cached()
     return fix_corrupted_config(catalog_path())
 

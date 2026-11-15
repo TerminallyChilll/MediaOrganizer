@@ -5,13 +5,22 @@ so filename parsing and title cleaning have an offline reference list when
 ``guessit`` falls back to a raw stem, leaves release/edition tokens attached
 to a title, or encounters a bare numeric movie title like ``1917``.
 
-Uses only Python's standard library (``sqlite3``, ``gzip``, ``urllib``).
+Network access is strictly opt-in: nothing downloads datasets unless the user
+explicitly runs ``python run.py --update-catalog`` or selects ``[C]`` in the
+wizard menu (and ``build_catalog`` can also build from local ``.tsv`` /
+``.tsv.gz`` files via ``MEDIAORG_BASICS_SOURCE`` / ``MEDIAORG_RATINGS_SOURCE``).
+IMDb dataset files are provided for personal and non-commercial use under
+IMDb's Non-Commercial Licensing terms (https://developer.imdb.com/non-commercial-datasets/).
+
+Uses only Python's standard library (``sqlite3``, ``gzip``, ``urllib``, ``hashlib``).
 ASCII markers only ([OK], [!], ->): no emoji, no cp1252 crashes.
 """
 
 from __future__ import annotations
 
 import gzip
+import hashlib
+import io
 import os
 import re
 import sqlite3
@@ -31,7 +40,9 @@ BASICS_URL = "https://datasets.imdbws.com/title.basics.tsv.gz"
 DEFAULT_MIN_MOVIE_VOTES = 100
 DEFAULT_MIN_TV_VOTES = 50
 DOWNLOAD_TIMEOUT = 120
+MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024  # 512 MB safety ceiling
 
+_GZIP_MAGIC = b"\x1f\x8b"
 _MOVIE_TYPES = frozenset({"movie", "tvMovie"})
 _TV_TYPES = frozenset({"tvSeries", "tvMiniSeries"})
 
@@ -61,10 +72,6 @@ _SEQUEL_MARKERS = frozenset({
     "part", "pt", "vol", "volume", "chapter",
 })
 
-# Bare leading articles that cannot stand alone as a prefix match when stripping
-# arbitrary raw tails.
-_BARE_ARTICLES = frozenset({"a", "an", "the"})
-
 # Release, edition, technical, and ripper tokens that guessit occasionally
 # leaves attached to a title when they appear in non-standard positions.
 _JUNK_TAIL_WORDS = frozenset({
@@ -89,7 +96,7 @@ class CatalogMatch:
     year: int | None
     kind: str           # "movie" | "tv"
     votes: int
-    match_type: str     # "exact" | "year_fuzzy" | "prefix" | "unambiguous"
+    match_type: str     # "exact" | "year_fuzzy" | "prefix" | "unambiguous" | "ambiguous"
 
 
 def catalog_path(folder: Path | str | None = None) -> Path:
@@ -196,12 +203,12 @@ def catalog_stats(db_path: Path | None = None) -> dict | None:
         return None
     try:
         meta = dict(conn.execute("SELECT key, value FROM meta").fetchall())
-        movie_count = int(meta.get("movie_count", 0))
-        tv_count = int(meta.get("tv_count", 0))
-        if not movie_count and not tv_count:
-            total = conn.execute("SELECT COUNT(*) FROM titles").fetchone()[0]
-        else:
-            total = movie_count + tv_count
+        counts = dict(
+            conn.execute("SELECT kind, COUNT(*) FROM titles GROUP BY kind").fetchall()
+        )
+        movie_count = int(counts.get("movie", 0))
+        tv_count = int(counts.get("tv", 0))
+        total = movie_count + tv_count
         return {
             "path": path,
             "movie_count": movie_count,
@@ -261,29 +268,39 @@ def _query_year_fuzzy(conn: sqlite3.Connection, norm: str, year: int,
 
 def _query_unambiguous(conn: sqlite3.Connection, norm: str,
                        target_kind: str | None) -> CatalogMatch | None:
+    """Look up a title without a year constraint.
+
+    If exactly one entry matches `(norm_title, kind)`, its year is returned
+    with `match_type='unambiguous'`. If multiple entries exist across different
+    years (e.g. 'The Thing' 1982 vs. 2011), the highest-voted title casing is
+    returned with `year=None` and `match_type='ambiguous'` so callers never
+    stamp a guessed remake year onto an undated file.
+    """
     if target_kind:
-        row = conn.execute(
+        rows = conn.execute(
             "SELECT title, year, kind, votes FROM titles "
             "WHERE norm_title = ? AND kind = ? "
-            "ORDER BY votes DESC LIMIT 1",
+            "ORDER BY votes DESC LIMIT 2",
             (norm, target_kind),
-        ).fetchone()
+        ).fetchall()
     else:
-        row = conn.execute(
+        rows = conn.execute(
             "SELECT title, year, kind, votes FROM titles "
             "WHERE norm_title = ? "
-            "ORDER BY votes DESC LIMIT 1",
+            "ORDER BY votes DESC LIMIT 2",
             (norm,),
-        ).fetchone()
-    if row:
-        return CatalogMatch(row[0], row[1] or None, row[2], row[3], "unambiguous")
-    return None
+        ).fetchall()
+    if not rows:
+        return None
+    top = rows[0]
+    if len(rows) == 1:
+        return CatalogMatch(top[0], top[1] or None, top[2], top[3], "unambiguous")
+    return CatalogMatch(top[0], None, top[2], top[3], "ambiguous")
 
 
 def lookup_title(title: str, year: int | None = None,
                  kind_hint: str | None = None,
-                 db_path: Path | None = None, *,
-                 allow_any_tail: bool = False) -> CatalogMatch | None:
+                 db_path: Path | None = None) -> CatalogMatch | None:
     """Look up `(title, year, kind_hint)` in the local SQLite catalog.
 
     Returns a :class:`CatalogMatch` or ``None`` if the catalog is not
@@ -299,7 +316,7 @@ def lookup_title(title: str, year: int | None = None,
     if not norm:
         return None
     target_kind = _map_kind_hint(kind_hint)
-    country_match = _COUNTRY_SUFFIX_RE.search(title) if not allow_any_tail else None
+    country_match = _COUNTRY_SUFFIX_RE.search(title)
 
     try:
         # Tier 1 & 2: Exact normalized title + exact or +-1 year.
@@ -326,13 +343,13 @@ def lookup_title(title: str, year: int | None = None,
                 year,
                 kind_hint=kind_hint,
                 db_path=db_path,
-                allow_any_tail=False,
             )
             if base_m is not None:
                 code = country_match.group(1)
+                resolved_year = year if year is not None else base_m.year
                 return CatalogMatch(
                     f"{base_m.title} ({code})",
-                    year,
+                    resolved_year,
                     base_m.kind,
                     base_m.votes,
                     base_m.match_type,
@@ -340,24 +357,23 @@ def lookup_title(title: str, year: int | None = None,
             return None
 
         # Tier 3: Word-boundary prefix match (longest prefix wins).
+        # The stripped tail must consist entirely of release/edition/technical
+        # tokens so a multi-word title absent from the catalog (e.g.
+        # "[It Comes at Night].2017.1080p.mkv") can never be truncated to a
+        # shorter unrelated movie ("It" 2017).
         words = norm.split()
         if len(words) >= 2:
             for k in range(len(words) - 1, 0, -1):
                 tail = words[k:]
-                # Never strip across a sequel number or marker ("Part 2", "II")
-                # anywhere in the stripped tail unless the token is a known
-                # technical/release tag ("1080p").
                 if any(
                     not _is_junk_tail_word(w)
                     and (w.isdigit() or w in _SEQUEL_MARKERS)
                     for w in tail
                 ):
                     continue
-                if not allow_any_tail and not all(_is_junk_tail_word(w) for w in tail):
+                if not all(_is_junk_tail_word(w) for w in tail):
                     continue
                 prefix = " ".join(words[:k])
-                if allow_any_tail and prefix in _BARE_ARTICLES:
-                    continue
                 if year is not None:
                     m = (_query_exact(conn, prefix, year, target_kind)
                          or _query_year_fuzzy(conn, prefix, year, target_kind))
@@ -390,29 +406,30 @@ def refine_parsed(parsed, kind_hint: str | None = None,
         return parsed
 
     hint = kind_hint or ("episode" if parsed.kind == "episode" else None)
-    is_raw = parsed.source == "raw"
     match = lookup_title(
         parsed.title,
         parsed.year,
         kind_hint=hint,
         db_path=db_path,
-        allow_any_tail=is_raw,
     )
     if match is None:
         return parsed
 
-    if is_raw:
+    can_backfill_year = match.match_type in ("exact", "year_fuzzy", "unambiguous")
+
+    if parsed.source == "raw":
         parsed.title = match.title
-        if parsed.year is None and match.year is not None:
+        if parsed.year is None and match.year is not None and can_backfill_year:
             parsed.year = match.year
         parsed.source = "catalog"
     elif match.match_type == "prefix":
         parsed.title = match.title
-        if parsed.year is None and match.year is not None:
+        if parsed.year is None and match.year is not None and can_backfill_year:
             parsed.year = match.year
         parsed.source = "catalog"
     elif (parsed.year is None
           and match.year is not None
+          and can_backfill_year
           and parsed.title.strip().isdigit()
           and hint != "episode"
           and parsed.season is None
@@ -442,11 +459,11 @@ def clean_titles_with_catalog(filenames: Iterable[str],
             p.year,
             kind_hint="episode" if p.kind == "episode" else None,
             db_path=db_path,
-            allow_any_tail=(p.source == "raw"),
         )
         if m is not None:
             is_ep = p.kind == "episode" or p.season is not None or bool(p.episodes)
-            year_val = p.year if is_ep else (p.year or m.year)
+            can_backfill = m.match_type in ("exact", "year_fuzzy", "unambiguous")
+            year_val = p.year if is_ep else (p.year or (m.year if can_backfill else None))
             results[str(name)] = {
                 "title": m.title,
                 "year": str(year_val) if year_val else "",
@@ -457,38 +474,95 @@ def clean_titles_with_catalog(filenames: Iterable[str],
 
 # --- Catalog Builder / Updater -----------------------------------------------
 
-def _open_tsv_lines(source: str | Path, timeout: int = DOWNLOAD_TIMEOUT):
-    """Yield UTF-8 text lines from a local `.tsv`/`.tsv.gz` path or a URL."""
+class _BoundedHashStream(io.RawIOBase):
+    """Wraps a byte stream to enforce a size limit and compute SHA-256."""
+
+    def __init__(self, raw, max_bytes: int = MAX_DOWNLOAD_BYTES):
+        self._raw = raw
+        self._max_bytes = max_bytes
+        self.total_bytes = 0
+        self.hasher = hashlib.sha256()
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b) -> int:
+        data = self._raw.read(len(b))
+        if not data:
+            return 0
+        self.total_bytes += len(data)
+        if self.total_bytes > self._max_bytes:
+            raise ValueError(
+                f"Dataset stream exceeded safety limit ({self._max_bytes} bytes)"
+            )
+        self.hasher.update(data)
+        n = len(data)
+        b[:n] = data
+        return n
+
+
+def _open_tsv_lines(
+    source: str | Path,
+    timeout: int = DOWNLOAD_TIMEOUT,
+    expected_sha256: str | None = None,
+    max_bytes: int = MAX_DOWNLOAD_BYTES,
+):
+    """Yield UTF-8 text lines from a local `.tsv`/`.tsv.gz` path or a URL.
+
+    Auto-detects gzip compression from the two-byte magic header (`1f 8b`)
+    rather than assuming URLs are always compressed or local files always have
+    accurate suffixes, and verifies `expected_sha256` when supplied.
+    """
     src_str = str(source)
-    if src_str.startswith(("http://", "https://")):
-        ctx = ssl.create_default_context()
-        req = urllib.request.Request(
-            src_str,
-            headers={"User-Agent": "MediaOrganizer/1.0 (+offline-catalog)"},
-        )
-        resp = urllib.request.urlopen(req, timeout=timeout, context=ctx)
-        try:
-            with gzip.GzipFile(fileobj=resp) as gz:
+    raw_fh = None
+    try:
+        if src_str.startswith(("http://", "https://")):
+            ctx = ssl.create_default_context()
+            req = urllib.request.Request(
+                src_str,
+                headers={"User-Agent": "MediaOrganizer/1.0 (+offline-catalog)"},
+            )
+            raw_fh = urllib.request.urlopen(req, timeout=timeout, context=ctx)
+        else:
+            raw_fh = open(Path(source), "rb")
+
+        bounded = _BoundedHashStream(raw_fh, max_bytes=max_bytes)
+        buf = io.BufferedReader(bounded)
+        magic = buf.peek(2)[:2]
+        if magic == _GZIP_MAGIC:
+            with gzip.GzipFile(fileobj=buf) as gz:
                 for raw in gz:
                     yield raw.decode("utf-8", errors="replace")
-        finally:
-            resp.close()
-        return
+        else:
+            for raw in buf:
+                yield raw.decode("utf-8", errors="replace")
 
-    path = Path(source)
-    if path.suffix.lower() == ".gz":
-        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as fh:
-            yield from fh
-    else:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            yield from fh
+        if expected_sha256:
+            # Drain any trailing EOF bytes (e.g. gzip footer) so the hash
+            # covers the entire file/response stream.
+            while buf.read(65536):
+                pass
+            actual = bounded.hasher.hexdigest().lower()
+            want = expected_sha256.strip().lower()
+            if actual != want:
+                raise ValueError(
+                    f"SHA-256 mismatch for {source}: expected {want}, got {actual}"
+                )
+    finally:
+        if raw_fh is not None:
+            try:
+                raw_fh.close()
+            except Exception:
+                pass
 
 
 def build_catalog(
     db_path: Path | str | None = None,
     *,
-    basics_source: str | Path = BASICS_URL,
-    ratings_source: str | Path = RATINGS_URL,
+    basics_source: str | Path | None = None,
+    ratings_source: str | Path | None = None,
+    basics_sha256: str | None = None,
+    ratings_sha256: str | None = None,
     min_movie_votes: int = DEFAULT_MIN_MOVIE_VOTES,
     min_tv_votes: int = DEFAULT_MIN_TV_VOTES,
     timeout: int = DOWNLOAD_TIMEOUT,
@@ -496,8 +570,18 @@ def build_catalog(
 ) -> dict:
     """Download/read IMDb datasets and build the local SQLite catalog atomically.
 
+    Strictly opt-in: only runs when explicitly invoked by the user. Sources and
+    optional SHA-256 digests can also be supplied via ``MEDIAORG_BASICS_SOURCE``,
+    ``MEDIAORG_RATINGS_SOURCE``, ``MEDIAORG_BASICS_SHA256``, and
+    ``MEDIAORG_RATINGS_SHA256``.
+
     Returns a stats dict ``{'path', 'movie_count', 'tv_count', 'total', 'size_mb'}``.
     """
+    basics_src = basics_source or os.environ.get("MEDIAORG_BASICS_SOURCE") or BASICS_URL
+    ratings_src = ratings_source or os.environ.get("MEDIAORG_RATINGS_SOURCE") or RATINGS_URL
+    b_sha = basics_sha256 or os.environ.get("MEDIAORG_BASICS_SHA256") or None
+    r_sha = ratings_sha256 or os.environ.get("MEDIAORG_RATINGS_SHA256") or None
+
     target = Path(db_path) if db_path is not None else catalog_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp_prefix = target.name if target.name.startswith(".") else f".{target.name}"
@@ -511,7 +595,7 @@ def build_catalog(
     _log(f"Reading title ratings (min votes: movies={min_movie_votes}, TV={min_tv_votes})...")
     votes_by_id: dict[str, int] = {}
     first = True
-    for line in _open_tsv_lines(ratings_source, timeout=timeout):
+    for line in _open_tsv_lines(ratings_src, timeout=timeout, expected_sha256=r_sha):
         if first:
             first = False
             continue
@@ -563,11 +647,9 @@ def build_catalog(
         )
 
         batch: list[tuple[str, str, int, str, int]] = []
-        movie_count = 0
-        tv_count = 0
         first = True
 
-        for line in _open_tsv_lines(basics_source, timeout=timeout):
+        for line in _open_tsv_lines(basics_src, timeout=timeout, expected_sha256=b_sha):
             if first:
                 first = False
                 continue
@@ -597,11 +679,6 @@ def build_catalog(
             if not norm_primary:
                 continue
 
-            if kind == "movie":
-                movie_count += 1
-            else:
-                tv_count += 1
-
             batch.append((norm_primary, kind, year_val, primary_title, num_votes))
             if original_title and original_title != r"\N":
                 norm_orig = normalize_title(original_title)
@@ -615,6 +692,17 @@ def build_catalog(
         if batch:
             conn.executemany(upsert_sql, batch)
             batch.clear()
+
+        counts = dict(
+            conn.execute("SELECT kind, COUNT(*) FROM titles GROUP BY kind").fetchall()
+        )
+        movie_count = int(counts.get("movie", 0))
+        tv_count = int(counts.get("tv", 0))
+        if movie_count + tv_count == 0:
+            raise RuntimeError(
+                "IMDb datasets produced 0 qualifying catalog entries; "
+                "keeping existing catalog"
+            )
 
         built_at = time.time()
         conn.executemany(
