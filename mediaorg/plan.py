@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .parse import (COMPANION_EXTS, VIDEO_EXTS, ParsedName, is_junk_dir,
-                    is_junk_name, is_media_file)
+                    is_junk_name, is_media_file, parse_name)
 
 
 # --- Unicode / filesystem helpers -------------------------------------------
@@ -116,8 +116,11 @@ _SE_CORE = r'[Ss](\d{1,4})[Ee](\d{1,3})(?!\d)'
 # SxxEyy (group 1=season) or bare NxN like "1x2"/"9x9" (groups 2, 3).
 EPISODE_PATTERN = re.compile(
     r'(?:[Ss](\d{1,4})[Ee]\d{1,3}(?!\d)|(?<!\d)(\d{1,2})[xX](\d{1,2})(?!\d))')
-# Pure season folders: "Season 1", "S01", "Season 1 (2024)".
-SEASON_FOLDER_PATTERN = re.compile(r'^(?:season\s*|s)(\d{1,4})(?:\s*\(\d{4}\))?$', re.IGNORECASE)
+# Pure season folders: "Season 1", "Season.01", "Series 1", "S01", "Season 1 (2024)".
+SEASON_FOLDER_PATTERN = re.compile(
+    r'^(?:(?:season|series|saison|staffel)[\s._-]*|s)(\d{1,4})(?:\s*\(\d{4}\))?$',
+    re.IGNORECASE,
+)
 # Already-normalized names the organizer must leave untouched (incl. the
 # year-tagged form the rename scheme produces). Zero-padding is deliberately
 # NOT canonical: accepting "Season 01" here left organize skipping it while
@@ -314,22 +317,55 @@ def find_show_roots(library_root: Path,
     return collect(library_root, 1)
 
 
+def _companion_matches_stem(comp_stem: str, video_stem: str) -> bool:
+    """True when `comp_stem` equals `video_stem` or extends it at a boundary."""
+    if not comp_stem.startswith(video_stem):
+        return False
+    if len(comp_stem) == len(video_stem):
+        return True
+    return comp_stem[len(video_stem)] in ('.', '-', '_', ' ', '[', '(')
+
+
 def companion_files(video: Path) -> list[Path]:
     """Non-video files next to `video` sharing its stem (subs, nfo, art)."""
     out = []
+    norm_video_stem = norm(video.stem)
     try:
-        for entry in os.scandir(video.parent):
-            if not entry.is_file(follow_symlinks=False):
-                continue
-            p = Path(entry.path)
-            if p == video:
-                continue
-            if (p.suffix.lower() in COMPANION_EXTS
-                    and not is_junk_name(p.name)
-                    and norm(p.name).startswith(norm(video.stem))):
-                out.append(p)
+        entries = list(os.scandir(video.parent))
     except OSError:
-        pass
+        return out
+
+    file_entries = []
+    for entry in entries:
+        try:
+            if entry.is_file(follow_symlinks=False):
+                file_entries.append(entry)
+        except OSError:
+            continue
+
+    # Sibling video stems so e.g. "Movie.2020.mkv" does not steal
+    # "Movie.2020.Extended.srt" from "Movie.2020.Extended.mkv". Built from
+    # `entries` by name so a transient stat failure on a sibling video does
+    # not hide it from the longest-stem specificity check.
+    other_video_stems = [
+        norm(Path(e.name).stem) for e in entries
+        if Path(e.path) != video and is_media_file(e.name)
+    ]
+
+    for entry in file_entries:
+        p = Path(entry.path)
+        if p == video:
+            continue
+        if (p.suffix.lower() in COMPANION_EXTS
+                and not is_junk_name(p.name)):
+            norm_comp_stem = norm(p.stem)
+            if not _companion_matches_stem(norm_comp_stem, norm_video_stem):
+                continue
+            if any(len(s) > len(norm_video_stem)
+                   and _companion_matches_stem(norm_comp_stem, s)
+                   for s in other_video_stems):
+                continue
+            out.append(p)
     return sorted(out)
 
 
@@ -360,11 +396,17 @@ def check_collisions(ops: list[Op], *,
     plan = Plan()
     limit = max_path_length()
     by_dst: dict[str, list[Op]] = {}
+    by_src: dict[str, list[Op]] = {}
     for op in ops:
         by_dst.setdefault(_collision_key(op.dst), []).append(op)
+        if op.kind == "move" and op.src:
+            by_src.setdefault(_collision_key(op.src), []).append(op)
 
     for op in ops:
         if op.kind == "move":
+            if op.src and len(by_src[_collision_key(op.src)]) > 1:
+                plan.skipped.append((op, "conflict: multiple targets for same source"))
+                continue
             group = by_dst[_collision_key(op.dst)]
             if sum(1 for o in group if o.kind == "move") > 1:
                 plan.skipped.append((op, "conflict: multiple sources map to same target"))
@@ -374,7 +416,7 @@ def check_collisions(ops: list[Op], *,
                     op, f"destination path is {len(str(op.dst))} characters, "
                         f"over this system's {limit} limit"))
                 continue
-            if op.dst.exists():
+            if os.path.lexists(op.dst):
                 # samefile() is also true for hardlinks, so it must not be
                 # used on its own to wave a move through: doing so sent a
                 # hardlink pair down the two-step rename path and destroyed
@@ -600,7 +642,21 @@ def plan_season_structure(show_path: Path) -> Plan:
             return None
         snum = _season_of(filename)
         if snum is None:
-            snum = _season_of(containing.name)
+            # Walk up ancestor folders inside the show (e.g.
+            # Season 1/Show.S01E01/Subs/eng.srt -> Show.S01E01 declares S01).
+            cur = containing
+            is_video = Path(filename).suffix.lower() in VIDEO_EXTS
+            while cur != show_path:
+                snum = _season_of(cur.name)
+                if snum is None and is_video:
+                    sm = SEASON_FOLDER_PATTERN.match(cur.name.strip())
+                    if sm:
+                        snum = int(sm.group(1))
+                if snum is not None:
+                    break
+                if show_path not in cur.parents:
+                    break
+                cur = cur.parent
         return None if snum is None else show_path / canonical(snum)
 
     # 1. Merge duplicate season folders into the canonical one FIRST — so
@@ -666,8 +722,7 @@ def plan_season_structure(show_path: Path) -> Plan:
         target = show_path / canonical(snum)
         for ep_folder in sorted(ep_folders):
             ep_path = show_path / ep_folder
-            lifted = _lift_media(ep_path, lambda _n, _d, t=target: t,
-                                 include_root=True)
+            lifted = _lift_media(ep_path, place, include_root=True)
             if any(o.kind == "move" for o in lifted):
                 ops.extend(lifted)
             else:
@@ -718,29 +773,137 @@ def plan_season_structure(show_path: Path) -> Plan:
 
 # --- Loose movie files planner ----------------------------------------------
 
+_MOVIE_SUPPORT_DIRS = re.compile(
+    r'^(?:subs?|subtitles|samples?|artwork|screens?|proof|extrafanart'
+    r'|extrathumbs|fanart|posters?|making[ ._-]?of'
+    r'|bonus[ ._-]?features?|bonus[ ._-]?materials?|other|scenes?|shorts?'
+    r'|commentar(?:y|ies)|bloopers?|outtakes?|promos?|teasers?|previews?'
+    r'|bdmv|video_ts|audio_ts)$',
+    re.IGNORECASE,
+)
+_SUPPORT_VIDEO_NAME = re.compile(
+    r'^(?:sample[.\s_-]+|interview[.\s_-]+with[.\s_-]+(?:the[.\s_-]+)?(?:cast|crew|director|producer|writer|filmmaker|composer|editor|creator|author|star)s?\b)'
+    r'|(?:^|[.\s_-])(?:samples?|trailers?|teasers?|featurettes?|bonus'
+    r'|previews?|proof|interviews?'
+    r'|deleted[ ._-]?scenes?|behind[ ._-]?the[ ._-]?scenes?)'
+    r'(?:[.\s_-]?\d{1,2})?'
+    r'(?:[.\s_-]+(?:\d{1,2}|(?:480|576|720|1080|2160)[pi]|4k|uhd|hd|sdr'
+    r'|hdr(?:10\+?)?|dv|bluray|bdrip|brrip|web(?:[ ._-]?dl|rip)?|hdtv|dvdrip'
+    r'|remux|[xh]26[45]|hevc|avc|av1|xvid|aac|ac3|eac3|dts|truehd|atmos'
+    r'|10bit|proper|repack))*$',
+    re.IGNORECASE,
+)
+
+
+def _dir_has_video(directory: Path,
+                   max_depth: int = SHOW_SEARCH_MAX_DEPTH) -> bool:
+    walk_errors: list[OSError] = []
+    for dirpath, dirnames, filenames in os.walk(
+            directory, onerror=walk_errors.append):
+        if any(is_media_file(f) for f in filenames):
+            return True
+        rel_parts = Path(dirpath).relative_to(directory).parts
+        if len(rel_parts) >= max_depth:
+            dirnames[:] = []
+        else:
+            dirnames[:] = [d for d in dirnames if not is_junk_dir(d)]
+    return False
+
+
+def _is_movie_wrapper_dir(directory: Path, child_dirs: list[Path],
+                          loose_videos: list[Path]) -> bool:
+    """True when `directory` is a genre/collection bucket rather than one movie's folder.
+
+    A single loose video inside a subfolder looks identical on disk to
+    ``Movies/Movie Name/file.mkv``, so a subfolder only qualifies as a wrapper
+    when it contains non-extras child directories that hold media or 2+
+    distinct feature movie titles (excluding sample/trailer clips).
+    """
+    if not loose_videos:
+        return False
+    feature_videos = [
+        v for v in loose_videos if not _SUPPORT_VIDEO_NAME.search(v.stem)
+    ]
+    parsed = [parse_name(v.name, kind_hint="movie") for v in feature_videos]
+    titles = {norm(p.title).casefold() for p in parsed}
+    titles.discard('')
+    years = {p.year for p in parsed if p.year}
+    dated_titles = {norm(p.title).casefold() for p in parsed if p.year}
+    dated_titles.discard('')
+    dir_title = norm(parse_name(directory.name, kind_hint="movie").title).casefold()
+    if dir_title and dir_title in titles and len(years) <= 1 and len(dated_titles) <= 1:
+        return False
+    if len(titles) >= 2:
+        return True
+    real_subdirs = [
+        d for d in child_dirs
+        if not SPECIALS_FOLDER_PATTERN.match(d.name.strip())
+        and not _MOVIE_SUPPORT_DIRS.match(d.name.strip())
+        and _dir_has_video(d)
+    ]
+    return bool(real_subdirs)
+
+
 def plan_loose_movies(movies_root: Path) -> Plan:
-    """Plan moving loose video files in the movies root into own folders."""
+    """Plan moving loose video files in `movies_root` (and wrapper subfolders) into own folders."""
     movies_root = Path(movies_root)
     ops: list[Op] = []
-    try:
-        entries = sorted(os.scandir(movies_root), key=lambda e: e.name)
-    except OSError:
-        return Plan()
-    for entry in entries:
-        if not entry.is_file(follow_symlinks=False):
-            continue
-        p = Path(entry.path)
-        if not is_media_file(p.name):
-            continue
-        folder = movies_root / p.stem
-        if not p.stem or '..' in p.stem or '/' in p.stem or '\\' in p.stem:
-            continue  # reject empty or path-traversal stems
-        if not folder.exists():
-            ops.append(Op("mkdir", None, folder))
-        ops.append(Op("move", p, folder / p.name))
-        for comp in companion_files(p):
-            ops.append(Op("move", comp, folder / comp.name))
-    return check_collisions(ops)
+    pre_skipped: list[tuple[Op, str]] = []
+    claimed_companions: set[Path] = set()
+
+    def scan_dir(directory: Path, depth: int) -> None:
+        try:
+            entries = sorted(os.scandir(directory), key=lambda e: e.name)
+        except OSError:
+            return
+
+        child_dirs: list[Path] = []
+        loose_videos: list[Path] = []
+        for e in entries:
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    if not is_junk_dir(e.name):
+                        child_dirs.append(Path(e.path))
+                elif e.is_file(follow_symlinks=False) and is_media_file(e.name):
+                    loose_videos.append(Path(e.path))
+            except OSError:
+                continue
+
+        should_wrap = (
+            depth == 0
+            or _is_movie_wrapper_dir(directory, child_dirs, loose_videos)
+        )
+        if should_wrap:
+            for p in loose_videos:
+                if not p.stem or p.stem in ('.', '..') or '/' in p.stem or '\\' in p.stem:
+                    continue  # reject empty or path-traversal stems
+                folder = directory / p.stem
+                if os.path.lexists(folder) and not folder.is_dir():
+                    pre_skipped.append(
+                        (Op("move", p, folder / p.name),
+                         f"conflict: destination parent is an existing file: {folder}")
+                    )
+                    continue
+                if not folder.exists():
+                    ops.append(Op("mkdir", None, folder))
+                ops.append(Op("move", p, folder / p.name))
+                for comp in companion_files(p):
+                    if comp not in claimed_companions:
+                        claimed_companions.add(comp)
+                        ops.append(Op("move", comp, folder / comp.name))
+
+        if depth < SHOW_SEARCH_MAX_DEPTH:
+            for sub in child_dirs:
+                if (SPECIALS_FOLDER_PATTERN.match(sub.name.strip())
+                        or _MOVIE_SUPPORT_DIRS.match(sub.name.strip())):
+                    continue
+                scan_dir(sub, depth + 1)
+
+    scan_dir(movies_root, 0)
+    plan = check_collisions(ops)
+    if pre_skipped:
+        plan.skipped = pre_skipped + plan.skipped
+    return plan
 
 
 # --- Naming scheme & name builders ------------------------------------------

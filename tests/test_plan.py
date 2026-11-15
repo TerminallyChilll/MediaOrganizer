@@ -744,3 +744,277 @@ def test_duplicate_season_rmdir_still_happens_when_it_does_empty(tmp_path):
     apply_plan(plan)
     assert not (tmp_path / "S02").exists()
     assert (tmp_path / "Season 2" / "Show.S02E02.mkv").exists()
+
+
+def test_series_and_dotted_season_folders_are_normalized(tmp_path):
+    show = tmp_path / "Show"
+    touch(show / "Series 1" / "Show.S01E01.mkv")
+    touch(show / "Season.02" / "Show.S02E01.mkv")
+
+    assert find_show_roots(tmp_path) == [show]
+    plan = plan_season_structure(show)
+    apply_plan(plan)
+    assert (show / "Season 1" / "Show.S01E01.mkv").exists()
+    assert (show / "Season 2" / "Show.S02E01.mkv").exists()
+
+
+def test_step3_keeps_extras_and_cross_season_routing_and_ancestor_season(tmp_path):
+    """Cross-season stray folders route via place(), Extras stay untouched, and
+    videos without SxxEyy nested inside Season N inherit Season N."""
+    touch(tmp_path / "Season 1" / "Ep01Dir" / "pilot.mkv")
+    touch(tmp_path / "Show.S01E01.Dir" / "Show.S02E01.mkv")
+    touch(tmp_path / "Extras" / "behind_the_scenes.mkv")
+
+    plan = plan_season_structure(tmp_path)
+    apply_plan(plan)
+    assert (tmp_path / "Season 1" / "pilot.mkv").exists()
+    assert (tmp_path / "Season 2" / "Show.S02E01.mkv").exists()
+    assert (tmp_path / "Extras" / "behind_the_scenes.mkv").exists()
+
+
+def test_check_collisions_flags_duplicate_src_and_broken_symlink(tmp_path):
+    from mediaorg.plan import Op, check_collisions
+
+    src = touch(tmp_path / "a.mkv")
+    d1 = tmp_path / "d1.mkv"
+    d2 = tmp_path / "d2.mkv"
+    plan1 = check_collisions([Op("move", src, d1), Op("move", src, d2)])
+    assert plan1.ops == []
+    assert len(plan1.skipped) == 2
+
+    src2 = touch(tmp_path / "b.mkv")
+    broken_dst = tmp_path / "broken.mkv"
+    broken_dst.symlink_to(tmp_path / "nonexistent_target.mkv")
+    plan2 = check_collisions([Op("move", src2, broken_dst)])
+    assert plan2.ops == []
+    assert len(plan2.skipped) == 1
+
+
+def test_plan_loose_movies_handles_dots_nested_wrappers_without_double_wrapping(tmp_path):
+    from mediaorg.plan import plan_loose_movies
+
+    touch(tmp_path / "A..B.2020.mkv")
+    touch(tmp_path / "Action" / "First.Film.2020.mkv")
+    touch(tmp_path / "Action" / "Second.Film.2021.mkv")
+    touch(tmp_path / "MultiPart (2022)" / "MultiPart.CD1.mkv")
+    touch(tmp_path / "MultiPart (2022)" / "MultiPart.CD2.mkv")
+
+    plan = plan_loose_movies(tmp_path)
+    apply_plan(plan)
+
+    assert (tmp_path / "A..B.2020" / "A..B.2020.mkv").exists()
+    assert (tmp_path / "Action" / "First.Film.2020" / "First.Film.2020.mkv").exists()
+    assert (tmp_path / "Action" / "Second.Film.2021" / "Second.Film.2021.mkv").exists()
+    # Single-title multi-part movie folder must NOT be double-wrapped.
+    assert (tmp_path / "MultiPart (2022)" / "MultiPart.CD1.mkv").exists()
+    assert (tmp_path / "MultiPart (2022)" / "MultiPart.CD2.mkv").exists()
+
+
+def test_extfix_rejects_m4a_heic_ico_and_same_extension_case(tmp_path):
+    from mediaorg.extfix import detect_extension, plan_extension_convert
+
+    m4a = tmp_path / "audio"
+    m4a.write_bytes(b"\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00")
+    assert detect_extension(m4a) is None
+
+    heic = tmp_path / "photo"
+    heic.write_bytes(b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00")
+    assert detect_extension(heic) is None
+
+    ico = tmp_path / "favicon"
+    ico.write_bytes(b"\x00\x00\x01\x00\x01\x00\x10\x10")
+    assert detect_extension(ico) is None
+
+    vid = tmp_path / "Movie.mkv"
+    vid.write_bytes(b"\x1a\x45\xdf\xa3" + b"\x00" * 32)
+    assert plan_extension_convert(tmp_path, ".mkv", ".mkv").ops == []
+    vid_upper = tmp_path / "Upper.MKV"
+    vid_upper.write_bytes(b"\x1a\x45\xdf\xa3" + b"\x00" * 32)
+    assert [o.dst.name for o in plan_extension_convert(tmp_path, ".mkv", ".mkv").ops] == ["Upper.mkv"]
+
+
+def test_loose_movies_ignores_artwork_subdirs_and_sample_clips(tmp_path):
+    from mediaorg.plan import plan_loose_movies
+
+    movie_dir = tmp_path / "Movie (2020)"
+    touch(movie_dir / "Movie.2020.mkv")
+    touch(movie_dir / "sample.mkv")
+    touch(movie_dir / "Artwork" / "poster.jpg")
+    touch(movie_dir / "CustomThumbs" / "thumb.png")
+
+    plan = plan_loose_movies(tmp_path)
+    assert plan.ops == []
+
+
+def test_companion_files_tolerates_flaky_entry_oserror(tmp_path, monkeypatch):
+    from mediaorg.plan import companion_files
+
+    vid = touch(tmp_path / "Film.2020.mkv")
+    sub = touch(tmp_path / "Film.2020.en.srt")
+    touch(tmp_path / "Film.2020.Extended.mkv")
+    touch(tmp_path / "Film.2020.Extended.en.srt")
+    real_scandir = os.scandir
+
+    class FlakyEntry:
+        def __init__(self, real):
+            self._real = real
+            self.name = real.name
+            self.path = real.path
+
+        def is_file(self, follow_symlinks=False):
+            if self.name in ("stale.srt", "Film.2020.Extended.mkv"):
+                raise OSError(116, "Stale file handle")
+            return self._real.is_file(follow_symlinks=follow_symlinks)
+
+    touch(tmp_path / "stale.srt")
+
+    def flaky_scandir(path=".", *args, **kwargs):
+        entries = list(real_scandir(path, *args, **kwargs))
+        return [FlakyEntry(e) for e in entries]
+
+    monkeypatch.setattr(os, "scandir", flaky_scandir)
+    assert companion_files(vid) == [sub]
+
+
+def test_loose_movies_wraps_titles_containing_support_words(tmp_path):
+    from mediaorg.plan import plan_loose_movies
+
+    bucket = tmp_path / "Comedy"
+    touch(bucket / "The.Interview.2014.mkv")
+    touch(bucket / "Proof.2005.mkv")
+    touch(bucket / "Trailer.Park.Boys.1080p.mkv")
+
+    drama = tmp_path / "Drama"
+    touch(drama / "Interview.with.the.Vampire.1994.1080p.mkv")
+    touch(drama / "Heat.1995.1080p.mkv")
+
+    alien = tmp_path / "Alien"
+    touch(alien / "Alien.1979.mkv")
+    touch(alien / "Aliens.1986.mkv")
+
+    # Same year on purpose: only a shared year makes the len(dated_titles)
+    # guard decide the outcome, so keep both films at 1995.
+    same_year = tmp_path / "Heat"
+    touch(same_year / "Heat.1995.mkv")
+    touch(same_year / "Collateral.1995.mkv")
+
+    single = tmp_path / "SingleFilm (2020)"
+    touch(single / "SingleFilm.2020.mkv")
+    touch(single / "Interview with the Cast.mkv")
+
+    plan = plan_loose_movies(tmp_path)
+    apply_plan(plan)
+
+    assert (bucket / "The.Interview.2014" / "The.Interview.2014.mkv").exists()
+    assert (bucket / "Proof.2005" / "Proof.2005.mkv").exists()
+    assert (bucket / "Trailer.Park.Boys.1080p" / "Trailer.Park.Boys.1080p.mkv").exists()
+    assert (drama / "Interview.with.the.Vampire.1994.1080p" / "Interview.with.the.Vampire.1994.1080p.mkv").exists()
+    assert (drama / "Heat.1995.1080p" / "Heat.1995.1080p.mkv").exists()
+    assert (alien / "Alien.1979" / "Alien.1979.mkv").exists()
+    assert (alien / "Aliens.1986" / "Aliens.1986.mkv").exists()
+    assert (same_year / "Heat.1995" / "Heat.1995.mkv").exists()
+    assert (same_year / "Collateral.1995" / "Collateral.1995.mkv").exists()
+    assert (single / "SingleFilm.2020.mkv").exists()
+    assert (single / "Interview with the Cast.mkv").exists()
+
+
+def test_is_movie_wrapper_dir_short_circuits_and_dir_has_video_bounds_and_oserror(tmp_path, monkeypatch):
+    from mediaorg import plan as plan_mod
+
+    sub = tmp_path / "Sub"
+    sub.mkdir()
+    monkeypatch.setattr(plan_mod, "_dir_has_video",
+                        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should not walk")))
+    assert plan_mod._is_movie_wrapper_dir(tmp_path, [sub], []) is False
+    monkeypatch.undo()
+
+    deep = tmp_path / "d0" / "d1" / "d2"
+    touch(deep / "film.mkv")
+    assert plan_mod._dir_has_video(tmp_path / "d0", max_depth=1) is False
+    assert plan_mod._dir_has_video(tmp_path / "d0", max_depth=2) is True
+
+    def broken_walk(directory, onerror=None, **kwargs):
+        if onerror is not None:
+            onerror(OSError(13, "Permission denied"))
+        return iter(())
+
+    monkeypatch.setattr(os, "walk", broken_walk)
+    assert plan_mod._dir_has_video(tmp_path / "d0") is False
+
+
+def test_support_video_name_and_movie_wrapper_support_dirs_and_single_title(tmp_path):
+    from mediaorg import plan as plan_mod
+    from mediaorg.plan import plan_loose_movies
+
+    # 1 & 2: Support clips with preview/proof/interview, prefix sample/interview with,
+    # and chained trailing quality/codec/source tags match _SUPPORT_VIDEO_NAME.
+    for clip in (
+        "interview",
+        "Interview with the Cast",
+        "Interview.with.the.Producer",
+        "Interview.with.the.Writer",
+        "Interview.with.the.Filmmakers",
+        "Interview.with.the.Stars",
+        "sample-Dune.2021.1080p.BluRay.x264-GRP",
+        "Dune.2021.sample.1080p.HDR",
+        "Dune.2021.Trailer.1080p.x264",
+        "Dune.2021.sample.HDTV.x264",
+        "Dune.2021.preview.720p",
+        "Dune.2021.proof",
+    ):
+        assert plan_mod._SUPPORT_VIDEO_NAME.search(clip), clip
+
+    for feature in (
+        "The.Interview.2014",
+        "Proof.2005",
+        "Trailer.Park.Boys.1080p",
+    ):
+        assert not plan_mod._SUPPORT_VIDEO_NAME.search(feature), feature
+
+    # 3a & 3b: Movie folder with support clips, Bonus Features/Other/Scenes/Commentary
+    # subdirs, or even an arbitrary custom subdir when directory.name matches the single
+    # movie title, must NOT be treated as a wrapper bucket.
+    movie_dir = tmp_path / "Dune (2021)"
+    touch(movie_dir / "Dune.2021.1080p.mkv")
+    touch(movie_dir / "interview.mkv")
+    touch(movie_dir / "Interview with the Cast.mkv")
+    touch(movie_dir / "Interview.with.the.Producer.mkv")
+    touch(movie_dir / "UnrecognizedExtraClip.mkv")
+    touch(movie_dir / "sample-Dune.2021.1080p.BluRay.x264-GRP.mkv")
+    touch(movie_dir / "Dune.2021.sample.1080p.HDR.mkv")
+    touch(movie_dir / "Bonus Features" / "making_of.mkv")
+    touch(movie_dir / "Other" / "clip.mkv")
+    touch(movie_dir / "Scenes" / "scene1.mkv")
+    touch(movie_dir / "Commentary" / "comm.mkv")
+    touch(movie_dir / "UnlistedSubdir" / "extra.mkv")
+
+    # Even a differently-named folder with only Bonus Features/Other/Scenes/Commentary
+    # and a single feature movie is not a wrapper bucket because those subdirs are in
+    # _MOVIE_SUPPORT_DIRS.
+    alt_dir = tmp_path / "ReleaseFolder"
+    touch(alt_dir / "Arrival.2016.1080p.mkv")
+    touch(alt_dir / "Bonus Features" / "bonus.mkv")
+    touch(alt_dir / "Scenes" / "deleted.mkv")
+
+    plan = plan_loose_movies(tmp_path)
+    assert plan.ops == []
+
+
+def test_dir_has_video_continues_past_unreadable_sibling_subdir(tmp_path, monkeypatch):
+    from mediaorg import plan as plan_mod
+
+    root = tmp_path / "parent"
+    bad = root / "a_unreadable"
+    good = root / "b_readable"
+    bad.mkdir(parents=True)
+    touch(good / "movie.mkv")
+
+    real_scandir = os.scandir
+
+    def partial_scandir(path=".", *args, **kwargs):
+        if os.fspath(path) == os.fspath(bad):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", partial_scandir)
+    assert plan_mod._dir_has_video(root) is True

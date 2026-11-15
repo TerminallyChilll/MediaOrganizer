@@ -581,7 +581,8 @@ def _review_items(items: list[_ReviewItem], crossing: set, label: str,
 def confirm_and_execute(plan: Plan, journal: Path, dry_run: bool = False,
                         label: str = "changes", *, roots=None,
                         session: str | None = None,
-                        accept_gate: bool = True) -> list:
+                        accept_gate: bool = True,
+                        assume_yes: bool = False) -> list:
     """Preview a plan, review it, execute, then ask to keep or put it back.
 
     `accept_gate` False skips only the last question, never the review: the
@@ -593,7 +594,7 @@ def confirm_and_execute(plan: Plan, journal: Path, dry_run: bool = False,
     applied and the undo command is given. Interactively, nothing is ever
     applied that has not been listed on screen first.
     """
-    interactive = _stdin_is_interactive()
+    interactive = _stdin_is_interactive() and not assume_yes
     if not plan.ops:
         print(f"\n[OK] Nothing to do ({label}).")
         for op, reason in plan.skipped:
@@ -624,7 +625,9 @@ def confirm_and_execute(plan: Plan, journal: Path, dry_run: bool = False,
     else:
         # Unattended: still show every change, since the log is the only record
         # anyone will read afterwards.
-        print("(stdin is not a terminal - applying without prompting.)")
+        print("(stdin is not a terminal - applying without prompting.)"
+              if not _stdin_is_interactive()
+              else "(--yes: applying without prompting.)")
         for op in plan.ops:
             print(f"  {op.kind.upper():6} {op.src if op.src else ''}  ->  "
                   f"{op.dst}")
@@ -833,7 +836,8 @@ def _journal_path() -> Path:
 
 def run_organize(tv_path: str, dry_run: bool = False, *,
                  session: str | None = None,
-                 accept_gate: bool = True) -> None:
+                 accept_gate: bool = True,
+                 assume_yes: bool = False) -> None:
     root = Path(tv_path)
     show_roots = find_show_roots(root)
     if not show_roots:
@@ -856,12 +860,13 @@ def run_organize(tv_path: str, dry_run: bool = False, *,
           "is used.)")
     confirm_and_execute(plan, _journal_path(), dry_run, "TV structure changes",
                         roots=[root], session=session,
-                        accept_gate=accept_gate)
+                        accept_gate=accept_gate, assume_yes=assume_yes)
 
 
 def run_organize_movies(movies_path: str, dry_run: bool = False, *,
                         session: str | None = None,
-                        accept_gate: bool = True) -> None:
+                        accept_gate: bool = True,
+                        assume_yes: bool = False) -> None:
     """Give each loose movie file in the movies root its own folder.
 
     Only reachable from `--action full` before now, so anyone using the menu
@@ -880,7 +885,7 @@ def run_organize_movies(movies_path: str, dry_run: bool = False, *,
     print(f"\n   [OK] {movies} loose movie file(s) to give a folder of their own.")
     confirm_and_execute(plan, _journal_path(), dry_run, "loose-file moves",
                         roots=[root], session=session,
-                        accept_gate=accept_gate)
+                        accept_gate=accept_gate, assume_yes=assume_yes)
 
 
 def _warn_loose_movies(movies_path) -> None:
@@ -951,7 +956,9 @@ def _clean_season(val) -> str:
     return '' if val is None else str(val).strip()
 
 
-def run_scan(movies_path, tv_path, excel_path: Path, dry_run: bool = False) -> None:
+def run_scan(movies_path, tv_path, excel_path: Path, dry_run: bool = False, *,
+             overwrite_excel: bool | None = None,
+             assume_yes: bool = False) -> tuple[list[dict], list[dict]]:
     patterns = load_custom_patterns()
     # Loose movie moves are part of organize, not scan. Scan is read-only.
     # The --action full flow handles loose movies in run_organize/run_rename.
@@ -961,15 +968,25 @@ def run_scan(movies_path, tv_path, excel_path: Path, dry_run: bool = False) -> N
 
     # ── recursive supplement: the structured scanners only look one level
     # deep, so deeply nested media (e.g. "Collection/Movie/file.mkv") is
-    # missed.  Run the recursive walk whenever the structured scan produced
-    # any placeholder rows (no actual media) or found nothing at all, and
-    # merge the results — structured rows with media take priority.
+    # missed. Only descend recursively into folders that actually came up
+    # empty, matching the TV side below.
     if movies_path:
-        movies_has_gaps = (not movies_rows
-                           or any(not r.get('Video Files') for r in movies_rows))
+        gap_folders = {r['Folder Name'] for r in movies_rows
+                       if not r.get('Video Files')}
+        movies_has_gaps = bool(not movies_rows or gap_folders)
         if movies_has_gaps:
-            print("   [!] Structured scan has gaps — running recursive walk for Movies...")
-            rec = scan.scan_recursive(Path(movies_path), patterns)
+            if not movies_rows:
+                print("   [!] Structured scan has gaps — running recursive walk for Movies...")
+                rec = scan.scan_recursive(Path(movies_path), patterns)
+            else:
+                print(f"   [!] {len(gap_folders)} movie folder(s) had no detectable "
+                      f"video — running recursive walk for those...")
+                rec = []
+                for gf in sorted(gap_folders):
+                    sub = (Path(movies_path) / gf
+                           if gf != '.' else Path(movies_path))
+                    rec.extend(scan.scan_recursive(sub, patterns,
+                                                   base=Path(movies_path)))
             if rec:
                 structured = {r['Folder Name']: r for r in movies_rows
                               if r.get('Video Files')}
@@ -979,12 +996,16 @@ def run_scan(movies_path, tv_path, excel_path: Path, dry_run: bool = False) -> N
                 # Placeholder rows for containers that now have recursive
                 # descendants must go — otherwise plan_renames renames the
                 # parent before the child ops and strands their paths.
-                # Root-level rows ('.') have no parts and cover no placeholder.
-                covered = {Path(rr['Folder Name']).parts[0] for rr in added_rows
+                covered = {Path(rr['Folder Name']) for rr in added_rows
                            if rr['Folder Name'] != '.'}
+
+                def _movie_covered(folder: str) -> bool:
+                    here = Path(folder)
+                    return any(c == here or here in c.parents for c in covered)
+
                 movies_rows[:] = [r for r in movies_rows
                                   if r.get('Video Files')
-                                  or r['Folder Name'] not in covered]
+                                  or not _movie_covered(r['Folder Name'])]
                 print(f"   [OK] Recursive scan added {len(added_rows)} folder(s) "
                       f"(total {len(movies_rows)}).")
             elif not movies_rows:
@@ -1044,27 +1065,36 @@ def run_scan(movies_path, tv_path, excel_path: Path, dry_run: bool = False) -> N
     if not movies_rows and not tv_rows:
         print("[!] Nothing found to scan — not even with recursive walk.")
         print("    Check that the path contains video files and is accessible.")
-        return
+        return [], []
 
     _report_misfiled(movies_rows, tv_rows, patterns)
 
     if dry_run:
         print(f"\n[dry-run] Would save {len(movies_rows)} movie row(s), {len(tv_rows)} TV row(s) "
               f"to {excel_path}")
-        return
+        return movies_rows, tv_rows
 
     append = False
     if excel_path.exists():
-        append = ask_yes_no(f"'{excel_path.name}' exists. Append to it? "
-                            f"(no = overwrite)", default=True)
+        if overwrite_excel is not None:
+            append = not overwrite_excel
+        elif assume_yes or not _stdin_is_interactive():
+            # Prompt defaults to append=True; unattended runs must not truncate
+            # existing sheets or discard hand-edited '... Fixed' columns.
+            append = True
+            print(f"   [i] '{excel_path.name}' exists — appending scan results.")
+        else:
+            append = ask_yes_no(f"'{excel_path.name}' exists. Append to it? "
+                                f"(no = overwrite)", default=True)
     try:
         excel.write_library(excel_path, movies_rows, tv_rows,
                             movies_path, tv_path, append=append)
     except PermissionError:
         print(f"[!] Cannot write '{excel_path.name}' - close it in other programs first.")
-        return
+        return movies_rows, tv_rows
     print(f"[OK] Saved {len(movies_rows)} movie row(s), {len(tv_rows)} TV row(s) "
           f"to {excel_path}")
+    return movies_rows, tv_rows
 
 
 def _ask_scheme(config: dict) -> NamingScheme:
@@ -1086,8 +1116,7 @@ def _ask_scheme(config: dict) -> NamingScheme:
     return scheme
 
 
-def _llm_candidates(df_movies, df_tv, patterns) -> list[str]:
-    """Names guessit couldn't confidently parse (source == 'raw')."""
+def _all_candidate_names(df_movies, df_tv) -> list[str]:
     names = []
     if df_movies is not None:
         names += [str(v) for v in df_movies['Folder Name'].dropna()]
@@ -1097,7 +1126,12 @@ def _llm_candidates(df_movies, df_tv, patterns) -> list[str]:
     if df_tv is not None:
         names += [str(v) for v in df_tv['Show Folder'].dropna().unique()]
         names += [Path(str(v)).name for v in df_tv['Episode File'].dropna()]
-    return [n for n in dict.fromkeys(names)
+    return list(dict.fromkeys(names))
+
+
+def _llm_candidates(df_movies, df_tv, patterns) -> list[str]:
+    """Names guessit couldn't confidently parse (source == 'raw')."""
+    return [n for n in _all_candidate_names(df_movies, df_tv)
             if parse_name(n, custom_patterns=patterns).source == "raw"]
 
 
@@ -1119,25 +1153,25 @@ def _ask_llm_results(df_movies, df_tv, patterns) -> dict:
         print("[OK] Nothing needs LLM cleaning.")
         return {}
     if candidates is None:
-        names = []
-        if df_movies is not None:
-            names += [str(v) for v in df_movies['Folder Name'].dropna()]
-        if df_tv is not None:
-            names += [str(v) for v in df_tv['Show Folder'].dropna().unique()]
-        candidates = list(dict.fromkeys(names))
+        candidates = _all_candidate_names(df_movies, df_tv)
 
     cfg = llm.load_llm_config()
     if choice == '2':
-        url = prompt_input(f"Ollama URL [{cfg.get('ollama_url', 'http://localhost:11434')}]: ",
-                           default=cfg.get('ollama_url', 'http://localhost:11434'))
+        default_url = llm.env_value('ollama_url') or cfg.get(
+            'ollama_url', 'http://localhost:11434')
+        url = prompt_input(f"Ollama URL [{default_url}]: ",
+                           default=default_url)
         models = llm.list_ollama_models(url)
         if not models:
             print(f"[!] No Ollama models found at {url}.")
             return {}
         for i, m in enumerate(models, 1):
             print(f"  [{i}] {m}")
-        idx = prompt_input(f"Model (1-{len(models)}) [1]: ", default='1')
-        model = models[int(idx) - 1] if idx.isdigit() and 1 <= int(idx) <= len(models) else models[0]
+        default_model = llm.env_value('ollama_model') or cfg.get('ollama_model', '')
+        default_idx = str(models.index(default_model) + 1) if default_model in models else '1'
+        idx = prompt_input(f"Model (1-{len(models)}) [{default_idx}]: ",
+                           default=default_idx)
+        model = models[int(idx) - 1] if idx.isdigit() and 1 <= int(idx) <= len(models) else models[int(default_idx) - 1]
         cfg.update({'ollama_url': url, 'ollama_model': model})
         llm.save_llm_config(cfg)
         print(f"Cleaning {len(candidates)} name(s) with {model}...")
@@ -1201,38 +1235,43 @@ def log_changes(excel_path: Path, entries: list) -> None:
 
 def run_rename(movies_path, tv_path, excel_path: Path, dry_run: bool = False,
                *, session: str | None = None,
-               accept_gate: bool = True, log: bool = True) -> list:
+               accept_gate: bool = True, log: bool = True,
+               assume_yes: bool = False,
+               df_movies=None, df_tv=None) -> list:
     """Plan and apply renames. Returns the entries that were applied.
 
     The caller gets the entries back so a multi-phase flow can hold off on
     logging them until its own accept gate has been answered.
     """
-    if not excel_path.exists():
-        print(f"[!] Spreadsheet not found: {excel_path}. Run a scan first.")
-        return []
-    df_movies, df_tv, meta = excel.read_library(excel_path)
-    movies_path = movies_path or meta.get('Movies Path')
-    tv_path = tv_path or meta.get('TV Shows Path')
+    if df_movies is None and df_tv is None:
+        if not excel_path.exists():
+            print(f"[!] Spreadsheet not found: {excel_path}. Run a scan first.")
+            return []
+        df_movies, df_tv, meta = excel.read_library(excel_path)
+        movies_path = movies_path or meta.get('Movies Path')
+        tv_path = tv_path or meta.get('TV Shows Path')
     patterns = load_custom_patterns()
 
     config = _load_config()
-    scheme = _ask_scheme(config) if not dry_run else \
+    interactive = _stdin_is_interactive() and not dry_run and not assume_yes
+    scheme = _ask_scheme(config) if interactive else \
         NamingScheme.from_dict(config.get('scheme', {}))
-    llm_results = _ask_llm_results(df_movies, df_tv, patterns) if not dry_run else {}
+    llm_results = _ask_llm_results(df_movies, df_tv, patterns) if interactive else {}
 
     plan = excel.plan_renames(df_movies, movies_path, df_tv, tv_path,
                               scheme, llm_results, patterns)
     rename_roots = [Path(p) for p in (movies_path, tv_path) if p]
     entries = confirm_and_execute(plan, _journal_path(), dry_run, "renames",
                                   roots=rename_roots, session=session,
-                                  accept_gate=accept_gate)
+                                  accept_gate=accept_gate,
+                                  assume_yes=assume_yes)
     # `log` is False only for the multi-phase flows, which log after their own
     # session gate. It is NOT tied to accept_gate: doing that stopped
     # `--action rename` writing the sheet at all, since it passes
     # accept_gate=False. confirm_and_execute already returns [] when the user
     # rejects, and returns the entries when a revert failed and the library is
     # still renamed — which is exactly when the audit trail matters most.
-    if log:
+    if log and excel_path.exists():
         log_changes(excel_path, entries)
     return entries
 
@@ -1305,7 +1344,7 @@ def _run_recovery(dry_run: bool = False) -> None:
 
 def run_undo(dry_run: bool = False, *, run_id: str | None = None,
              session: bool = False, count: int = 1,
-             force: bool = False) -> None:
+             force: bool = False, assume_yes: bool = False) -> None:
     journal = _journal_path()
     _run_recovery(dry_run)
 
@@ -1337,7 +1376,7 @@ def run_undo(dry_run: bool = False, *, run_id: str | None = None,
             for op in result.done:
                 print(f"  {op.kind.upper():6} {op.src or ''}  ->  {op.dst}")
             return
-        if not ask_yes_no("Undo the whole action now?", default=True):
+        if not assume_yes and not ask_yes_no("Undo the whole action now?", default=True):
             return
         _report_undo(undo_session(journal, force=force))
         return
@@ -1349,7 +1388,7 @@ def run_undo(dry_run: bool = False, *, run_id: str | None = None,
         for op in result.done:
             print(f"  {op.kind.upper():6} {op.src or ''}  ->  {op.dst}")
         return
-    if not ask_yes_no("Undo it now?", default=True):
+    if not assume_yes and not ask_yes_no("Undo it now?", default=True):
         return
     _report_undo(undo_last(journal, count, force=force))
 
@@ -1733,10 +1772,20 @@ Tip: type 'back' or 'b' at any prompt to return here.""")
                     break
             elif choice == '9':
                 run_list_runs()
-                if pending_runs(_journal_path()):
-                    run_undo(session=ask_yes_no(
-                        "Undo the entire last action (all its runs)?",
-                        default=False))
+                pending = pending_runs(_journal_path())
+                if pending:
+                    last_session = pending[-1].get("session")
+                    session_runs = ([r for r in pending
+                                     if r.get("session") == last_session]
+                                    if last_session else [])
+                    whole_action = (
+                        ask_yes_no(
+                            f"Undo the entire last action ({len(session_runs)} runs)?",
+                            default=False,
+                        )
+                        if len(session_runs) > 1 else False
+                    )
+                    run_undo(session=whole_action, assume_yes=whole_action)
             elif choice == '8':
                 run_custom_words()
             elif choice == '7':
@@ -1889,7 +1938,7 @@ def main() -> None:
                         help="Report how many commits behind this copy is, "
                              "without changing anything")
     parser.add_argument('--yes', '-y', action='store_true',
-                        help="Answer yes to the --update confirmation")
+                        help="Answer yes to confirmation prompts")
     parser.add_argument('--version', '-V', action='store_true',
                         help="Print the version and installed commit")
     args = parser.parse_args()
@@ -1910,7 +1959,7 @@ def main() -> None:
         run_undo(dry_run=args.dry_run, run_id=args.undo_run,
                  session=args.undo_session,
                  count=1 if args.undo_last is None else args.undo_last,
-                 force=args.force)
+                 force=args.force, assume_yes=args.yes)
         return
     if not args.action:
         run_wizard()
@@ -1933,35 +1982,48 @@ def main() -> None:
     if args.action == 'organize':
         if not tv:
             sys.exit("[!] --tv is required for 'organize'.")
-        run_organize(tv, dry_run=args.dry_run, accept_gate=gate)
+        run_organize(tv, dry_run=args.dry_run, accept_gate=gate,
+                     assume_yes=args.yes)
     elif args.action == 'organize-movies':
         if not movies:
             sys.exit("[!] --movies is required for 'organize-movies'.")
-        run_organize_movies(movies, dry_run=args.dry_run, accept_gate=gate)
+        run_organize_movies(movies, dry_run=args.dry_run, accept_gate=gate,
+                            assume_yes=args.yes)
     elif args.action == 'scan':
-        run_scan(movies, tv, xlsx, dry_run=args.dry_run)
+        run_scan(movies, tv, xlsx, dry_run=args.dry_run, assume_yes=args.yes)
     elif args.action == 'rename':
-        run_rename(movies, tv, xlsx, dry_run=args.dry_run, accept_gate=gate)
+        run_rename(movies, tv, xlsx, dry_run=args.dry_run, accept_gate=gate,
+                   assume_yes=args.yes)
     elif args.action == 'full':
         # One session id across all three phases so a single
         # `--undo-session` reverses the whole action.
         session = uuid.uuid4().hex[:12]
         if tv:
             run_organize(tv, dry_run=args.dry_run, session=session,
-                         accept_gate=False)
+                         accept_gate=False, assume_yes=args.yes)
         if movies:
             loose = plan_loose_movies(Path(movies))
             if loose.ops:
                 confirm_and_execute(loose, _journal_path(), args.dry_run,
                                     "loose-file moves", roots=[Path(movies)],
-                                    session=session, accept_gate=False)
-        run_scan(movies, tv, xlsx, dry_run=args.dry_run)
+                                    session=session, accept_gate=False,
+                                    assume_yes=args.yes)
+        m_rows, t_rows = run_scan(movies, tv, xlsx, dry_run=args.dry_run,
+                                  assume_yes=args.yes)
+        if args.dry_run:
+            import pandas as pd
+            df_m = pd.DataFrame(m_rows) if m_rows else None
+            df_t = pd.DataFrame(t_rows) if t_rows else None
+            if df_m is not None or df_t is not None:
+                run_rename(movies, tv, xlsx, dry_run=True, session=session,
+                           accept_gate=False, log=False, assume_yes=args.yes,
+                           df_movies=df_m, df_tv=df_t)
+            return
         # With --review, one question covers every phase: answering "no" puts
         # the organize back too, not just the rename.
-        entries = run_rename(movies, tv, xlsx, dry_run=args.dry_run,
-                             session=session, accept_gate=False, log=not gate)
-        if args.dry_run:
-            return
+        entries = run_rename(movies, tv, xlsx, dry_run=False,
+                             session=session, accept_gate=False, log=not gate,
+                             assume_yes=args.yes)
         if gate:
             outcome = accept_or_revert(None, _journal_path(), label="changes",
                                        session=session)

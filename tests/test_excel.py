@@ -595,3 +595,209 @@ def test_llm_quality_is_applied(tmp_path):
                         NamingScheme(), llm_results)
     assert sorted(op.dst.name for op in plan.ops) == \
         ["Hopeless Name (2011) [1080p]", "Hopeless Name (2011) [1080p].mkv"]
+
+
+def test_plan_renames_deepest_first_nested_shows_and_collections(tmp_path):
+    from mediaorg.scan import scan_recursive, scan_recursive_tv
+
+    movies = tmp_path / "Movies"
+    make_movie(movies, "Collection.2020", ["Collection.2020.mkv"])
+    make_movie(movies / "Collection.2020", "Inner.Film.2021",
+               ["Inner.Film.2021.mkv"])
+    m_rows = scan_recursive(movies)
+    m_plan = plan_renames(pd.DataFrame(m_rows), str(movies), None, None,
+                          NamingScheme())
+    for op in m_plan.ops:
+        op.dst.parent.mkdir(parents=True, exist_ok=True)
+        op.src.rename(op.dst)
+    assert (movies / "Collection (2020)" / "Inner Film (2021)" / "Inner Film (2021).mkv").exists()
+
+    tv = tmp_path / "TV"
+    (tv / "Parent.Show" / "Season 1").mkdir(parents=True)
+    (tv / "Parent.Show" / "Season 1" / "Parent.Show.S01E01.mkv").write_text("v")
+    (tv / "Parent.Show" / "Spinoff.Show" / "Season 1").mkdir(parents=True)
+    (tv / "Parent.Show" / "Spinoff.Show" / "Season 1" / "Spinoff.Show.S01E01.mkv").write_text("v")
+    t_rows = scan_recursive_tv(tv)
+    t_plan = plan_renames(None, None, pd.DataFrame(t_rows), str(tv),
+                          NamingScheme())
+    for op in t_plan.ops:
+        op.dst.parent.mkdir(parents=True, exist_ok=True)
+        op.src.rename(op.dst)
+    assert (tv / "Parent Show" / "Spinoff Show" / "Season 1" / "Spinoff Show S01E01.mkv").exists()
+
+
+def test_tv_overrides_on_non_first_row_still_apply(tmp_path):
+    tv = tmp_path / "TV"
+    show = tv / "raw.show" / "Season 1"
+    show.mkdir(parents=True)
+    (show / "raw.show.S01E01.mkv").write_text("v")
+    (show / "raw.show.S01E02.mkv").write_text("v")
+
+    rows = scan_tv(tv)
+    df_tv = pd.DataFrame(rows)
+    # Put overrides only on the second row
+    df_tv.loc[1, 'Title Fixed'] = 'Custom Show'
+    df_tv.loc[1, 'Folder Fixed'] = 'Custom Show Folder'
+    df_tv.loc[1, 'Season Year'] = '2022'
+
+    plan = plan_renames(None, None, df_tv, str(tv), NamingScheme())
+    dsts = [str(op.dst) for op in plan.ops]
+    assert any(d.endswith("Custom Show Folder") for d in dsts)
+    assert any(d.endswith("Season 1 (2022)") for d in dsts)
+    assert any(d.endswith("Custom Show S01E01.mkv") for d in dsts)
+
+
+def test_write_library_append_deduplicates_mixed_season_episode_types(tmp_path):
+    tv = tmp_path / "TV"
+    s = tv / "Show" / "Season 1"
+    s.mkdir(parents=True)
+    (s / "Show.S01E01.mkv").write_text("v")
+    xlsx = tmp_path / "lib.xlsx"
+
+    rows = scan_tv(tv)
+    excel.write_library(xlsx, [], rows, None, str(tv), append=False)
+    df_m, df_t, _ = excel.read_library(xlsx)
+    assert len(df_t) == 1
+    excel.write_library(xlsx, [], rows, None, str(tv), append=True)
+    _, df_t2, _ = excel.read_library(xlsx)
+    assert len(df_t2) == 1
+
+
+def test_movies_files_fixed_and_multi_quality_preserved(tmp_path):
+    movies = tmp_path / "Movies"
+    make_movie(movies, "Dune (2021)",
+               ["Dune.2021.1080p.mkv", "Dune.2021.2160p.mkv"])
+    rows = scan_movies(movies)
+    df_m = pd.DataFrame(rows)
+    # Row should keep blank Quality when files differ, preserving each file's quality
+    plan = plan_renames(df_m, str(movies), None, None, NamingScheme())
+    dst_names = sorted(op.dst.name for op in plan.ops)
+    assert "Dune (2021) [1080p].mkv" in dst_names
+    assert "Dune (2021) [2160p].mkv" in dst_names
+
+    # Explicit 1-to-1 Files Fixed overrides take precedence
+    df_m.loc[0, 'Files Fixed'] = "Dune Custom 1080 | Dune Custom 2160"
+    plan2 = plan_renames(df_m, str(movies), None, None, NamingScheme())
+    dst_names2 = sorted(op.dst.name for op in plan2.ops)
+    assert "Dune Custom 1080.mkv" in dst_names2
+    assert "Dune Custom 2160.mkv" in dst_names2
+
+
+def test_companion_ops_multi_episode_tail_and_boundary_and_zero_size(tmp_path):
+    d = tmp_path / "Show" / "Season 1"
+    d.mkdir(parents=True)
+    vid = d / "Show.S01E01-E02.mkv"
+    sub = d / "Show.S01E01-E02.en.srt"
+    vid.write_text("v")
+    sub.write_text("s")
+    ops = excel._companion_ops(vid, vid.name, "Show - S01E01-E02.mkv")
+    assert [op.dst.name for op in ops] == ["Show - S01E01-E02.en.srt"]
+
+    # Prefix boundary check: Up.2009 must not steal Uptown.Girls.2003.srt
+    m = tmp_path / "Movies" / "Up (2009)"
+    m.mkdir(parents=True)
+    up = m / "Up.2009.mkv"
+    other = m / "Uptown.Girls.2003.srt"
+    up.write_text("v")
+    other.write_text("s")
+    assert excel._companion_ops(up, up.name, "Up (2009).mkv") == []
+
+    # 0.0 size must be omitted when movie_file_include_size=True
+    m2 = tmp_path / "Movies2"
+    make_movie(m2, "ZeroFilm (2020)", ["ZeroFilm (2020).mkv"])
+    (m2 / "ZeroFilm (2020)" / "ZeroFilm (2020).mkv").write_bytes(b"")
+    rows = scan_movies(m2)
+    scheme = NamingScheme()
+    scheme.movie_file_include_size = True
+    p = plan_renames(pd.DataFrame(rows), str(m2), None, None, scheme)
+    assert p.ops == []
+
+
+def test_companion_ops_multi_ep_mismatch_and_preserve_fixed_on_append(tmp_path, monkeypatch):
+    # Prefix fails (video has 1080p), episode code fallback must strip full S01E01-E02
+    # and contiguous S01E01E02 alike.
+    d = tmp_path / "Show" / "Season 1"
+    d.mkdir(parents=True)
+    vid = d / "Show.S01E01-E02.1080p.mkv"
+    sub = d / "Show.S01E01-E02.en.srt"
+    vid.write_text("v")
+    sub.write_text("s")
+    ops = excel._companion_ops(vid, vid.name, "Show S01E01-E02 [1080p].mkv")
+    assert [op.dst.name for op in ops] == ["Show S01E01-E02 [1080p].en.srt"]
+
+    d_contig = tmp_path / "Show" / "Season 2"
+    d_contig.mkdir(parents=True)
+    vid_c = d_contig / "Show.S01E01E02.1080p.mkv"
+    sub_c = d_contig / "Show.S01E01E02.en.srt"
+    vid_c.write_text("v")
+    sub_c.write_text("s")
+    ops_c = excel._companion_ops(vid_c, vid_c.name, "Show S01E01-E02 [1080p].mkv")
+    assert [op.dst.name for op in ops_c] == ["Show S01E01-E02 [1080p].en.srt"]
+
+    # _companion_ops tolerates OSError on e.is_file() and still sees flaky longer video stems
+    import os
+    m_flaky = tmp_path / "FlakyMovie"
+    m_flaky.mkdir(parents=True)
+    short_vid = m_flaky / "Film.2020.mkv"
+    long_vid = m_flaky / "Film.2020.Extended.mkv"
+    short_sub = m_flaky / "Film.2020.en.srt"
+    long_sub = m_flaky / "Film.2020.Extended.en.srt"
+    stale_sub = m_flaky / "stale.srt"
+    for p in (short_vid, long_vid, short_sub, long_sub, stale_sub):
+        p.write_text("x")
+    real_scandir = os.scandir
+
+    class FlakyEntry:
+        def __init__(self, real):
+            self._real = real
+            self.name = real.name
+            self.path = real.path
+
+        def is_file(self, follow_symlinks=False):
+            if self.name in ("stale.srt", "Film.2020.Extended.mkv"):
+                raise OSError(116, "Stale file handle")
+            return self._real.is_file(follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(
+        os, "scandir",
+        lambda path=".", *a, **kw: [FlakyEntry(e) for e in real_scandir(path, *a, **kw)]
+    )
+    flaky_ops = excel._companion_ops(short_vid, short_vid.name, "Film (2020).mkv")
+    assert [op.dst.name for op in flaky_ops] == ["Film (2020).en.srt"]
+    monkeypatch.setattr(os, "scandir", real_scandir)
+
+    # Files Fixed comma support, partial pipe override, & mismatched count skipped reason
+    movies = tmp_path / "Movies"
+    make_movie(movies, "Dune (2021)", ["Dune.1080p.mkv", "Dune.2160p.mkv"])
+    rows = scan_movies(movies)
+    df_m = pd.DataFrame(rows)
+    df_m.loc[0, 'Files Fixed'] = "Dune One, Dune Two"
+    plan_comma = plan_renames(df_m, str(movies), None, None, NamingScheme())
+    assert {"Dune One.mkv", "Dune Two.mkv"}.issubset(
+        {op.dst.name for op in plan_comma.ops}
+    )
+
+    movies3 = tmp_path / "Movies3"
+    make_movie(movies3, "Trilogy (2021)",
+               ["FilmA.2021.1080p.mkv", "FilmB.2021.1080p.mkv", "FilmC.2021.1080p.mkv"])
+    rows3 = scan_movies(movies3)
+    df_m3 = pd.DataFrame(rows3)
+    df_m3.loc[0, 'Files Fixed'] = "New One | | New Three"
+    plan_partial = plan_renames(df_m3, str(movies3), None, None, NamingScheme())
+    partial_dsts = {op.dst.name for op in plan_partial.ops}
+    assert {"New One.mkv", "FilmB (2021) [1080p].mkv", "New Three.mkv"}.issubset(partial_dsts)
+
+    df_m.loc[0, 'Files Fixed'] = "Only One Override"
+    plan_bad = plan_renames(df_m, str(movies), None, None, NamingScheme())
+    assert any("Files Fixed" in reason for _, reason in plan_bad.skipped)
+
+    # write_library(..., append=True) preserves hand-edited '... Fixed' columns
+    xlsx = tmp_path / "lib.xlsx"
+    excel.write_library(xlsx, rows, [], str(movies), None, append=False)
+    df_saved, _, _ = excel.read_library(xlsx)
+    df_saved['Title Fixed'] = 'Hand Edited Dune'
+    with pd.ExcelWriter(xlsx, engine='openpyxl', mode='a', if_sheet_exists='replace') as w:
+        df_saved.to_excel(w, sheet_name='Movies', index=False)
+    excel.write_library(xlsx, rows, [], str(movies), None, append=True)
+    df_after, _, _ = excel.read_library(xlsx)
+    assert df_after.loc[0, 'Title Fixed'] == 'Hand Edited Dune'

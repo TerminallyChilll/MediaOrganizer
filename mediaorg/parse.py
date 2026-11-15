@@ -26,7 +26,8 @@ COMPANION_EXTS = {'.srt', '.sub', '.idx', '.ass', '.ssa', '.nfo', '.jpg',
 JUNK_NAMES = {'.ds_store', 'thumbs.db', 'desktop.ini', '.localized',
               '.apdisk', '.spotlight-v100', '.trashes', '.fseventsd'}
 JUNK_PREFIXES = ('._',)
-JUNK_DIRS = {'@eadir', '.@__thumb', '.spotlight-v100', '.trashes',
+TRASH_DIR = ".mediaorg_trash"
+JUNK_DIRS = {TRASH_DIR, '@eadir', '.@__thumb', '.spotlight-v100', '.trashes',
              '.fseventsd', '$recycle.bin', 'system volume information'}
 
 
@@ -214,25 +215,33 @@ def parse_name(name: str, kind_hint: str | None = None,
     options['excludes'] = ['release_group']
     g = guessit(cleaned, options)
 
+    def _first(key):
+        val = g.get(key)
+        return val[0] if isinstance(val, list) and val else val
+
     eps = g.get('episode')
     episodes = [] if eps is None else (list(eps) if isinstance(eps, list) else [int(eps)])
 
-    title = g.get('title')
-    year = g.get('year')
+    title = _first('title')
+    year = _first('year')
     source = "guessit"
 
     # Fold the country back into the title ("The Office (US)") — otherwise
     # re-parsing our own output would strip it and renames never settle.
     if title and 'country' in g:
-        country = g['country']
-        code = getattr(country, 'alpha2', str(country))
-        if not title.endswith(f" ({code})"):
-            title = f"{title} ({code})"
+        country = _first('country')
+        if country is not None:
+            code = getattr(country, 'alpha2', str(country))
+            if code and not str(title).endswith(f" ({code})"):
+                title = f"{title} ({code})"
 
     if not title:
         stem = _strip_video_ext(cleaned).strip()
-        if year is not None and stem == str(year):
-            # "1917.mkv": the whole name IS the title, not a year tag.
+        if year is not None and (
+            stem == str(year)
+            or re.match(rf'^{re.escape(str(year))}(?:[.\s_\-(]|$)', stem)
+        ):
+            # "1917.mkv" or "1917.1080p.BluRay.mkv": the leading year IS the title.
             title, year = str(year), None
         else:
             raw = stem
@@ -245,10 +254,6 @@ def parse_name(name: str, kind_hint: str | None = None,
             title = _strip_video_ext(cleaned).strip()
             source = "raw"
 
-    def _first(key):
-        val = g.get(key)
-        return val[0] if isinstance(val, list) and val else val
-
     edition = _first('edition')
     # Explicit None check: `part or cd` would discard a legitimate part 0.
     part = _first('part')
@@ -259,14 +264,33 @@ def parse_name(name: str, kind_hint: str | None = None,
     except (TypeError, ValueError):
         part = None
 
+    episode_title = _first('episode_title')
+    if isinstance(episode_title, str) and '-' in episode_title:
+        # Excluding release_group prevents hyphenated titles like WALL-E from
+        # breaking, but can leave a trailing "-GROUP" attached to episode_title.
+        # Validate that the stripped release group actually matches the suffix
+        # so genuinely hyphenated episode titles cannot be altered.
+        g_with_rg = guessit(cleaned, {'type': kind_hint} if kind_hint else {})
+        rg = g_with_rg.get('release_group')
+        rg_str = rg[0] if isinstance(rg, list) and rg else (rg if isinstance(rg, str) else '')
+        rg_ep = g_with_rg.get('episode_title')
+        rg_ep_str = rg_ep[0] if isinstance(rg_ep, list) and rg_ep else (rg_ep if isinstance(rg_ep, str) else '')
+        if (rg_str and rg_ep_str
+                and episode_title.casefold().endswith(f"-{rg_str.casefold()}")
+                and rg_ep_str.strip() == episode_title[:-len(rg_str) - 1].strip()):
+            episode_title = rg_ep_str
+
+    screen_size = _first('screen_size')
+    date_val = _first('date')
+
     return ParsedName(
-        title=title,
+        title=str(title),
         year=year,
-        season=g.get('season') if not isinstance(g.get('season'), list) else g.get('season')[0],
+        season=_first('season'),
         episodes=episodes,
-        quality=str(g['screen_size']) if 'screen_size' in g else None,
-        date=g.get('date'),
-        episode_title=g.get('episode_title'),
+        quality=str(screen_size) if screen_size is not None else None,
+        date=date_val,
+        episode_title=str(episode_title) if episode_title is not None else None,
         kind=g.get('type', 'unknown'),
         source=source,
         edition=str(edition) if edition else None,

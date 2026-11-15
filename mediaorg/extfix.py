@@ -7,13 +7,20 @@ from pathlib import Path
 from .parse import TMP_SUFFIX, VIDEO_EXTS, is_junk_dir, is_junk_name
 from .plan import Op, Plan, check_collisions
 
-_KNOWN_NON_VIDEO = {'.nfo', '.srt', '.sub', '.idx', '.jpg', '.jpeg', '.png',
-                    '.txt', '.nzb', '.bat', '.sh', '.py', '.json', '.xlsx',
-                    '.xls', '.jsonl',
+_KNOWN_NON_VIDEO = {'.nfo', '.srt', '.sub', '.idx', '.ass', '.ssa', '.vtt',
+                    '.jpg', '.jpeg', '.png', '.webp', '.ico', '.heic', '.heif',
+                    '.avif', '.m4a', '.m4b', '.m4p', '.aac', '.mp3', '.flac',
+                    '.wav', '.txt', '.nzb', '.bat', '.sh', '.py', '.json',
+                    '.xlsx', '.xls', '.jsonl',
                     # Our own crash scar: without this, a restore pass would
                     # magic-byte sniff it and append a video extension. Taken
                     # from execute so the two can never drift apart.
                     TMP_SUFFIX}
+
+_NON_VIDEO_FTYP_BRANDS = {
+    b'M4A ', b'M4B ', b'M4P ', b'heic', b'heix', b'heim', b'heis',
+    b'mif1', b'msf1', b'avif', b'avis',
+}
 
 
 def detect_extension(filepath: Path) -> str | None:
@@ -26,10 +33,13 @@ def detect_extension(filepath: Path) -> str | None:
     if header.startswith(b'\x1a\x45\xdf\xa3'):
         return '.mkv'
     if len(header) >= 8 and header.startswith(b'ftyp', 4):
-        return '.mp4'
+        brand = header[8:12] if len(header) >= 12 else b''
+        if brand in _NON_VIDEO_FTYP_BRANDS:
+            return None
+        return '.mov' if brand == b'qt  ' else '.mp4'
     if header.startswith(b'RIFF') and header.startswith(b'AVI ', 8):
         return '.avi'
-    if header.startswith(b'\x00\x00\x01'):
+    if header.startswith((b'\x00\x00\x01\xba', b'\x00\x00\x01\xb3')):
         return '.mpg'
     if header.startswith(b'\x30\x26\xb2\x75'):
         return '.wmv'
@@ -64,6 +74,6 @@ def plan_extension_convert(folder: Path, from_ext: str, to_ext: str) -> Plan:
         dirnames[:] = sorted(d for d in dirnames if not is_junk_dir(d))
         for filename in sorted(f for f in filenames if not is_junk_name(f)):
             p = Path(dirpath) / filename
-            if p.suffix.lower() == from_ext:
+            if p.suffix.lower() == from_ext and p.suffix != to_ext:
                 ops.append(Op("move", p, p.with_suffix(to_ext)))
     return check_collisions(ops)

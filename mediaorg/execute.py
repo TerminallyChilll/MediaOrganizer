@@ -29,12 +29,11 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .parse import TMP_SUFFIX, is_junk_dir, is_junk_name
+from .parse import TMP_SUFFIX, TRASH_DIR, is_junk_dir, is_junk_name
 from .plan import Op, Plan
 
 JOURNAL_FILE = "mediaorg_journal.jsonl"
 JOURNAL_VERSION = 2
-TRASH_DIR = ".mediaorg_trash"
 
 # Backoff for files held open by another program (Plex/Jellyfin/VLC streaming
 # an episode is the single most common real-world failure). Tests set this to
@@ -219,7 +218,7 @@ def _fsync_path(path: Path) -> None:
         os.close(fd)
 
 
-def _move_across(src: Path, dst: Path) -> None:
+def _move_across(src: Path, dst: Path, *, on_copied=None) -> None:
     """Rename, falling back to a *verified* copy when crossing devices.
 
     ``shutil.move``'s fallback leaves a truncated destination if the copy dies
@@ -236,25 +235,52 @@ def _move_across(src: Path, dst: Path) -> None:
             raise
 
     if src.is_dir() and not src.is_symlink():
-        shutil.copytree(src, dst, symlinks=True)
+        os.mkdir(dst)
+        try:
+            shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=True)
+        except BaseException:
+            shutil.rmtree(dst, ignore_errors=True)
+            raise
+        if on_copied is not None:
+            on_copied()
         shutil.rmtree(src)
         return
 
-    # lstat on both sides: copy2 is told not to follow symlinks, so for a
-    # symlinked file it copies the link itself. stat() would compare the
-    # target's size against the link's and fail a perfectly good copy.
-    expected = src.lstat().st_size
-    shutil.copy2(src, dst, follow_symlinks=False)
-    _fsync_path(dst)
-    actual = dst.lstat().st_size
-    if actual != expected:
-        raise OSError(errno.EIO,
-                      f"copy verification failed: {dst} is {actual} bytes, "
-                      f"expected {expected}")
-    os.unlink(src)
+    # Claim dst atomically before entering the cleanup try-block so a
+    # pre-existing destination is never unlinked on failure: symlinks use
+    # os.symlink (single syscall failing with EEXIST), regular files use
+    # O_CREAT | O_EXCL.
+    is_link = src.is_symlink()
+    if is_link:
+        os.symlink(os.readlink(src), dst)
+    else:
+        expected = src.lstat().st_size
+        fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
+    try:
+        if is_link:
+            try:
+                shutil.copystat(src, dst, follow_symlinks=False)
+            except (OSError, NotImplementedError):
+                pass
+        else:
+            shutil.copy2(src, dst, follow_symlinks=False)
+            _fsync_path(dst)
+            actual = dst.lstat().st_size
+            if actual != expected:
+                raise OSError(errno.EIO,
+                              f"copy verification failed: {dst} is {actual} bytes, "
+                              f"expected {expected}")
+        os.unlink(src)
+    except BaseException:
+        try:
+            os.unlink(dst)
+        except OSError:
+            pass
+        raise
 
 
-def _do_move(src: Path, dst: Path, on_tmp=None) -> None:
+def _do_move(src: Path, dst: Path, on_tmp=None, on_copied=None) -> None:
     if _is_case_only_rename(src, dst) and (
             not os.path.lexists(dst) or _same_file(src, dst)):
         # A case-insensitive filesystem sees src and dst as the same name, so
@@ -274,7 +300,7 @@ def _do_move(src: Path, dst: Path, on_tmp=None) -> None:
     if os.path.lexists(dst):
         raise FileExistsError(f"target already exists: {dst}")
     dst.parent.mkdir(parents=True, exist_ok=True)
-    _move_across(src, dst)
+    _move_across(src, dst, on_copied=on_copied)
 
 
 def _retrying(fn, delays=None):
@@ -403,7 +429,6 @@ def execute(plan: Plan, journal: Path, dry_run: bool = False, *,
             jw.seq += 1
             seq = jw.seq
             created: list[Path] = []
-            quarantined: list[tuple[Path, Path]] = []
             try:
                 if op.kind == "move":
                     src, dst = _op_path(op.src), _op_path(op.dst)
@@ -418,17 +443,33 @@ def execute(plan: Plan, journal: Path, dry_run: bool = False, *,
                     # without this flag recovery would mistake that innocent
                     # file for a partial copy of ours and delete it.
                     dst_existed = os.path.lexists(dst)
+                    src_is_dir = src.is_dir() and not src.is_symlink()
+                    copied = False
 
                     def on_tmp(tmp: Path, _seq=seq, _src=src, _dst=dst,
-                               _existed=dst_existed) -> None:
+                               _existed=dst_existed,
+                               _is_dir=src_is_dir) -> None:
                         jw.log({"op": "intent", "kind": "move", "seq": _seq,
                                 "src": str(_src), "dst": str(_dst),
-                                "tmp": str(tmp), "dst_existed": _existed})
+                                "tmp": str(tmp), "dst_existed": _existed,
+                                **({"dir": True} if _is_dir else {})})
+
+                    def on_copied(_seq=seq, _src=src, _dst=dst,
+                                  _existed=dst_existed,
+                                  _is_dir=src_is_dir) -> None:
+                        nonlocal copied
+                        copied = True
+                        jw.log({"op": "intent", "kind": "move", "seq": _seq,
+                                "src": str(_src), "dst": str(_dst),
+                                "dst_existed": _existed, "copied": True,
+                                **({"dir": True} if _is_dir else {})})
 
                     jw.log({"op": "intent", "kind": "move", "seq": seq,
                             "src": str(src), "dst": str(dst),
-                            "dst_existed": dst_existed})
-                    _retrying(lambda: _do_move(src, dst, on_tmp=on_tmp))
+                            "dst_existed": dst_existed,
+                            **({"dir": True} if src_is_dir else {})})
+                    _retrying(lambda: shutil.rmtree(src) if copied else _do_move(
+                        src, dst, on_tmp=on_tmp, on_copied=on_copied))
                     entry = {"op": "move", "src": str(src), "dst": str(dst),
                              "seq": seq, **_stat_fields(dst)}
 
@@ -461,12 +502,35 @@ def execute(plan: Plan, journal: Path, dry_run: bool = False, *,
                             jw.log({"op": "mkdir", "src": None, "dst": str(d),
                                     "seq": seq})
                         for j in junk:
+                            jw.seq += 1
+                            jseq = jw.seq
                             jdst = _free_name(trash / j.name)
-                            _retrying(lambda a=j, b=jdst: os.rename(a, b))
+                            is_j_dir = j.is_dir() and not j.is_symlink()
+                            j_copied = False
+
+                            def on_j_copied(_seq=jseq, _src=j, _dst=jdst,
+                                            _is_dir=is_j_dir) -> None:
+                                nonlocal j_copied
+                                j_copied = True
+                                jw.log({"op": "intent", "kind": "move",
+                                        "seq": _seq, "src": str(_src),
+                                        "dst": str(_dst),
+                                        "dst_existed": False, "copied": True,
+                                        **({"dir": True} if _is_dir else {})})
+
+                            jw.log({"op": "intent", "kind": "move", "seq": jseq,
+                                    "src": str(j), "dst": str(jdst),
+                                    "dst_existed": False,
+                                    **({"dir": True} if is_j_dir else {})})
+                            _retrying(lambda a=j, b=jdst, cb=on_j_copied: (
+                                shutil.rmtree(a) if j_copied
+                                else _move_across(a, b, on_copied=cb)
+                            ))
                             jw.log({"op": "move", "src": str(j),
-                                    "dst": str(jdst), "seq": seq,
+                                    "dst": str(jdst), "seq": jseq,
                                     **_stat_fields(jdst)})
-                            quarantined.append((j, jdst))
+                        jw.seq += 1
+                        seq = jw.seq
                     jw.log({"op": "intent", "kind": "rmdir", "seq": seq,
                             "dst": str(dst)})
                     _retrying(dst.rmdir)
@@ -571,15 +635,18 @@ def recover(journal: Path, dry_run: bool = False) -> list[str]:
     notes: list[str] = []
     for run in list_runs(journal):
         completed = {(e.get("seq"), e.get("op")) for e in run["ops"]}
+        copied_seqs = {i.get("seq") for i in run["intents"] if i.get("copied")}
+        seen_seqs: set = set()
         for intent in run["intents"]:
             seq, kind = intent.get("seq"), intent.get("kind")
-            if (seq, kind) in completed:
+            if (seq, kind) in completed or seq in seen_seqs:
                 continue
             src = Path(intent["src"]) if intent.get("src") else None
             dst = Path(intent["dst"]) if intent.get("dst") else None
             tmp = Path(intent["tmp"]) if intent.get("tmp") else None
 
             if tmp is not None and os.path.lexists(tmp):
+                seen_seqs.add(seq)
                 target = src if src is not None and not os.path.lexists(src) else None
                 if target is None:
                     notes.append(f"stranded temp file (source occupied): {tmp}")
@@ -587,6 +654,25 @@ def recover(journal: Path, dry_run: bool = False) -> list[str]:
                 notes.append(f"restore stranded temp file {tmp} -> {target}")
                 if not dry_run:
                     os.rename(tmp, target)
+                continue
+
+            if (kind == "move" and src is not None and dst is not None
+                    and seq in copied_seqs
+                    and os.path.lexists(src) and os.path.lexists(dst)):
+                seen_seqs.add(seq)
+                notes.append(
+                    f"remove leftover source after completed copy: {src} (copied to {dst})"
+                )
+                if not dry_run:
+                    try:
+                        if src.is_dir() and not src.is_symlink():
+                            shutil.rmtree(src)
+                        else:
+                            os.unlink(src)
+                    except OSError as exc:
+                        notes[-1] = (
+                            f"note: {dst} completed but {src} was not removed: {exc}"
+                        )
                 continue
 
             if (kind == "move" and src is not None and dst is not None
@@ -598,7 +684,12 @@ def recover(journal: Path, dry_run: bool = False) -> list[str]:
                     # destroys a file we never owned. Journals without the
                     # flag (v1, or v2 before this was added) fall through to
                     # "leave it alone", which is the safe default.
-                    and intent.get("dst_existed") is False):
+                    # Once copytree completes (seq in copied_seqs), dst holds
+                    # the complete copy and src may be half-removed by a
+                    # failing rmtree(src), so dst must be preserved.
+                    and intent.get("dst_existed") is False
+                    and seq not in copied_seqs):
+                seen_seqs.add(seq)
                 # The move never completed and the source is intact, so what
                 # sits at dst is a partial copy we created. Removing it also
                 # unblocks retries: the collision check would otherwise see it
@@ -616,6 +707,7 @@ def recover(journal: Path, dry_run: bool = False) -> list[str]:
 
             if (kind == "move" and src is not None and dst is not None
                     and not os.path.lexists(src) and os.path.lexists(dst)):
+                seen_seqs.add(seq)
                 notes.append(
                     f"note: {src} -> {dst} completed but was not journaled "
                     f"(crash before the write); it cannot be undone automatically")

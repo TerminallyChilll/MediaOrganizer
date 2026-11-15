@@ -15,12 +15,14 @@ import pandas as pd
 from .parse import (COMPANION_EXTS, VIDEO_EXTS, ParsedName, companion_tail,
                     is_junk_name, is_media_file, parse_name)
 from .plan import (EPISODE_PATTERN, SEASON_FOLDER_PATTERN, NamingScheme, Op,
-                   Plan, build_episode_file_name, build_movie_file_name,
-                   build_movie_folder_name, build_season_folder_name,
-                   build_tv_show_folder_name, check_collisions,
-                   extract_season_episode, norm, sanitize)
+                   Plan, build_episode_file_name,
+                   build_movie_file_name, build_movie_folder_name,
+                   build_season_folder_name, build_tv_show_folder_name,
+                   check_collisions, extract_season_episode, norm, sanitize)
 
-_SEASON_FOLDER_RE = re.compile(r'^Season\s+\d+$', re.IGNORECASE)
+_MULTI_EP_PATTERN = re.compile(
+    r'(?:[Ss]\d{1,4}[Ee]\d{1,3}(?:[-_.]?[Ee]\d{1,3})*|\d{1,2}[xX]\d{1,2})'
+)
 
 
 def _differs(new: str, old: str) -> bool:
@@ -78,6 +80,37 @@ def read_library(path: Path):
     return df_movies, df_tv, meta
 
 
+def _preserve_fixed_columns(new_df: pd.DataFrame, old_df: pd.DataFrame,
+                            key_cols: list[str]) -> pd.DataFrame:
+    """Carry hand-edited '... Fixed' cells from `old_df` into matching `new_df` rows."""
+    fixed_cols = [c for c in old_df.columns if str(c).endswith(' Fixed')]
+    if not fixed_cols or new_df.empty or old_df.empty:
+        return new_df
+    old_map: dict[tuple[str, ...], dict[str, str]] = {}
+    for _, row in old_df.iterrows():
+        k = tuple(_clean(row.get(c)) for c in key_cols)
+        vals = {fc: _clean(row.get(fc)) for fc in fixed_cols if _clean(row.get(fc))}
+        if vals:
+            old_map[k] = vals
+    if not old_map:
+        return new_df
+    out = new_df.copy()
+    for fc in fixed_cols:
+        if fc not in out.columns:
+            out[fc] = ''
+        else:
+            out[fc] = out[fc].astype(object)
+    for idx, row in out.iterrows():
+        k = tuple(_clean(row.get(c)) for c in key_cols)
+        saved = old_map.get(k)
+        if not saved:
+            continue
+        for fc, val in saved.items():
+            if not _clean(out.at[idx, fc]):
+                out.at[idx, fc] = val
+    return out
+
+
 def write_library(path: Path, movies_rows: list[dict], tv_rows: list[dict],
                   movies_path=None, tv_path=None, append: bool = False) -> None:
     path = Path(path)
@@ -88,13 +121,26 @@ def write_library(path: Path, movies_rows: list[dict], tv_rows: list[dict],
     if append and path.exists():
         old_movies, old_tv, meta = read_library(path)
         if old_movies is not None and not movies_df.empty:
+            movies_df = _preserve_fixed_columns(
+                movies_df, old_movies, ['Folder Name']
+            )
             movies_df = pd.concat([old_movies, movies_df]).drop_duplicates(
                 subset=['Folder Name'], keep='last')
         elif old_movies is not None:
             movies_df = old_movies
         if old_tv is not None and not tv_df.empty:
-            tv_df = pd.concat([old_tv, tv_df]).drop_duplicates(
-                subset=['Show Folder', 'Season', 'Episode'], keep='last')
+            old_tv = old_tv.copy()
+            tv_df = tv_df.copy()
+            old_tv['_s_key'] = old_tv['Season'].map(_clean)
+            old_tv['_e_key'] = old_tv['Episode'].map(_clean)
+            tv_df['_s_key'] = tv_df['Season'].map(_clean)
+            tv_df['_e_key'] = tv_df['Episode'].map(_clean)
+            tv_df = _preserve_fixed_columns(
+                tv_df, old_tv, ['Show Folder', '_s_key', '_e_key']
+            )
+            tv_df = pd.concat([old_tv, tv_df], ignore_index=True).drop_duplicates(
+                subset=['Show Folder', '_s_key', '_e_key'], keep='last'
+            ).drop(columns=['_s_key', '_e_key'])
         elif old_tv is not None:
             tv_df = old_tv
 
@@ -143,7 +189,8 @@ def append_changes(path: Path, entries: list[dict]) -> None:
         df_new.to_excel(writer, sheet_name='Changes', index=False)
 
 
-def _companion_ops(video_path: Path, old_base: str, new_base: str) -> list[Op]:
+def _companion_ops(video_path: Path, old_base: str, new_base: str, *,
+                   claimed: set[Path] | None = None) -> list[Op]:
     """Rename subs/nfo alongside their video so players keep matching them.
 
     A companion belongs to the video when its stem starts with the video's
@@ -176,11 +223,17 @@ def _companion_ops(video_path: Path, old_base: str, new_base: str) -> list[Op]:
     # planning. The first executes and the second fails at execute time with the
     # subtitle already sitting under the wrong film's name.
     video_stems = [norm(Path(e.name).stem) for e in entries
-                   if e.is_file(follow_symlinks=False) and is_media_file(e.name)]
-    for e in entries:
-        if not e.is_file(follow_symlinks=False) or is_junk_name(e.name):
+                   if is_media_file(e.name)]
+    for e in sorted(entries, key=lambda x: x.name):
+        try:
+            is_regular = e.is_file(follow_symlinks=False)
+        except OSError:
+            continue
+        if not is_regular or is_junk_name(e.name):
             continue
         p = Path(e.path)
+        if claimed is not None and p in claimed:
+            continue
         if p.suffix.lower() not in COMPANION_EXTS:
             continue
         # Normalise before the prefix test, or a subtitle stored NFD next to an
@@ -195,12 +248,14 @@ def _companion_ops(video_path: Path, old_base: str, new_base: str) -> list[Op]:
             tail = prefix_tail
         elif code != (None, None) and extract_season_episode(p.name) == code:
             # Keep whatever follows the episode code (e.g. ".en" language tag).
-            m = EPISODE_PATTERN.search(p.stem)
+            m = _MULTI_EP_PATTERN.search(p.stem) or EPISODE_PATTERN.search(p.stem)
             tail = p.stem[m.end():] if m else ''
         else:
             continue
         new_name = new_stem + tail + p.suffix
         if _differs(new_name, p.name):
+            if claimed is not None:
+                claimed.add(p)
             ops.append(Op("move", p, p.with_name(new_name)))
     return ops
 
@@ -252,34 +307,103 @@ def _video_files(row) -> list[str]:
     return [raw]
 
 
+def _clean_size(val) -> str:
+    """Cleaned size string for naming, omitting zero/empty values."""
+    s = _clean(val)
+    if not s:
+        return ''
+    try:
+        return s if float(s) > 0 else ''
+    except ValueError:
+        return ''
+
+
+def _first_non_empty(df_slice, col: str) -> str:
+    """First non-empty cleaned value for `col` across all rows in `df_slice`."""
+    if col not in df_slice.columns:
+        return ''
+    for val in df_slice[col]:
+        cleaned = _clean(val)
+        if cleaned:
+            return cleaned
+    return ''
+
+
+def _season_group_key(val) -> int | None:
+    """Normalize Season cell values (1, 1.0, '1', '') for grouping."""
+    s = _clean(val)
+    if not s:
+        return None
+    try:
+        return int(float(s))
+    except (TypeError, ValueError):
+        return None
+
+
+def _fixed_video_files(row, count: int) -> tuple[list[str], str | None]:
+    """1-to-1 'Files Fixed' overrides matching `Video Files`, or ([], reason)."""
+    raw = _clean(row.get('Files Fixed'))
+    if not raw or count <= 0:
+        return [], None
+    if '|' in raw:
+        parts = [v.strip() for v in raw.split('|')]
+    elif count > 1 and ',' in raw:
+        parts = [v.strip() for v in raw.split(',') if v.strip()]
+    else:
+        parts = [raw]
+    if len(parts) != count:
+        return [], (f"'Files Fixed' has {len(parts)} entry(ies) for "
+                    f"{count} video file(s) - override skipped")
+    return parts, None
+
+
 def _plan_movie_files(row, folder_path: Path, scheme: NamingScheme,
                       llm_results: dict, custom_patterns, ops: list[Op],
-                      folder_parse: ParsedName | None = None) -> None:
+                      folder_parse: ParsedName | None = None,
+                      claimed_companions: set[Path] | None = None,
+                      pre_skipped: list[tuple[Op, str]] | None = None) -> None:
     """Plan the renames for the video files listed on one Movies row."""
-    for vf in _video_files(row):
+    video_files = _video_files(row)
+    fixed_files, fix_err = _fixed_video_files(row, len(video_files))
+    if fix_err and pre_skipped is not None and video_files:
+        p0 = folder_path / video_files[0]
+        pre_skipped.append((Op("move", p0, p0), fix_err))
+    size_str = _clean_size(row.get('Size (GB)')) if scheme.movie_file_include_size else None
+
+    for idx, vf in enumerate(video_files):
         ext = Path(vf).suffix
-        pf = parse_name(vf, kind_hint="movie", custom_patterns=custom_patterns)
-        if vf in llm_results:
-            pf = _parsed_from_llm(llm_results[vf], pf)
-        if get_val(row, 'Title Fixed', ''):
-            pf.title = get_val(row, 'Title Fixed', '')
-        # Honor Fixed-column overrides on file-level parses too, so Year
-        # Fixed / Quality Fixed apply uniformly to folder and file renames.
-        if get_val(row, 'Year Fixed', ''):
-            pf.year = _safe_int_year(get_val(row, 'Year Fixed', ''))
-        if get_val(row, 'Quality Fixed', 'Quality'):
-            pf.quality = get_val(row, 'Quality Fixed', 'Quality')
-        if folder_parse is not None:
-            pf.year = pf.year or folder_parse.year
-            pf.quality = pf.quality or folder_parse.quality
-        new_file = build_movie_file_name(
-            pf, ext,
-            _clean(row.get('Size (GB)')) if scheme.movie_file_include_size else None,
-            scheme)
+        override = fixed_files[idx] if fixed_files else ''
+        if override:
+            suffix = Path(override).suffix.lower()
+            known_ext = suffix in VIDEO_EXTS or suffix in COMPANION_EXTS
+            stem = Path(override).stem if known_ext else override
+            new_file = sanitize(stem)
+            if not new_file.lower().endswith(ext.lower()):
+                new_file += ext
+        else:
+            pf = parse_name(vf, kind_hint="movie", custom_patterns=custom_patterns)
+            if vf in llm_results:
+                pf = _parsed_from_llm(llm_results[vf], pf)
+            if get_val(row, 'Title Fixed', ''):
+                pf.title = get_val(row, 'Title Fixed', '')
+            # Honor Fixed-column overrides on file-level parses too, so Year
+            # Fixed / Quality Fixed apply uniformly to folder and file renames.
+            if get_val(row, 'Year Fixed', ''):
+                pf.year = _safe_int_year(get_val(row, 'Year Fixed', ''))
+            quality_fixed = get_val(row, 'Quality Fixed', '')
+            if quality_fixed:
+                pf.quality = quality_fixed
+            elif not pf.quality:
+                pf.quality = _clean(row.get('Quality')) or (
+                    folder_parse.quality if folder_parse else None)
+            if folder_parse is not None:
+                pf.year = pf.year or folder_parse.year
+            new_file = build_movie_file_name(pf, ext, size_str, scheme)
         # Guard against a stem-less name (".mkv"): sanitize now always
         # returns a fallback, but the check keeps the invariant local.
         if Path(new_file).stem and _differs(new_file, vf):
-            ops.extend(_companion_ops(folder_path / vf, vf, new_file))
+            ops.extend(_companion_ops(folder_path / vf, vf, new_file,
+                                      claimed=claimed_companions))
             ops.append(Op("move", folder_path / vf, folder_path / new_file))
 
 
@@ -289,18 +413,26 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
     """Build rename ops from the spreadsheet (with Fixed-column overrides).
 
     Emits pure renames only (dst.parent == src.parent), children before
-    parents, so no op ever depends on an earlier rename. Cross-directory
-    moves are the organizer's job.
+    parents and deepest folders before shallowest, so no op ever depends on
+    an earlier rename. Cross-directory moves are the organizer's job.
     """
     llm_results = llm_results or {}
     ops: list[Op] = []
+    pre_skipped: list[tuple[Op, str]] = []
+    claimed_companions: set[Path] = set()
 
     if df_movies is not None and movies_path:
         movies_path = Path(movies_path)
-        for _, row in df_movies.iterrows():
-            old_folder = _clean(row.get('Folder Name'))
-            if not old_folder:
-                continue
+        movie_rows = [
+            (_clean(row.get('Folder Name')), row)
+            for _, row in df_movies.iterrows()
+        ]
+        movie_rows = [(f, r) for f, r in movie_rows if f]
+        # Deepest folders first so nested renames never move a parent out from
+        # under a descendant row.
+        movie_rows.sort(key=lambda item: (-len(Path(item[0]).parts), item[0]))
+
+        for old_folder, row in movie_rows:
             if old_folder == '.':
                 # A recursive scan records files sitting directly in the
                 # movies root under '.'. Their own renames are handled from
@@ -309,7 +441,9 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
                 # subdirectory of itself — it fails with EINVAL, and until it
                 # does it sits in the confirmation preview looking terrifying.
                 _plan_movie_files(row, movies_path, scheme, llm_results,
-                                  custom_patterns, ops)
+                                  custom_patterns, ops,
+                                  claimed_companions=claimed_companions,
+                                  pre_skipped=pre_skipped)
                 continue
             folder_path = movies_path / old_folder
 
@@ -334,15 +468,17 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
 
             # Files first (children before parent).
             _plan_movie_files(row, folder_path, scheme, llm_results,
-                              custom_patterns, ops, folder_parse=p)
+                              custom_patterns, ops, folder_parse=p,
+                              claimed_companions=claimed_companions,
+                              pre_skipped=pre_skipped)
 
             folder_fixed = _clean(row.get('Folder Fixed'))
             # Spreadsheet overrides were previously taken verbatim, so a user
             # typing "Movie: Part 2" produced a destination with a raw colon.
+            folder_size = (_clean_size(row.get('Size (GB)'))
+                           if scheme.movie_folder_include_size else None)
             new_folder = sanitize(folder_fixed) if folder_fixed else \
-                build_movie_folder_name(
-                    p, _clean(row.get('Size (GB)')) if scheme.movie_folder_include_size else None,
-                    scheme)
+                build_movie_folder_name(p, folder_size, scheme)
             if new_folder and _differs(new_folder, Path(old_folder).name):
                 # Preserve the parent directory when Folder Name contains a
                 # nested path (e.g. "Collection/Movie.2020" from a recursive
@@ -356,9 +492,15 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
 
     if df_tv is not None and tv_path:
         tv_path = Path(tv_path)
-        for show_folder, show_eps in df_tv.groupby('Show Folder'):
-            show_folder = str(show_folder)
-            first = show_eps.iloc[0]
+        tv_groups = [
+            (str(sf), grp) for sf, grp in df_tv.groupby('Show Folder')
+            if _clean(sf)
+        ]
+        # Deepest show folders first so renaming a parent show never strands a
+        # nested sub-show beneath it.
+        tv_groups.sort(key=lambda item: (-len(Path(item[0]).parts), item[0]))
+
+        for show_folder, show_eps in tv_groups:
             # A nested show is recorded as a relative path ("Genre/Show"), so
             # every name-level decision below has to look at the last
             # component. Matching against the whole path meant a nested show
@@ -366,7 +508,7 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
             # parsed out of the wrapper directories leading to it.
             show_name = Path(show_folder).name
             # Scanner run on a single show root: "show folders" are seasons.
-            show_is_season = bool(_SEASON_FOLDER_RE.match(show_name))
+            show_is_season = bool(SEASON_FOLDER_PATTERN.match(show_name.strip()))
             # Recursive scans record root-level episodes as '.': the show is
             # the selected tv_path itself.
             show_is_root = show_folder == '.'
@@ -376,28 +518,29 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
                                 custom_patterns=custom_patterns)
             if show_folder in llm_results:
                 p_show = _parsed_from_llm(llm_results[show_folder], p_show)
-            if get_val(first, 'Title Fixed', ''):
-                p_show.title = get_val(first, 'Title Fixed', '')
+            title_fixed = _first_non_empty(show_eps, 'Title Fixed')
+            if title_fixed:
+                p_show.title = title_fixed
             if not p_show.title:
                 continue
             # Show year: season 1's year, like v1.
-            s1 = show_eps[show_eps['Season'].astype(str).str.strip().isin(['1', '1.0'])]
-            s1_year = _clean(s1.iloc[0].get('Season Year')) if len(s1) else ''
+            s1_mask = show_eps['Season'].map(_season_group_key) == 1
+            s1 = show_eps[s1_mask]
+            s1_year = _first_non_empty(s1, 'Season Year') if len(s1) else ''
             if s1_year:
                 p_show.year = _safe_int_year(s1_year)
 
             season_ops: list[Op] = []
-            for season_num, season_eps in show_eps.groupby('Season', dropna=False):
-                if _clean(season_num) == '':
+            show_eps = show_eps.copy()
+            show_eps['_season_key'] = show_eps['Season'].map(_season_group_key)
+            for season_num, season_eps in show_eps.groupby('_season_key', dropna=False):
+                if season_num is None or (isinstance(season_num, float) and pd.isna(season_num)):
                     # No detectable season: an extra, a trailer, or a movie
                     # filed under TV. Leave it alone rather than inventing a
                     # name for it.
                     continue
-                try:
-                    season_num = int(float(season_num))
-                except (TypeError, ValueError):
-                    continue
-                season_year = _clean(season_eps.iloc[0].get('Season Year'))
+                season_num = int(season_num)
+                season_year = _first_non_empty(season_eps, 'Season Year')
 
                 for _, episode in season_eps.iterrows():
                     rel = _clean(episode.get('Episode File'))
@@ -437,14 +580,14 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
                         stem = Path(file_fixed).stem if known_ext else file_fixed
                         new_base = sanitize(stem)
                     else:
-                        new_base = build_episode_file_name(
-                            pe, ext,
-                            _clean(episode.get('Size (GB)')) if scheme.tv_episode_include_size else None,
-                            scheme)
+                        ep_size = (_clean_size(episode.get('Size (GB)'))
+                                   if scheme.tv_episode_include_size else None)
+                        new_base = build_episode_file_name(pe, ext, ep_size, scheme)
                     if not new_base.lower().endswith(ext.lower()):
                         new_base += ext
                     if Path(new_base).stem and _differs(new_base, base):
-                        ops.extend(_companion_ops(old_path, base, new_base))
+                        ops.extend(_companion_ops(old_path, base, new_base,
+                                                  claimed=claimed_companions))
                         ops.append(Op("move", old_path, old_path.parent / new_base))
 
                 if not show_is_season:
@@ -457,7 +600,7 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
             ops.extend(season_ops)
 
             if not show_is_season and not show_is_root:
-                show_fixed = _clean(first.get('Folder Fixed'))
+                show_fixed = _first_non_empty(show_eps, 'Folder Fixed')
                 new_show = sanitize(show_fixed) if show_fixed else \
                     build_tv_show_folder_name(p_show, scheme)
                 if new_show and _differs(new_show, Path(show_folder).name):
@@ -470,4 +613,7 @@ def plan_renames(df_movies, movies_path, df_tv, tv_path, scheme: NamingScheme,
                         dest = tv_path / new_show
                     ops.append(Op("move", show_path, dest))
 
-    return check_collisions(ops)
+    plan = check_collisions(ops)
+    if pre_skipped:
+        plan.skipped = pre_skipped + plan.skipped
+    return plan

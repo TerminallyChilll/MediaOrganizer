@@ -593,3 +593,190 @@ def test_dropping_nothing_leaves_the_rmdir_alone(tmp_path):
            Op("rmdir", None, tmp_path / "src")]
     plan = check_collisions(ops)
     assert [op.kind for op in plan.ops] == ["move", "rmdir"]
+
+
+def test_junk_quarantine_logs_intent_and_recovers_partial_copy(tmp_path, journal, monkeypatch):
+    lib = tmp_path / "lib"
+    d = lib / "Season 1"
+    touch(d / ".DS_Store")
+
+    def crash_move(src, dst, *, on_copied=None):
+        dst.write_text("partial junk")
+        raise OSError("EXDEV copy interrupted")
+
+    monkeypatch.setattr(ex, "_move_across", crash_move)
+    result = execute(Plan(ops=[Op("rmdir", None, d)]), journal, roots=[lib])
+    assert not result.ok
+    junk_in_trash = lib / ".mediaorg_trash" / ".DS_Store"
+    assert junk_in_trash.exists()
+
+    notes = ex.recover(journal)
+    assert any("remove incomplete copy" in n for n in notes)
+    assert not junk_in_trash.exists()
+    assert (d / ".DS_Store").exists()
+
+
+def test_move_across_cleans_partial_dst_and_recover_preserves_directory_copy(tmp_path, journal, monkeypatch):
+    import errno
+    import shutil
+
+    real_copy2 = shutil.copy2
+    real_copytree = shutil.copytree
+    real_rmtree = shutil.rmtree
+
+    def exdev_rename(src, dst):
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(os, "rename", exdev_rename)
+
+    # 1. File copy size mismatch unlinks partial dst immediately
+    src_file = tmp_path / "src_file.mkv"
+    src_file.write_text("full content")
+    dst_file = tmp_path / "dst_file.mkv"
+
+    def truncated_copy2(src, dst, **kw):
+        Path(dst).write_text("short")
+
+    monkeypatch.setattr(shutil, "copy2", truncated_copy2)
+    with pytest.raises(OSError):
+        ex._move_across(src_file, dst_file)
+    assert src_file.exists()
+    assert not dst_file.exists()
+
+    # 2. Directory copytree failure cleans up partial dst tree
+    src_dir = tmp_path / "src_dir"
+    src_dir.mkdir()
+    (src_dir / "a.txt").write_text("a")
+    dst_dir = tmp_path / "dst_dir"
+
+    def failing_copytree(src, dst, **kw):
+        Path(dst).mkdir(parents=True, exist_ok=True)
+        (Path(dst) / "partial.txt").write_text("p")
+        raise OSError("disk full during copytree")
+
+    monkeypatch.setattr(shutil, "copytree", failing_copytree)
+    with pytest.raises(OSError):
+        ex._move_across(src_dir, dst_dir)
+    assert (src_dir / "a.txt").exists()
+    assert not dst_dir.exists()
+
+    # 3. Pre-existing destination (file, directory, or symlink target) is never deleted on failure
+    existing_file = tmp_path / "existing.mkv"
+    existing_file.write_text("innocent file")
+    with pytest.raises(FileExistsError):
+        ex._move_across(src_file, existing_file)
+    assert existing_file.read_text() == "innocent file"
+
+    existing_dir = tmp_path / "existing_dir"
+    existing_dir.mkdir()
+    (existing_dir / "keep.txt").write_text("innocent dir")
+    with pytest.raises(FileExistsError):
+        ex._move_across(src_dir, existing_dir)
+    assert (existing_dir / "keep.txt").read_text() == "innocent dir"
+
+    src_link = tmp_path / "src_link.mkv"
+    src_link.symlink_to("target_movie.mkv")
+    with pytest.raises(FileExistsError):
+        ex._move_across(src_link, existing_file)
+    assert existing_file.read_text() == "innocent file"
+    assert src_link.is_symlink()
+
+    dst_link = tmp_path / "dst_link.mkv"
+    ex._move_across(src_link, dst_link)
+    assert not src_link.exists() and not os.path.lexists(src_link)
+    assert dst_link.is_symlink() and os.readlink(dst_link) == "target_movie.mkv"
+
+    # 4. File unlink PermissionError cleans up dst on each attempt and preserves
+    # the real PermissionError across retries (never masked by FileExistsError).
+    monkeypatch.setattr(shutil, "copy2", real_copy2)
+    monkeypatch.setattr(ex, "RETRY_DELAYS", (0.0, 0.0))
+    locked_file = tmp_path / "locked.mkv"
+    locked_file.write_text("locked content")
+    locked_dst = tmp_path / "locked_dst.mkv"
+    real_unlink = os.unlink
+    unlink_attempts = []
+
+    def locked_unlink(path, *a, **kw):
+        if Path(path) == locked_file:
+            unlink_attempts.append(path)
+            raise PermissionError(errno.EACCES, "File in use", str(path))
+        return real_unlink(path, *a, **kw)
+
+    monkeypatch.setattr(os, "unlink", locked_unlink)
+    file_res = execute(Plan(ops=[Op("move", locked_file, locked_dst)]),
+                       journal, roots=[tmp_path])
+    assert not file_res.ok
+    assert len(unlink_attempts) == 3  # initial + 2 retries
+    assert "open in another program" in file_res.failed[0][1]
+    assert locked_file.exists()
+    assert not locked_dst.exists()
+    monkeypatch.setattr(os, "unlink", real_unlink)
+
+    # 5. Directory copytree succeeds, then rmtree(src) fails partway:
+    # retries only call rmtree(src) (preserving PermissionError), and
+    # recover() must NOT delete the complete copy at dst (seq in copied_seqs).
+    lib = tmp_path / "lib"
+    s2 = lib / "Season 2"
+    eadir = s2 / "@eaDir"
+    eadir.mkdir(parents=True)
+    (eadir / "one.jpg").write_text("1")
+    (eadir / "two.jpg").write_text("2")
+    rmtree_attempts = []
+
+    def half_failing_rmtree(path, *a, **kw):
+        p = Path(path)
+        if p == eadir:
+            rmtree_attempts.append(p)
+            if (p / "one.jpg").exists():
+                (p / "one.jpg").unlink()
+            raise PermissionError("locked file during rmtree(src)")
+        return real_rmtree(path, *a, **kw)
+
+    monkeypatch.setattr(shutil, "copytree", real_copytree)
+    monkeypatch.setattr(shutil, "rmtree", half_failing_rmtree)
+
+    res = execute(Plan(ops=[Op("rmdir", None, s2)]), journal, roots=[lib])
+    assert not res.ok
+    assert len(rmtree_attempts) == 3  # initial + 2 retries
+    assert "open in another program" in res.failed[0][1]
+    trash_eadir = lib / ".mediaorg_trash" / "@eaDir"
+    assert (trash_eadir / "one.jpg").exists() and (trash_eadir / "two.jpg").exists()
+
+    # (a) When src is still locked, recover() preserves dst and reports the error.
+    locked_notes = ex.recover(journal)
+    assert len(locked_notes) == 1
+    assert f"note: {trash_eadir} completed but {eadir} was not removed" in locked_notes[0]
+    assert (trash_eadir / "one.jpg").exists() and (trash_eadir / "two.jpg").exists()
+    assert eadir.exists()
+
+    # (b) Once the lock clears, recover() finishes removing src while keeping dst intact.
+    monkeypatch.setattr(shutil, "rmtree", real_rmtree)
+    cleared_notes = ex.recover(journal)
+    assert cleared_notes == [
+        f"remove leftover source after completed copy: {eadir} (copied to {trash_eadir})"
+    ]
+    assert not eadir.exists()
+    assert (trash_eadir / "one.jpg").exists() and (trash_eadir / "two.jpg").exists()
+
+    # 6. Conversely, a crash-partial directory copy (where copytree never finished,
+    # so copied=True was never logged) IS removed by recover().
+    crash_journal = tmp_path / "crash_dir.jsonl"
+    crash_src = tmp_path / "crash_src_dir"
+    crash_src.mkdir()
+    (crash_src / "full.txt").write_text("full")
+    crash_dst = tmp_path / "crash_dst_dir"
+    crash_dst.mkdir()
+    (crash_dst / "partial.txt").write_text("partial")
+    crash_journal.write_text(
+        json.dumps({"op": "begin_run", "id": "r1", "v": 2}) + "\n"
+        + json.dumps({
+            "op": "intent", "kind": "move", "seq": 1,
+            "src": str(crash_src), "dst": str(crash_dst),
+            "dst_existed": False, "dir": True,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    notes = ex.recover(crash_journal)
+    assert notes == [f"remove incomplete copy: {crash_dst}"]
+    assert crash_src.exists()
+    assert not crash_dst.exists()
