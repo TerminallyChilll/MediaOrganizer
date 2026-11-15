@@ -74,6 +74,7 @@ def check_package_structure() -> tuple[str, str]:
         root / "mediaorg" / "scan.py",
         root / "mediaorg" / "excel.py",
         root / "mediaorg" / "parse.py",
+        root / "mediaorg" / "catalog.py",
         root / "mediaorg" / "llm.py",
         root / "mediaorg" / "extfix.py",
         root / "mediaorg" / "update.py",
@@ -209,6 +210,35 @@ def fix_interrupted() -> tuple[str, str]:
     if not notes:
         return _ok("Nothing to recover")
     return _ok(f"Recovered {len(notes)} interrupted change(s)")
+
+
+def check_catalog() -> tuple[str, str]:
+    """Validate the optional offline SQLite catalog if present on disk."""
+    import sqlite3
+    from .catalog import catalog_path
+    cp = catalog_path()
+    if not cp.exists():
+        return _ok(f"Not downloaded (optional — build with: python run.py --update-catalog)")
+    try:
+        uri = f"{cp.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            res = conn.execute("PRAGMA quick_check").fetchone()
+            if not res or res[0] != "ok":
+                return _err(f"{cp} failed integrity check: {res}")
+            count = conn.execute("SELECT COUNT(*) FROM titles").fetchone()[0]
+        finally:
+            conn.close()
+        return _ok(f"{cp} — {count:,} title entries")
+    except (sqlite3.Error, OSError, ValueError) as e:
+        return _err(f"{cp} is corrupted or unreadable: {e}")
+
+
+def fix_catalog() -> tuple[str, str]:
+    """Back up a corrupted offline catalog DB so it stops failing lookups."""
+    from .catalog import _close_cached, catalog_path
+    _close_cached()
+    return fix_corrupted_config(catalog_path())
 
 
 def check_version() -> tuple[str, str]:
@@ -452,11 +482,21 @@ def run_doctor(*, auto_fix: bool = False) -> int:
         if sf == "OK":
             fixed += 1
 
-    # 8. Unicode output
+    # 8. Offline catalog (optional; validated when present on disk)
+    s, msg = check_catalog()
+    report(s, "Offline catalog", msg)
+    if s == "FAIL" and auto_fix:
+        sf, mf = fix_catalog()
+        report(sf, "Offline catalog (fix)", mf)
+        if sf == "OK":
+            fixed += 1
+            issues -= 1
+
+    # 9. Unicode output
     s, msg = check_stdout()
     report(s, "Terminal Unicode", msg)
 
-    # 9. Version / updates
+    # 10. Version / updates
     from . import __version__
     s, msg = check_version()
     report(s, f"Version (v{__version__})", msg)

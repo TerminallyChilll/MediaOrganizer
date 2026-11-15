@@ -16,7 +16,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from . import excel, extfix, llm, scan, update
+from . import catalog, excel, extfix, llm, scan, update
 from .execute import (execute, journal_path, last_run_ops, list_runs,
                       pending_runs, recover, undo_last, undo_last_run,
                       undo_run, undo_session)
@@ -1140,9 +1140,28 @@ def _ask_llm_results(df_movies, df_tv, patterns) -> dict:
     print("  [1] guessit (fast, offline - recommended)")
     print("  [2] guessit + local LLM (Ollama) for unparseable names")
     print("  [3] guessit + cloud LLM (OpenAI / Gemini) for unparseable names")
-    choice = prompt_input("Select (1-3) [1]: ", default='1')
-    if choice not in ('2', '3'):
+    print("  [4] guessit + offline catalog (local IMDb backup list)")
+    choice = prompt_input("Select (1-4) [1]: ", default='1')
+    if choice not in ('2', '3', '4'):
         return {}
+
+    if choice == '4':
+        if catalog.catalog_stats() is None:
+            if not ask_yes_no("Offline catalog is not downloaded yet. "
+                              "Download it now from IMDb?", default=True):
+                return {}
+            if not run_update_catalog():
+                return {}
+        candidates = _llm_candidates(df_movies, df_tv, patterns)
+        if ask_yes_no(f"{len(candidates)} name(s) look hard to parse. Match ALL "
+                      f"names against the offline catalog instead of just those?",
+                      default=False):
+            candidates = _all_candidate_names(df_movies, df_tv)
+        if not candidates:
+            print("[OK] Nothing needs catalog cleaning.")
+            return {}
+        print(f"Matching {len(candidates)} name(s) against offline catalog...")
+        return catalog.clean_titles_with_catalog(candidates, custom_patterns=patterns)
 
     candidates = _llm_candidates(df_movies, df_tv, patterns)
     if ask_yes_no(f"{len(candidates)} name(s) look hard to parse. Clean ALL "
@@ -1654,6 +1673,70 @@ def confirm_word_list() -> list[str]:
     return patterns
 
 
+# --- Offline catalog ---------------------------------------------------------
+
+def run_update_catalog() -> bool:
+    """Download IMDb datasets and build the local offline catalog DB."""
+    print(f"\nBuilding offline catalog at {catalog.catalog_path()}...")
+    try:
+        stats = catalog.build_catalog(
+            progress_cb=lambda msg: print(f"   {msg}")
+        )
+        print(f"   [OK] Offline catalog built: {stats['movie_count']:,} movies, "
+              f"{stats['tv_count']:,} TV series ({stats['size_mb']} MB).")
+        return True
+    except Exception as exc:
+        print(f"   [!] Could not build offline catalog: {exc}")
+        return False
+
+
+def run_catalog_menu() -> None:
+    """Interactive menu for managing and testing the offline title catalog."""
+    while True:
+        stats = catalog.catalog_stats()
+        print("\n" + "-" * 60)
+        print("OFFLINE TITLE CATALOG")
+        print("-" * 60)
+        print(f"File: {catalog.catalog_path()}")
+        if stats:
+            built_str = (_fmt_ts(stats["built_at"])
+                         if stats.get("built_at") else "unknown")
+            print(f"Status: installed — {stats['movie_count']:,} movies, "
+                  f"{stats['tv_count']:,} TV series ({stats['size_mb']} MB, "
+                  f"built {built_str})")
+        else:
+            print("Status: not downloaded yet")
+        print("\n  [u] Download / update catalog from IMDb")
+        print("  [t] Test a filename against the catalog")
+        print("  [q] Back to the menu")
+
+        action = prompt_input("\nSelect: ").lower()
+        if action in ('q', ''):
+            return
+        if action == 'u':
+            run_update_catalog()
+        elif action == 't':
+            sample = prompt_input("Filename or title to test: ")
+            if not sample:
+                continue
+            patterns = load_custom_patterns()
+            parsed = parse_name(sample, custom_patterns=patterns)
+            match = catalog.lookup_title(
+                parsed.title,
+                parsed.year,
+                kind_hint="episode" if parsed.kind == "episode" else None,
+                allow_any_tail=(parsed.source == "raw"),
+            )
+            print(f"   parsed title : {parsed.title} "
+                  f"(year: {parsed.year or '-'}, source: {parsed.source})")
+            if match:
+                print(f"   catalog hit  : {match.title} "
+                      f"({match.year or '-'}, {match.kind}, "
+                      f"{match.votes:,} votes, {match.match_type})")
+            else:
+                print("   catalog hit  : (no match)")
+
+
 # --- Menu / entry point ------------------------------------------------------
 
 def _ask_paths(tv_only: bool = False):
@@ -1757,14 +1840,17 @@ def run_wizard() -> None:
   [7] Inventory every file    (every file, media or not -> xlsx/csv/txt)
   [8] Custom word list        (add / remove words stripped from names)
   [9] Undo last run
+  [C] Offline title catalog   (download / update IMDb backup list)
   [U] Update Media Organizer  (git pull + dependencies)
   [0] Exit
 
 Tip: type 'back' or 'b' at any prompt to return here.""")
-            choice = prompt_input("\nSelect an option (0-9, U): ")
+            choice = prompt_input("\nSelect an option (0-9, C, U): ")
 
             if choice == '0':
                 break
+            elif choice.lower() == 'c':
+                run_catalog_menu()
             elif choice.lower() == 'u':
                 if run_update():
                     print("\nExiting so the new version is loaded on the "
@@ -1934,6 +2020,8 @@ def main() -> None:
                         help="Undo even if a file was modified since, or out of order")
     parser.add_argument('--update', action='store_true',
                         help="Update to the latest version (git pull + dependencies)")
+    parser.add_argument('--update-catalog', action='store_true',
+                        help="Download or refresh the offline IMDb title catalog")
     parser.add_argument('--check-update', action='store_true',
                         help="Report how many commits behind this copy is, "
                              "without changing anything")
@@ -1951,6 +2039,8 @@ def main() -> None:
         return
     if args.update:
         sys.exit(update.run_update(assume_yes=args.yes, dry_run=args.dry_run))
+    if args.update_catalog:
+        sys.exit(0 if run_update_catalog() else 1)
 
     if args.list_runs:
         run_list_runs()
