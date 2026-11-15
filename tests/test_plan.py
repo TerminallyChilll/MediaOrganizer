@@ -914,3 +914,75 @@ def test_is_movie_wrapper_dir_short_circuits_and_dir_has_video_bounds_and_oserro
 
     monkeypatch.setattr(os, "walk", broken_walk)
     assert plan_mod._dir_has_video(tmp_path / "d0") is False
+
+
+def test_support_video_name_and_movie_wrapper_support_dirs_and_single_title(tmp_path):
+    from mediaorg import plan as plan_mod
+    from mediaorg.plan import plan_loose_movies
+
+    # 1 & 2: Support clips with preview/proof/interview, prefix sample/interview with,
+    # and chained trailing quality/codec/source tags match _SUPPORT_VIDEO_NAME.
+    for clip in (
+        "interview",
+        "Interview with the Cast",
+        "sample-Dune.2021.1080p.BluRay.x264-GRP",
+        "Dune.2021.sample.1080p.HDR",
+        "Dune.2021.Trailer.1080p.x264",
+        "Dune.2021.sample.HDTV.x264",
+        "Dune.2021.preview.720p",
+        "Dune.2021.proof",
+    ):
+        assert plan_mod._SUPPORT_VIDEO_NAME.search(clip), clip
+
+    for feature in (
+        "The.Interview.2014",
+        "Proof.2005",
+        "Trailer.Park.Boys.1080p",
+    ):
+        assert not plan_mod._SUPPORT_VIDEO_NAME.search(feature), feature
+
+    # 3a & 3b: Movie folder with support clips, Bonus Features/Other/Scenes/Commentary
+    # subdirs, or even an arbitrary custom subdir when directory.name matches the single
+    # movie title, must NOT be treated as a wrapper bucket.
+    movie_dir = tmp_path / "Dune (2021)"
+    touch(movie_dir / "Dune.2021.1080p.mkv")
+    touch(movie_dir / "interview.mkv")
+    touch(movie_dir / "Interview with the Cast.mkv")
+    touch(movie_dir / "sample-Dune.2021.1080p.BluRay.x264-GRP.mkv")
+    touch(movie_dir / "Dune.2021.sample.1080p.HDR.mkv")
+    touch(movie_dir / "Bonus Features" / "making_of.mkv")
+    touch(movie_dir / "Other" / "clip.mkv")
+    touch(movie_dir / "Scenes" / "scene1.mkv")
+    touch(movie_dir / "Commentary" / "comm.mkv")
+    touch(movie_dir / "UnlistedSubdir" / "extra.mkv")
+
+    # Even a differently-named folder with only Bonus Features/Other/Scenes/Commentary
+    # and a single feature movie is not a wrapper bucket because those subdirs are in
+    # _MOVIE_SUPPORT_DIRS.
+    alt_dir = tmp_path / "ReleaseFolder"
+    touch(alt_dir / "Arrival.2016.1080p.mkv")
+    touch(alt_dir / "Bonus Features" / "bonus.mkv")
+    touch(alt_dir / "Scenes" / "deleted.mkv")
+
+    plan = plan_loose_movies(tmp_path)
+    assert plan.ops == []
+
+
+def test_dir_has_video_continues_past_unreadable_sibling_subdir(tmp_path, monkeypatch):
+    from mediaorg import plan as plan_mod
+
+    root = tmp_path / "parent"
+    bad = root / "a_unreadable"
+    good = root / "b_readable"
+    bad.mkdir(parents=True)
+    touch(good / "movie.mkv")
+
+    real_scandir = os.scandir
+
+    def partial_scandir(path=".", *args, **kwargs):
+        if os.fspath(path) == os.fspath(bad):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", partial_scandir)
+    assert plan_mod._dir_has_video(root) is True

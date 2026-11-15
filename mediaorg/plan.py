@@ -774,36 +774,39 @@ def plan_season_structure(show_path: Path) -> Plan:
 # --- Loose movie files planner ----------------------------------------------
 
 _MOVIE_SUPPORT_DIRS = re.compile(
-    r'^(?:subs?|subtitles|samples?|artwork|screens?|proof|extrafanart|making[ ._-]?of)$',
+    r'^(?:subs?|subtitles|samples?|artwork|screens?|proof|extrafanart'
+    r'|extrathumbs|fanart|posters?|making[ ._-]?of'
+    r'|bonus[ ._-]?features?|bonus[ ._-]?materials?|other|scenes?|shorts?'
+    r'|commentar(?:y|ies)|bloopers?|outtakes?|promos?|teasers?|previews?'
+    r'|bdmv|video_ts|audio_ts)$',
     re.IGNORECASE,
 )
 _SUPPORT_VIDEO_NAME = re.compile(
-    r'(?:^|[.\s_-])(?:sample|trailer|teaser|featurette|bonus'
+    r'^(?:sample[.\s_-]+|interview[.\s_-]+with\b)'
+    r'|(?:^|[.\s_-])(?:samples?|trailers?|teasers?|featurettes?|bonus'
+    r'|previews?|proof|interviews?'
     r'|deleted[ ._-]?scenes?|behind[ ._-]?the[ ._-]?scenes?)'
     r'(?:[.\s_-]?\d{1,2})?'
-    r'(?:[.\s_-]+(?:(?:480|576|720|1080|2160)[pi]|4k|uhd|hd))?$',
+    r'(?:[.\s_-]+(?:\d{1,2}|(?:480|576|720|1080|2160)[pi]|4k|uhd|hd|sdr'
+    r'|hdr(?:10\+?)?|dv|bluray|bdrip|brrip|web(?:[ ._-]?dl|rip)?|hdtv|dvdrip'
+    r'|remux|[xh]26[45]|hevc|avc|av1|xvid|aac|ac3|eac3|dts|truehd|atmos'
+    r'|10bit|proper|repack))*$',
     re.IGNORECASE,
 )
-
-
-def _raise_walk_error(err: OSError) -> None:
-    raise err
 
 
 def _dir_has_video(directory: Path,
                    max_depth: int = SHOW_SEARCH_MAX_DEPTH) -> bool:
-    try:
-        for dirpath, dirnames, filenames in os.walk(
-                directory, onerror=_raise_walk_error):
-            if any(is_media_file(f) for f in filenames):
-                return True
-            rel_parts = Path(dirpath).relative_to(directory).parts
-            if len(rel_parts) >= max_depth:
-                dirnames[:] = []
-            else:
-                dirnames[:] = [d for d in dirnames if not is_junk_dir(d)]
-    except OSError:
-        return False
+    walk_errors: list[OSError] = []
+    for dirpath, dirnames, filenames in os.walk(
+            directory, onerror=walk_errors.append):
+        if any(is_media_file(f) for f in filenames):
+            return True
+        rel_parts = Path(dirpath).relative_to(directory).parts
+        if len(rel_parts) >= max_depth:
+            dirnames[:] = []
+        else:
+            dirnames[:] = [d for d in dirnames if not is_junk_dir(d)]
     return False
 
 
@@ -818,25 +821,26 @@ def _is_movie_wrapper_dir(directory: Path, child_dirs: list[Path],
     """
     if not loose_videos:
         return False
+    feature_videos = [
+        v for v in loose_videos if not _SUPPORT_VIDEO_NAME.search(v.stem)
+    ]
+    titles = {
+        norm(parse_name(v.name, kind_hint="movie").title).casefold()
+        for v in feature_videos
+    }
+    titles.discard('')
+    if len(titles) >= 2:
+        return True
+    dir_title = norm(parse_name(directory.name, kind_hint="movie").title).casefold()
+    if len(titles) == 1 and dir_title and dir_title in titles:
+        return False
     real_subdirs = [
         d for d in child_dirs
         if not SPECIALS_FOLDER_PATTERN.match(d.name.strip())
         and not _MOVIE_SUPPORT_DIRS.match(d.name.strip())
         and _dir_has_video(d)
     ]
-    if real_subdirs:
-        return True
-    feature_videos = [
-        v for v in loose_videos if not _SUPPORT_VIDEO_NAME.search(v.stem)
-    ]
-    if len(feature_videos) < 2:
-        return False
-    titles = {
-        norm(parse_name(v.name, kind_hint="movie").title).casefold()
-        for v in feature_videos
-    }
-    titles.discard('')
-    return len(titles) >= 2
+    return bool(real_subdirs)
 
 
 def plan_loose_movies(movies_root: Path) -> Plan:
