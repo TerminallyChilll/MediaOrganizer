@@ -31,6 +31,12 @@ def _no_update_check(monkeypatch):
     monkeypatch.setenv("MEDIAORG_NO_UPDATE_CHECK", "1")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_catalog(monkeypatch, tmp_path):
+    """Isolate tests from any .media_catalog.db present in the repo root."""
+    monkeypatch.setenv("MEDIAORG_CATALOG", str(tmp_path / ".media_catalog.db"))
+
+
 @pytest.fixture
 def journal(tmp_path):
     return tmp_path / "journal.jsonl"

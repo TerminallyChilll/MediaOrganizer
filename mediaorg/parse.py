@@ -112,7 +112,7 @@ class ParsedName:
     date: datetime.date | None = None
     episode_title: str | None = None
     kind: str = "unknown"      # "movie" | "episode" | "unknown"
-    source: str = "guessit"    # "guessit" | "llm" | "raw"
+    source: str = "guessit"    # "guessit" | "catalog" | "llm" | "raw"
     # guessit parses these and they used to be discarded, which guaranteed a
     # collision between e.g. "Movie.1999.EXTENDED.mkv" and "Movie.1999.mkv":
     # both built the same target name, so check_collisions skipped BOTH and
@@ -199,7 +199,9 @@ def _strip_video_ext(name: str) -> str:
 
 
 def parse_name(name: str, kind_hint: str | None = None,
-               custom_patterns: list[str] = ()) -> ParsedName:
+               custom_patterns: list[str] = (),
+               catalog_db: Path | None = None, *,
+               use_catalog: bool = True) -> ParsedName:
     """Parse a file or folder name into its media parts.
 
     Fallback chain: guessit -> bare-number title ("1917.mkv") -> raw stem
@@ -283,7 +285,7 @@ def parse_name(name: str, kind_hint: str | None = None,
     screen_size = _first('screen_size')
     date_val = _first('date')
 
-    return ParsedName(
+    parsed = ParsedName(
         title=str(title),
         year=year,
         season=_first('season'),
@@ -296,3 +298,8 @@ def parse_name(name: str, kind_hint: str | None = None,
         edition=str(edition) if edition else None,
         part=part,
     )
+    if not use_catalog:
+        return parsed
+    from .catalog import refine_parsed
+    effective_hint = kind_hint or ("episode" if parsed.kind == "episode" else None)
+    return refine_parsed(parsed, kind_hint=effective_hint, db_path=catalog_db)

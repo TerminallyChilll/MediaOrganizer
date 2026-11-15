@@ -4,6 +4,8 @@ __pycache__/
 *.log
 .media_llm_config.json
 .media_renamer_config.json
+.media_catalog.db
+.media_catalog.db.*.tmp
 custom_strip_patterns.json
 .mediaorg_update_check.json
 *.xlsx

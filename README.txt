@@ -471,6 +471,24 @@ specifically, and the response parser copes with the usual local-model output
 alternative field names. If a batch fails, the run continues with the names
 that did come back.
 
+Offline title catalog
+~~~~~~~~~~~~~~~~~~~~~
+
+An optional local SQLite index (.media_catalog.db, override with
+MEDIAORG_CATALOG) built from IMDb's public non-commercial datasets
+(title.basics.tsv.gz and title.ratings.tsv.gz). Nothing is downloaded
+automatically -- build or refresh it on demand with:
+
+    python run.py --update-catalog
+
+or from menu option [C] Offline title catalog. Once present on disk,
+parse_name uses it automatically as a backup when guessit falls back to a raw
+stem, leaves trailing release/edition tokens on a title, or sees a bare
+numeric movie title (1917), and renaming engine option [4] can match batches
+against it offline without an LLM. Local dataset files and optional SHA-256
+checksums can be supplied via MEDIAORG_BASICS_SOURCE, MEDIAORG_RATINGS_SOURCE,
+MEDIAORG_BASICS_SHA256, and MEDIAORG_RATINGS_SHA256.
+
 The Fixed-columns workflow
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
