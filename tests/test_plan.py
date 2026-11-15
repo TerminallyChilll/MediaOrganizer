@@ -888,6 +888,10 @@ def test_loose_movies_wraps_titles_containing_support_words(tmp_path):
     touch(drama / "Interview.with.the.Vampire.1994.1080p.mkv")
     touch(drama / "Heat.1995.1080p.mkv")
 
+    alien = tmp_path / "Alien"
+    touch(alien / "Alien.1979.mkv")
+    touch(alien / "Aliens.1986.mkv")
+
     single = tmp_path / "SingleFilm (2020)"
     touch(single / "SingleFilm.2020.mkv")
     touch(single / "Interview with the Cast.mkv")
@@ -900,6 +904,8 @@ def test_loose_movies_wraps_titles_containing_support_words(tmp_path):
     assert (bucket / "Trailer.Park.Boys.1080p" / "Trailer.Park.Boys.1080p.mkv").exists()
     assert (drama / "Interview.with.the.Vampire.1994.1080p" / "Interview.with.the.Vampire.1994.1080p.mkv").exists()
     assert (drama / "Heat.1995.1080p" / "Heat.1995.1080p.mkv").exists()
+    assert (alien / "Alien.1979" / "Alien.1979.mkv").exists()
+    assert (alien / "Aliens.1986" / "Aliens.1986.mkv").exists()
     assert (single / "SingleFilm.2020.mkv").exists()
     assert (single / "Interview with the Cast.mkv").exists()
 

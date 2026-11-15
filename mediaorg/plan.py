@@ -824,13 +824,14 @@ def _is_movie_wrapper_dir(directory: Path, child_dirs: list[Path],
     feature_videos = [
         v for v in loose_videos if not _SUPPORT_VIDEO_NAME.search(v.stem)
     ]
-    titles = {
-        norm(parse_name(v.name, kind_hint="movie").title).casefold()
-        for v in feature_videos
-    }
+    parsed = [parse_name(v.name, kind_hint="movie") for v in feature_videos]
+    titles = {norm(p.title).casefold() for p in parsed}
     titles.discard('')
+    years = {p.year for p in parsed if p.year}
+    dated_titles = {norm(p.title).casefold() for p in parsed if p.year}
+    dated_titles.discard('')
     dir_title = norm(parse_name(directory.name, kind_hint="movie").title).casefold()
-    if dir_title and dir_title in titles:
+    if dir_title and dir_title in titles and len(years) <= 1 and len(dated_titles) <= 1:
         return False
     if len(titles) >= 2:
         return True
