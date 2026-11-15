@@ -246,25 +246,31 @@ def _move_across(src: Path, dst: Path, *, on_copied=None) -> None:
         shutil.rmtree(src)
         return
 
-    # lstat on both sides: copy2 is told not to follow symlinks, so for a
-    # symlinked file it copies the link itself. stat() would compare the
-    # target's size against the link's and fail a perfectly good copy.
-    expected = src.lstat().st_size
-    if src.is_symlink():
-        if os.path.lexists(dst):
-            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST),
-                                  str(dst))
+    # Claim dst atomically before entering the cleanup try-block so a
+    # pre-existing destination is never unlinked on failure: symlinks use
+    # os.symlink (single syscall failing with EEXIST), regular files use
+    # O_CREAT | O_EXCL.
+    is_link = src.is_symlink()
+    if is_link:
+        os.symlink(os.readlink(src), dst)
     else:
+        expected = src.lstat().st_size
         fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.close(fd)
     try:
-        shutil.copy2(src, dst, follow_symlinks=False)
-        _fsync_path(dst)
-        actual = dst.lstat().st_size
-        if actual != expected:
-            raise OSError(errno.EIO,
-                          f"copy verification failed: {dst} is {actual} bytes, "
-                          f"expected {expected}")
+        if is_link:
+            try:
+                shutil.copystat(src, dst, follow_symlinks=False)
+            except (OSError, NotImplementedError):
+                pass
+        else:
+            shutil.copy2(src, dst, follow_symlinks=False)
+            _fsync_path(dst)
+            actual = dst.lstat().st_size
+            if actual != expected:
+                raise OSError(errno.EIO,
+                              f"copy verification failed: {dst} is {actual} bytes, "
+                              f"expected {expected}")
         os.unlink(src)
     except BaseException:
         try:
@@ -648,6 +654,25 @@ def recover(journal: Path, dry_run: bool = False) -> list[str]:
                 notes.append(f"restore stranded temp file {tmp} -> {target}")
                 if not dry_run:
                     os.rename(tmp, target)
+                continue
+
+            if (kind == "move" and src is not None and dst is not None
+                    and seq in copied_seqs
+                    and os.path.lexists(src) and os.path.lexists(dst)):
+                seen_seqs.add(seq)
+                notes.append(
+                    f"remove leftover source after completed copy: {src} (copied to {dst})"
+                )
+                if not dry_run:
+                    try:
+                        if src.is_dir() and not src.is_symlink():
+                            shutil.rmtree(src)
+                        else:
+                            os.unlink(src)
+                    except OSError as exc:
+                        notes[-1] = (
+                            f"note: {dst} completed but {src} was not removed: {exc}"
+                        )
                 continue
 
             if (kind == "move" and src is not None and dst is not None

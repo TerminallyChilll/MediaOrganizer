@@ -660,7 +660,7 @@ def test_move_across_cleans_partial_dst_and_recover_preserves_directory_copy(tmp
     assert (src_dir / "a.txt").exists()
     assert not dst_dir.exists()
 
-    # 3. Pre-existing destination (file or directory) is never deleted on failure
+    # 3. Pre-existing destination (file, directory, or symlink target) is never deleted on failure
     existing_file = tmp_path / "existing.mkv"
     existing_file.write_text("innocent file")
     with pytest.raises(FileExistsError):
@@ -673,6 +673,18 @@ def test_move_across_cleans_partial_dst_and_recover_preserves_directory_copy(tmp
     with pytest.raises(FileExistsError):
         ex._move_across(src_dir, existing_dir)
     assert (existing_dir / "keep.txt").read_text() == "innocent dir"
+
+    src_link = tmp_path / "src_link.mkv"
+    src_link.symlink_to("target_movie.mkv")
+    with pytest.raises(FileExistsError):
+        ex._move_across(src_link, existing_file)
+    assert existing_file.read_text() == "innocent file"
+    assert src_link.is_symlink()
+
+    dst_link = tmp_path / "dst_link.mkv"
+    ex._move_across(src_link, dst_link)
+    assert not src_link.exists() and not os.path.lexists(src_link)
+    assert dst_link.is_symlink() and os.readlink(dst_link) == "target_movie.mkv"
 
     # 4. File unlink PermissionError cleans up dst on each attempt and preserves
     # the real PermissionError across retries (never masked by FileExistsError).
@@ -730,13 +742,24 @@ def test_move_across_cleans_partial_dst_and_recover_preserves_directory_copy(tmp
     trash_eadir = lib / ".mediaorg_trash" / "@eaDir"
     assert (trash_eadir / "one.jpg").exists() and (trash_eadir / "two.jpg").exists()
 
-    # recover() must leave the complete copy at trash_eadir intact!
-    assert ex.recover(journal) == []
+    # (a) When src is still locked, recover() preserves dst and reports the error.
+    locked_notes = ex.recover(journal)
+    assert len(locked_notes) == 1
+    assert f"note: {trash_eadir} completed but {eadir} was not removed" in locked_notes[0]
+    assert (trash_eadir / "one.jpg").exists() and (trash_eadir / "two.jpg").exists()
+    assert eadir.exists()
+
+    # (b) Once the lock clears, recover() finishes removing src while keeping dst intact.
+    monkeypatch.setattr(shutil, "rmtree", real_rmtree)
+    cleared_notes = ex.recover(journal)
+    assert cleared_notes == [
+        f"remove leftover source after completed copy: {eadir} (copied to {trash_eadir})"
+    ]
+    assert not eadir.exists()
     assert (trash_eadir / "one.jpg").exists() and (trash_eadir / "two.jpg").exists()
 
     # 6. Conversely, a crash-partial directory copy (where copytree never finished,
     # so copied=True was never logged) IS removed by recover().
-    monkeypatch.setattr(shutil, "rmtree", real_rmtree)
     crash_journal = tmp_path / "crash_dir.jsonl"
     crash_src = tmp_path / "crash_src_dir"
     crash_src.mkdir()

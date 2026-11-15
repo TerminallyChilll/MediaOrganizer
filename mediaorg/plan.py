@@ -782,7 +782,7 @@ _MOVIE_SUPPORT_DIRS = re.compile(
     re.IGNORECASE,
 )
 _SUPPORT_VIDEO_NAME = re.compile(
-    r'^(?:sample[.\s_-]+|interview[.\s_-]+with\b)'
+    r'^(?:sample[.\s_-]+|interview[.\s_-]+with[.\s_-]+(?:the[.\s_-]+)?(?:cast|crew|director|creator|author)s?\b)'
     r'|(?:^|[.\s_-])(?:samples?|trailers?|teasers?|featurettes?|bonus'
     r'|previews?|proof|interviews?'
     r'|deleted[ ._-]?scenes?|behind[ ._-]?the[ ._-]?scenes?)'

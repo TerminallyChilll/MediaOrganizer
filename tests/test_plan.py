@@ -884,12 +884,24 @@ def test_loose_movies_wraps_titles_containing_support_words(tmp_path):
     touch(bucket / "Proof.2005.mkv")
     touch(bucket / "Trailer.Park.Boys.1080p.mkv")
 
+    drama = tmp_path / "Drama"
+    touch(drama / "Interview.with.the.Vampire.1994.1080p.mkv")
+    touch(drama / "Heat.1995.1080p.mkv")
+
+    single = tmp_path / "SingleFilm (2020)"
+    touch(single / "SingleFilm.2020.mkv")
+    touch(single / "Interview with the Cast.mkv")
+
     plan = plan_loose_movies(tmp_path)
     apply_plan(plan)
 
     assert (bucket / "The.Interview.2014" / "The.Interview.2014.mkv").exists()
     assert (bucket / "Proof.2005" / "Proof.2005.mkv").exists()
     assert (bucket / "Trailer.Park.Boys.1080p" / "Trailer.Park.Boys.1080p.mkv").exists()
+    assert (drama / "Interview.with.the.Vampire.1994.1080p" / "Interview.with.the.Vampire.1994.1080p.mkv").exists()
+    assert (drama / "Heat.1995.1080p" / "Heat.1995.1080p.mkv").exists()
+    assert (single / "SingleFilm.2020.mkv").exists()
+    assert (single / "Interview with the Cast.mkv").exists()
 
 
 def test_is_movie_wrapper_dir_short_circuits_and_dir_has_video_bounds_and_oserror(tmp_path, monkeypatch):
