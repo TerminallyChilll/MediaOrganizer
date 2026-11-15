@@ -937,6 +937,10 @@ def test_support_video_name_and_movie_wrapper_support_dirs_and_single_title(tmp_
     for clip in (
         "interview",
         "Interview with the Cast",
+        "Interview.with.the.Producer",
+        "Interview.with.the.Writer",
+        "Interview.with.the.Filmmakers",
+        "Interview.with.the.Stars",
         "sample-Dune.2021.1080p.BluRay.x264-GRP",
         "Dune.2021.sample.1080p.HDR",
         "Dune.2021.Trailer.1080p.x264",
@@ -960,6 +964,8 @@ def test_support_video_name_and_movie_wrapper_support_dirs_and_single_title(tmp_
     touch(movie_dir / "Dune.2021.1080p.mkv")
     touch(movie_dir / "interview.mkv")
     touch(movie_dir / "Interview with the Cast.mkv")
+    touch(movie_dir / "Interview.with.the.Producer.mkv")
+    touch(movie_dir / "UnrecognizedExtraClip.mkv")
     touch(movie_dir / "sample-Dune.2021.1080p.BluRay.x264-GRP.mkv")
     touch(movie_dir / "Dune.2021.sample.1080p.HDR.mkv")
     touch(movie_dir / "Bonus Features" / "making_of.mkv")

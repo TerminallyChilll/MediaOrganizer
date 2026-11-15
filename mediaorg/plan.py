@@ -782,7 +782,7 @@ _MOVIE_SUPPORT_DIRS = re.compile(
     re.IGNORECASE,
 )
 _SUPPORT_VIDEO_NAME = re.compile(
-    r'^(?:sample[.\s_-]+|interview[.\s_-]+with[.\s_-]+(?:the[.\s_-]+)?(?:cast|crew|director|creator|author)s?\b)'
+    r'^(?:sample[.\s_-]+|interview[.\s_-]+with[.\s_-]+(?:the[.\s_-]+)?(?:cast|crew|director|producer|writer|filmmaker|composer|editor|creator|author|star)s?\b)'
     r'|(?:^|[.\s_-])(?:samples?|trailers?|teasers?|featurettes?|bonus'
     r'|previews?|proof|interviews?'
     r'|deleted[ ._-]?scenes?|behind[ ._-]?the[ ._-]?scenes?)'
@@ -829,11 +829,11 @@ def _is_movie_wrapper_dir(directory: Path, child_dirs: list[Path],
         for v in feature_videos
     }
     titles.discard('')
+    dir_title = norm(parse_name(directory.name, kind_hint="movie").title).casefold()
+    if dir_title and dir_title in titles:
+        return False
     if len(titles) >= 2:
         return True
-    dir_title = norm(parse_name(directory.name, kind_hint="movie").title).casefold()
-    if len(titles) == 1 and dir_title and dir_title in titles:
-        return False
     real_subdirs = [
         d for d in child_dirs
         if not SPECIALS_FOLDER_PATTERN.match(d.name.strip())
